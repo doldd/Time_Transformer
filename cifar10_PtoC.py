@@ -15,7 +15,7 @@ import arviz as az
 from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
-from src.subspace_curve import pytree_to_matrix, vec_to_pytree
+from src.subspace_curve import pytree_to_matrix, vec_to_pytree, bezier_coeff_fn
 from src.subspace_curve import OrthoSpan, CategorySubspaceBatchNorm, RepulsiveCategorySubspaceBatchNorm
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
@@ -587,13 +587,32 @@ def single_run(logger, config, n_samples_nuts=None):
 
 
 
-        # def acc_fn(carry, t):
-        #     x, y = carry
-        #     logits = s_model(params['params'], t, x)
-        #     return carry, (logits.argmax(-1) == y).mean(-1)
-        # valid accuracy
-        # acc_val = acc_fn((x_val, y_val), jnp.linspace(0, 1, 10))[1].mean()
-        # logger.log({'acc_val': acc_val})
+        # Bezier curve length
+        # define function to compute bezier curve length
+        def get_d_bezier(t):
+            bezier_coeff_inv = bezier_coeff_fn(k)
+            coeff = jax.vmap(bezier_coeff_inv)(t)
+
+            def clousure(cp):
+                n = cp.shape[0] - 1
+                cp_diff = cp[1:] - cp[:-1]
+                return jnp.einsum('tj,j...->t...', coeff, cp_diff) * n
+            return clousure
+
+        @jit
+        def bezier_length(cp):
+            t = jnp.linspace(0, 1, 1000)
+            d_bezier = get_d_bezier(t)
+            d_t = jnp.linalg.norm(d_bezier(cp), axis=-1)
+            length = jax.scipy.integrate.trapezoid(d_t, t)
+            return length
+        
+        cp = pytree_to_matrix(params['params'], k)
+        length_best = bezier_length(cp)
+        cp = pytree_to_matrix(last_params['params'], k)
+        length_last = bezier_length(cp)
+        logger.log({'Curve length best': length_best, 'Curve length last': length_last})
+
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 1)
@@ -606,8 +625,7 @@ def single_run(logger, config, n_samples_nuts=None):
 
         # valid
         nll, acc = valid_metrics_fn_final(rng_key, params)
-        logger.log({'acc_val_curve': acc.mean()})
-        logger.log({'nll_val_curve': nll.mean()})
+        logger.log({'acc_val_curve': acc.mean(), 'nll_val_curve': nll.mean()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax.twinx()
         ax2.plot(t_space, acc, label="valid acc",
@@ -688,6 +706,7 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description="Train a single model or a curve model.")
     parser.add_argument("--train", choices=["single", "curve"], required=True, help="Specify the training mode: 'single' for single model training, 'curve' for curve model training.")
+    parser.add_argument("--use_sweep", action="store_true", help="Use wandb sweep configuration if set.")
 
     args = parser.parse_args()
 
@@ -707,32 +726,39 @@ if __name__ == '__main__':
         single_model_train(logger, config)
     elif args.train == "curve":
         print("Curve training")
-        config = {
-            'rng_seed': 0,
-            'net_kwargs':{'num_blocks': (3, 3, 3),
-                          'c_hidden': (16, 32, 64),
-                          'num_classes': 10,
-                          'act_fn': 'relu',
-                          'block_class': 'ResNetBlock'},
-            'params_path': 'ddold/cifar_PtoC/params:v1',
-            'eval_every_n_batch': 20,
-            'curve_params': {'k': 10,
-                             'num_epochs': 500,
-                             'batch_size': 100,
-                             'natural_parameterization': False,
-                             'gravity': 0.,
-                             'weight_decay': 0.,
-                             'remove_initial_permutation': False,
-                             'jitter': 0.0,
-                             #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
-                             #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                             'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
-                                                                                              'kwargs': {'transition_steps': 490_000, 'peak_value': 0.2, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
-                                                                            'momentum': 0.9, 
-                                                                            'nesterov': True},},
-                          }}
-        logger = wandb.init(project="cifar_PtoC", name="cifar_curve", entity="ddold", config=config)
-        single_run(logger, config)
+        if args.use_sweep:
+            print("Using wandb config")
+            logger = wandb.init()
+            config = wandb.config
+            single_run(logger, config)
+        else:
+            print("Using perdefined config")
+            config = {
+                'rng_seed': 0,
+                'net_kwargs':{'num_blocks': (3, 3, 3),
+                            'c_hidden': (16, 32, 64),
+                            'num_classes': 10,
+                            'act_fn': 'relu',
+                            'block_class': 'ResNetBlock'},
+                'params_path': 'ddold/cifar_PtoC/params:v1',
+                'eval_every_n_batch': 20,
+                'curve_params': {'k': 10,
+                                'num_epochs': 50,
+                                'batch_size': 100,
+                                'natural_parameterization': False,
+                                'gravity': 0.,
+                                'weight_decay': 0.,
+                                'remove_initial_permutation': False,
+                                'jitter': 1e-6,
+                                #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
+                                #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
+                                'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
+                                                                                                'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
+                                                                                'momentum': 0.9, 
+                                                                                'nesterov': True},},
+                            }}
+            logger = wandb.init(project="cifar_PtoC", name="cifar_curve", entity="ddold", config=config)
+            single_run(logger, config)
 
         # main()
 

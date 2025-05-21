@@ -1,0 +1,64 @@
+program: cifar10_PtoC.py
+name: cifat_point_to_curve
+method: grid
+metric:
+  goal: maximize
+  name: acc_val_curve
+parameters:
+  net_kwargs:
+    parameters:
+      num_blocks:
+        value: [3, 3, 3]
+      c_hidden:
+        value: [16, 32, 64]
+      num_classes:
+        value: 10
+      act_fn:
+        value: "relu"
+      block_class:
+        value: "ResNetBlock"
+  params_path:
+    value: "ddold/cifar_PtoC/params:v1"
+  eval_every_n_batch:
+    value: 20
+  curve_params:
+    parameters:
+      k:
+        values: [2, 10,]
+      batch_size:
+        value: 100
+      natural_parameterization:
+        value: False
+      gravity:
+        values: [0., 0.0001, 0.01]
+      weight_decay:
+        values: [0.0, 0.0001, 0.001]
+      remove_initial_permutation:
+        values: [True, False]
+      jitter:
+        values: [1e-6, 1e-8]
+      num_epochs:
+        value: 200
+      optimizer_conf:
+        parameters:
+          name:
+            value: "optax.sgd"
+          kwargs:
+            parameters:
+              learning_rate:
+                values: [0.05, 0.005]
+              momentum:
+                value: 0.9
+              nesterov:
+                value: True
+  rng_seed:
+    values: [0,1]
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- "--train"
+- "curve"
+- "--use_sweep"
+#- ${args}

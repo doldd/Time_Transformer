@@ -450,14 +450,19 @@ def single_run(logger, config, n_samples_nuts=None):
             filename = os.path.join(artifact_dir, f"{art.logged_by().id}_params.npy")
             params = jnp.load(filename, allow_pickle=True).item()
             curve_params = [deepcopy(params['params']) for _ in range(k+1)]
-            curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)  
+            
             # add noise to the parameters
             param, struct = jax.tree.flatten(curve_params)
             keys = random.split(rng_key, len(param))
             def apply_noise(p, key, jitter):
                 return p+jitter*jax.random.normal(key, p.shape)
             noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
-            curve_params = jax.tree.unflatten(struct,noise_params)
+            curve_params = jax.tree.unflatten(struct, noise_params)
+            
+            if remove_initial_permutation:
+                curve_params = s_model.remove_permutation(init_key, curve_params)
+            
+            curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
             params = {'params': curve_params, 'batch_stats': params['batch_stats'], 'dist_params': {}}
         else:
             params = s_model.init_params(init_key, x[:2])
@@ -637,6 +642,7 @@ def single_run(logger, config, n_samples_nuts=None):
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
         nll, acc = test_metrics_fn_final(rng_key, params)
+        logger.log({'acc_test_curve': acc.mean(), 'nll_test_curve': nll.mean()})
         ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, acc, label="test acc",
                  c=plt.get_cmap('tab10')(2), linestyle="--")
@@ -647,6 +653,32 @@ def single_run(logger, config, n_samples_nuts=None):
         ax2.legend(loc='lower center')
         logger.log(
             {'Nll alonge curve': wandb.Image(fig)})
+        
+        # valid
+        nll, acc = valid_metrics_fn_final(rng_key, last_params)
+        logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean()})
+        ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
+        ax2 = ax.twinx()
+        ax2.plot(t_space, acc, label="valid acc",
+                 c=plt.get_cmap('tab10')(1), linestyle="--")
+        # train
+        nll, acc = train_metrics_fn_final(rng_key, last_params)
+        ax.plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
+        ax2.plot(t_space, acc, label="train acc",
+                 c=plt.get_cmap('tab10')(0), linestyle="--")
+        # test
+        nll, acc = test_metrics_fn_final(rng_key, last_params)
+        logger.log({'acc_test_curve_last': acc.mean(), 'nll_test_curve_last': nll.mean()})
+        ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
+        ax2.plot(t_space, acc, label="test acc",
+                 c=plt.get_cmap('tab10')(2), linestyle="--")
+        ax.set_xlabel("t")
+        ax.set_ylabel("mean log likelihood")
+        ax2.set_ylabel("acc")
+        ax.legend()
+        ax2.legend(loc='lower center')
+        logger.log(
+            {'Nll alonge curve last': wandb.Image(fig)})
 
         return rng_key, params, model, last_params
 

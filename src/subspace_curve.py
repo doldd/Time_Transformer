@@ -504,6 +504,33 @@ class SubspaceModelBatchNorm:
         self.perm_spec = perm_spec
         self.compute_loss = self.compute_loss_natural_t if natural_parameterization else self.compute_loss_t
 
+    def remove_permutation(self, key, params_list):
+        """
+        Removes the permutation from the parameters.
+
+        Parameters:
+        - params: The parameters of the model.
+
+        Returns:
+        - The parameters without permutation.
+
+        """
+        def flatten_params(params):
+            return {"/".join(k): v for k, v in traverse_util.flatten_dict(params).items()}
+
+        def unflatten_params(flat_params):
+            return traverse_util.unflatten_dict({tuple(k.split("/")): v
+                                                for k, v in flat_params.items()})
+
+        for i, p in enumerate(params_list[1:]):
+            print(f'Remove permutation from k {i+1}')
+            key, perm_key = random.split(key)
+            final_permutation = weight_matching(perm_key, self.perm_spec,
+                                                flatten_params(params_list[0]), flatten_params(p))
+            params_list[i] = unflatten_params(apply_permutation(
+                self.perm_spec, final_permutation, flatten_params(p)))
+        return params_list
+    
     def init_params(self, key, x):
         """
         Initializes the parameters of the model.
@@ -524,21 +551,7 @@ class SubspaceModelBatchNorm:
         stacked_params += [self.model.init(k, x)['params'] for k in keys[1:]]
         # if permutation is specified then remove the permutation by using the first point as anchor
         if self.perm_spec:
-            def flatten_params(params):
-                return {"/".join(k): v for k, v in traverse_util.flatten_dict(params).items()}
-            
-            def unflatten_params(flat_params):
-                return traverse_util.unflatten_dict({tuple(k.split("/")): v
-                                                    for k, v in flat_params.items()})
-            
-            for i, p in enumerate(stacked_params[1:]):
-                print(f'Remove permutation from k {i+1}')
-                key, perm_key = random.split(key)
-                final_permutation = weight_matching(perm_key, self.perm_spec,
-                                                    flatten_params(stacked_params[0]), flatten_params(p))
-                stacked_params[i] = unflatten_params(apply_permutation(
-                    self.perm_spec, final_permutation, flatten_params(p)))
-
+            stacked_params = self.remove_permutation(key, stacked_params)
         # now pytree of stacked params (each leaf has leading dim of k+1)
         all_params['params'] = jax.tree.map(
             lambda *x: jnp.stack(x), *stacked_params)

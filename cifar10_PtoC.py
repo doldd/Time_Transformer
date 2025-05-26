@@ -574,14 +574,14 @@ def single_run(logger, config, n_samples_nuts=None):
             _, d_bezier = bezier_curve(cp.shape[0], cp)
 
             def single(t):
-                grad = d_bezier(t)
+                grad_ = d_bezier(t)
                 second_dev = jax.jacrev(d_bezier)(t).squeeze()
 
-                norm_r_prime_sq = jnp.dot(grad, grad)  # |r'(t)|^2
+                norm_r_prime_sq = jnp.dot(grad_, grad_)  # |r'(t)|^2
                 norm_r_double_prime_sq = jnp.dot(
                     second_dev, second_dev)  # |r''(t)|^2
                 dot_r_prime_double_prime = jnp.dot(
-                    grad, second_dev)  # r'(t) · r''(t)
+                    grad_, second_dev)  # r'(t) · r''(t)
 
                 # Gram determinant equivalent for curvature
                 numerator = jnp.sqrt(
@@ -607,7 +607,7 @@ def single_run(logger, config, n_samples_nuts=None):
             x_, y_, batch_idx = batch
             rng_key, params, opt_state, best_loss, best_params = carry
             rng_key, subkey = random.split(rng_key)
-            loss, params, opt_state = s_model.train_step(
+            loss, params, opt_state, grad_ = s_model.train_step(
                 subkey, params, x_, y_, opt_state, optimizer)
             # validate
             rng_key, valid_key = random.split(rng_key)
@@ -632,7 +632,7 @@ def single_run(logger, config, n_samples_nuts=None):
             center = mass_center(cp_w)
             mean_curv = mean_curvature2(cp_w)
             rel_center = rel_center_fn(cp_w)
-            grad_norm = jnp.linalg.norm(pytree_to_matrix(grad['params'], k), axis=1).mean()
+            grad_norm = jnp.linalg.norm(pytree_to_matrix(grad_['params'], k), axis=1).mean()
 
             return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, length, l_bound, u_bound, gyra, center,  mean_curv,  rel_center, grad_norm)
 

@@ -375,7 +375,7 @@ class SubspaceModel:
         else:
             updates, opt_state = optimizer.update(grads[0]['params'], opt_state, params['params'])
             params['params'] = optax.apply_updates(params['params'], updates)
-        return loss, params, opt_state
+        return loss, params, opt_state, grads[0]
     
 
 class UniformTSubspace(SubspaceModel):
@@ -748,7 +748,7 @@ class SubspaceModelBatchNorm:
         else:
             params = {'params': trainable_params['params'],
                       'batch_stats': stats_params, 'dist_params': param_state['dist_params']}
-        return loss, params, opt_state
+        return loss, params, opt_state, grads
 
 
 class CategorySubspaceBatchNorm(SubspaceModelBatchNorm):

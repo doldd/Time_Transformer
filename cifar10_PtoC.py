@@ -442,8 +442,8 @@ def single_run(logger, config, n_samples_nuts=None):
             art = logger.use_artifact(config['params_path'], type='pytree')
             artifact_dir = art.download()
             filename = os.path.join(artifact_dir, f"{art.logged_by().id}_params.npy")
-            params = jnp.load(filename, allow_pickle=True).item()
-            curve_params = [deepcopy(params['params']) for _ in range(k+1)]
+            init_params = jnp.load(filename, allow_pickle=True).item()
+            curve_params = [deepcopy(init_params['params']) for _ in range(k+1)]
             
             # add noise to the parameters
             param, struct = jax.tree.flatten(curve_params)
@@ -457,10 +457,33 @@ def single_run(logger, config, n_samples_nuts=None):
                 curve_params = s_model.remove_permutation(init_key, curve_params)
             
             curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
-            params = {'params': curve_params, 'batch_stats': params['batch_stats'], 'dist_params': {}}
+            params = {'params': curve_params, 'batch_stats': init_params['batch_stats'], 'dist_params': {}}
 
             # load data
             x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(art.logged_by().config['rng_seed'])  # get fold from seed
+
+            def setup_init_metrics(batch_size, x, target, prefix='valid'):
+                def acc_fn(params):
+                    x_ = x.reshape(-1, batch_size, 32, 32, 3)
+                    y_ = target.reshape(-1, batch_size)
+
+                    def pred(carry, x):
+                        logits, _ = model.apply(params, x, train=False, mutable=["batch_stats"])
+                        return None, logits
+                    _, logits = jax.lax.scan(pred, None, x_)
+                    loss = jnp.mean(
+                        optax.losses.softmax_cross_entropy_with_integer_labels(
+                            logits=logits, labels=y_)
+                    )
+                    acc = jnp.mean(jnp.argmax(logits, axis=-1) == y_)
+                    return {f'init_{prefix}_acc':acc, f'init_{prefix}_loss':loss}
+                return acc_fn
+            init_metrics_fn = setup_init_metrics(250, x_val, y_val)
+            init_metrics = init_metrics_fn(init_params)
+            logger.summary.update(init_metrics)
+            init_metrics_fn = setup_init_metrics(250, x_test, y_test, prefix='test')
+            init_metrics = init_metrics_fn(init_params)
+            logger.summary.update(init_metrics)
         else:
             params = s_model.init_params(init_key, x[:2])
             # load data
@@ -570,7 +593,7 @@ def single_run(logger, config, n_samples_nuts=None):
         
         @jit
         def mean_curvature2(cp):
-            tt = jnp.linspace(0, 1, 1000)
+            tt = jnp.linspace(0, 1, 10)
             _, d_bezier = bezier_curve(cp.shape[0], cp)
 
             def single(t):
@@ -630,11 +653,11 @@ def single_run(logger, config, n_samples_nuts=None):
             u_bound = upper_bound(cp_w)
             gyra = gyration(cp_w)
             center = mass_center(cp_w)
-            mean_curv = mean_curvature2(cp_w)
+            # mean_curv = mean_curvature2(cp_w)
             rel_center = rel_center_fn(cp_w)
             grad_norm = jnp.linalg.norm(pytree_to_matrix(grad_['params'], k), axis=1).mean()
 
-            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, length, l_bound, u_bound, gyra, center,  mean_curv,  rel_center, grad_norm)
+            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm)
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -646,12 +669,12 @@ def single_run(logger, config, n_samples_nuts=None):
             # x_ = x
             x_ = x_[shuffel].reshape(-1, batch_size, 32, 32, 3)
             y_ = y[shuffel].reshape(-1, batch_size)
-            carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm) = jax.lax.scan(
+            carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm) = jax.lax.scan(
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
-            return carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm)
+            return carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm)
 
         carry = (rng_key, params, opt_state, best_loss, best_params)
-        carry, (losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm) = jax.lax.scan(
+        carry, (losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm) = jax.lax.scan(
             train_epoch, carry, jnp.arange(num_epochs))
 
         # log losses for wandb
@@ -672,7 +695,6 @@ def single_run(logger, config, n_samples_nuts=None):
         u_bound = jnp.array(u_bound).flatten()
         gyra = jnp.array(gyra).flatten()
         center = jnp.array(center).flatten()
-        mean_curv = jnp.array(mean_curv).flatten()
         rel_center = jnp.array(rel_center).flatten()
         grad_norm = jnp.array(grad_norm).flatten()
         _ = [
@@ -686,12 +708,11 @@ def single_run(logger, config, n_samples_nuts=None):
             "curve_upper_bound": ub,
             "curve_gyration": gy,
             "curve_center": ce,
-            "curve_mean_curvature": mc,
             "curve_rel_center": rc,
             "curve_grad_norm": gn,
             })
-            for e, l, vl, vacc, le, lb, ub, gy, ce, mc, rc, gn in zip(
-            epochs, losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm
+            for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn in zip(
+            epochs, losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm
             )
         ]
         params = carry[4]  # select best parameters

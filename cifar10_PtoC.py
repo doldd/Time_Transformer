@@ -15,7 +15,7 @@ import arviz as az
 from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
-from src.subspace_curve import pytree_to_matrix, vec_to_pytree, bezier_coeff_fn
+from src.subspace_curve import pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
 from src.subspace_curve import OrthoSpan, CategorySubspaceBatchNorm, RepulsiveCategorySubspaceBatchNorm
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
@@ -84,16 +84,14 @@ def load_cifar10(seed=0):
         std = jnp.array([x / 255.0 for x in [63.0, 62.1, 66.7]])
         return image * std + mean
 
-    def split_dataset(dataset, val_split=0.2, train=True):
+    def split_dataset(dataset, val_split=0.2):
         """Splits the dataset into train and validation set."""
         len_dataset = len(dataset)
         splits = get_splits(len_dataset, val_split)
         dataset_train, dataset_val = random_split(
             dataset, splits, generator=torch.Generator().manual_seed(seed))
 
-        if train:
-            return dataset_train
-        return dataset_val
+        return dataset_train, dataset_val
 
     def get_splits(len_dataset, val_split):
         """Computes split lengths for train and validation set."""
@@ -109,15 +107,15 @@ def load_cifar10(seed=0):
 
         return splits
 
-    train_transforms = torchvision.transforms.Compose(
-        [
-            # torchvision.transforms.RandomCrop(32, padding=4),
-            # torchvision.transforms.RandomHorizontalFlip(),
-            torchvision.transforms.ToTensor(),
-            cifar10_normalization,
-            torchvision.transforms.Lambda(lambda x: x.permute(1, 2, 0)),
-        ]
-    )
+    # train_transforms = torchvision.transforms.Compose(
+    #     [
+    #         # torchvision.transforms.RandomCrop(32, padding=4),
+    #         # torchvision.transforms.RandomHorizontalFlip(),
+    #         torchvision.transforms.ToTensor(),
+    #         cifar10_normalization,
+    #         torchvision.transforms.Lambda(lambda x: x.permute(1, 2, 0)),
+    #     ]
+    # )
     test_transforms = torchvision.transforms.Compose(
         [
             torchvision.transforms.ToTensor(),
@@ -126,12 +124,11 @@ def load_cifar10(seed=0):
         ]
     )
 
-    dataset_train = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
-                                    download=True, transform=train_transforms)
-    dataset_val = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
+    # dataset_train = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
+    #                                 download=True, transform=train_transforms)
+    dataset = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
                                 download=True, transform=test_transforms)
-    dataset_train = split_dataset(dataset_train, val_split=0.02)
-    dataset_val = split_dataset(dataset_val, val_split=0.02, train=False)
+    dataset_train, dataset_val = split_dataset(dataset, val_split=0.02)
     dataset_test = torchvision.datasets.CIFAR10(PATH_DATASETS, train=False,
                                     download=True, transform=test_transforms)
 
@@ -410,9 +407,6 @@ def single_run(logger, config, n_samples_nuts=None):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
 
-    x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(
-        config['rng_seed'])  # get fold from seed
-
     # create artifact for storing parameters
     artifact = wandb.Artifact(name="params", type="pytree")
 
@@ -464,8 +458,13 @@ def single_run(logger, config, n_samples_nuts=None):
             
             curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
             params = {'params': curve_params, 'batch_stats': params['batch_stats'], 'dist_params': {}}
+
+            # load data
+            x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(art.logged_by().config['rng_seed'])  # get fold from seed
         else:
             params = s_model.init_params(init_key, x[:2])
+            # load data
+            x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(config['rng_seed'])  # get fold from seed
 
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
@@ -530,6 +529,80 @@ def single_run(logger, config, n_samples_nuts=None):
             return acc_fn
         valid_metrics_fn = setup_metrics(250, x_val, y_val, n_samples=10)
 
+        # Bezier curve length
+        # define function to compute bezier curve length
+        def get_d_bezier(t):
+            bezier_coeff_inv = bezier_coeff_fn(k)
+            coeff = jax.vmap(bezier_coeff_inv)(t)
+
+            def clousure(cp):
+                n = cp.shape[0] - 1
+                cp_diff = cp[1:] - cp[:-1]
+                return jnp.einsum('tj,j...->t...', coeff, cp_diff) * n
+            return clousure
+
+        @jit
+        def bezier_length(cp):
+            t = jnp.linspace(0, 1, 1000)
+            d_bezier = get_d_bezier(t)
+            d_t = jnp.linalg.norm(d_bezier(cp), axis=-1)
+            length = jax.scipy.integrate.trapezoid(d_t, t)
+            return length
+        
+        @jit
+        def lower_bound(cp):
+            # get the length of the line between the first and last control
+            return jnp.linalg.norm(cp[-1]-cp[0])
+        
+        @jit
+        def upper_bound(cp):
+            # get the length of the line between each control point
+            return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
+
+        @jit 
+        def mass_center(cp):
+            return jnp.linalg.norm(cp.mean(axis=0))
+        
+        @jit
+        def gyration(cp):
+            mc = cp.mean(0)
+            return jnp.linalg.norm(cp - mc, axis=1).mean()
+        
+        @jit
+        def mean_curvature2(cp):
+            tt = jnp.linspace(0, 1, 1000)
+            _, d_bezier = bezier_curve(cp.shape[0], cp)
+
+            def single(t):
+                grad = d_bezier(t)
+                second_dev = jax.jacrev(d_bezier)(t).squeeze()
+
+                norm_r_prime_sq = jnp.dot(grad, grad)  # |r'(t)|^2
+                norm_r_double_prime_sq = jnp.dot(
+                    second_dev, second_dev)  # |r''(t)|^2
+                dot_r_prime_double_prime = jnp.dot(
+                    grad, second_dev)  # r'(t) · r''(t)
+
+                # Gram determinant equivalent for curvature
+                numerator = jnp.sqrt(
+                    norm_r_prime_sq * norm_r_double_prime_sq - dot_r_prime_double_prime**2)
+                denominator = norm_r_prime_sq ** (3/2)
+                return numerator / denominator
+            
+            curvature = jax.vmap(single)(tt)
+            return jax.scipy.integrate.trapezoid(curvature, tt)
+        
+        def init_rel_center(cp):
+            mean_center_t0 = cp.mean(axis=0)
+            @jit
+            def rel_center(cp):
+                return jnp.linalg.norm(cp.mean(axis=0) - mean_center_t0)
+            return rel_center
+        
+        # init metric
+        cp_w = pytree_to_matrix(params['params'], k)
+        rel_center_fn = init_rel_center(cp_w)
+
         def train_batch(carry, batch):
             x_, y_, batch_idx = batch
             rng_key, params, opt_state, best_loss, best_params = carry
@@ -551,7 +624,17 @@ def single_run(logger, config, n_samples_nuts=None):
                 val_loss < best_loss, lambda x: params, lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, val_loss)
 
-            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc)
+            cp_w = pytree_to_matrix(params['params'], k)
+            length = bezier_length(cp_w)
+            l_bound = lower_bound(cp_w)
+            u_bound = upper_bound(cp_w)
+            gyra = gyration(cp_w)
+            center = mass_center(cp_w)
+            mean_curv = mean_curvature2(cp_w)
+            rel_center = rel_center_fn(cp_w)
+            grad_norm = jnp.linalg.norm(pytree_to_matrix(grad['params'], k), axis=1).mean()
+
+            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, length, l_bound, u_bound, gyra, center,  mean_curv,  rel_center, grad_norm)
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -563,12 +646,12 @@ def single_run(logger, config, n_samples_nuts=None):
             # x_ = x
             x_ = x_[shuffel].reshape(-1, batch_size, 32, 32, 3)
             y_ = y[shuffel].reshape(-1, batch_size)
-            carry, (loss, val_loss, val_acc) = jax.lax.scan(
+            carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm) = jax.lax.scan(
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
-            return carry, (loss, val_loss, val_acc)
+            return carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm)
 
         carry = (rng_key, params, opt_state, best_loss, best_params)
-        carry, (losses, valid_losses, valid_acc) = jax.lax.scan(
+        carry, (losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm) = jax.lax.scan(
             train_epoch, carry, jnp.arange(num_epochs))
 
         # log losses for wandb
@@ -584,40 +667,43 @@ def single_run(logger, config, n_samples_nuts=None):
 
         valid_losses = jnp.array(valid_losses).flatten()
         valid_acc = jnp.array(valid_acc).flatten()
-        [logger.log({"train_loss": l, "Curve valid_loss": vl, 'Curve valid ACC': vacc, 'epoch': e})
-         for e, l, vl, vacc in zip(epochs, losses, valid_losses, valid_acc)]
+        length = jnp.array(length).flatten()
+        l_bound = jnp.array(l_bound).flatten()
+        u_bound = jnp.array(u_bound).flatten()
+        gyra = jnp.array(gyra).flatten()
+        center = jnp.array(center).flatten()
+        mean_curv = jnp.array(mean_curv).flatten()
+        rel_center = jnp.array(rel_center).flatten()
+        grad_norm = jnp.array(grad_norm).flatten()
+        _ = [
+            logger.log({
+            "train_loss": l,
+            "Curve valid_loss": vl,
+            "Curve valid ACC": vacc,
+            "epoch": e,
+            "curve_length": le,
+            "curve_lower_bound": lb,
+            "curve_upper_bound": ub,
+            "curve_gyration": gy,
+            "curve_center": ce,
+            "curve_mean_curvature": mc,
+            "curve_rel_center": rc,
+            "curve_grad_norm": gn,
+            })
+            for e, l, vl, vacc, le, lb, ub, gy, ce, mc, rc, gn in zip(
+            epochs, losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, mean_curv, rel_center, grad_norm
+            )
+        ]
         params = carry[4]  # select best parameters
         last_params = carry[1]
         rng_key = carry[0]
 
-
-
-        # Bezier curve length
-        # define function to compute bezier curve length
-        def get_d_bezier(t):
-            bezier_coeff_inv = bezier_coeff_fn(k)
-            coeff = jax.vmap(bezier_coeff_inv)(t)
-
-            def clousure(cp):
-                n = cp.shape[0] - 1
-                cp_diff = cp[1:] - cp[:-1]
-                return jnp.einsum('tj,j...->t...', coeff, cp_diff) * n
-            return clousure
-
-        @jit
-        def bezier_length(cp):
-            t = jnp.linspace(0, 1, 1000)
-            d_bezier = get_d_bezier(t)
-            d_t = jnp.linalg.norm(d_bezier(cp), axis=-1)
-            length = jax.scipy.integrate.trapezoid(d_t, t)
-            return length
-        
+        # Bezier curve length        
         cp = pytree_to_matrix(params['params'], k)
         length_best = bezier_length(cp)
         cp = pytree_to_matrix(last_params['params'], k)
         length_last = bezier_length(cp)
         logger.log({'Curve length best': length_best, 'Curve length last': length_last})
-
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 1)
@@ -626,7 +712,6 @@ def single_run(logger, config, n_samples_nuts=None):
         train_metrics_fn_final = setup_metrics(100, x, y, n_samples=50, use_linspace=True, average=False)
         test_metrics_fn_final = setup_metrics(100, x_test, y_test, n_samples=50, use_linspace=True, average=False)
     
-
 
         # valid
         nll, acc = valid_metrics_fn_final(rng_key, params)
@@ -655,6 +740,7 @@ def single_run(logger, config, n_samples_nuts=None):
             {'Nll alonge curve': wandb.Image(fig)})
         
         # valid
+        fig, ax = plt.subplots(1, 1)
         nll, acc = valid_metrics_fn_final(rng_key, last_params)
         logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))

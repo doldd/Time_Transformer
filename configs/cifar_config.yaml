@@ -30,7 +30,9 @@ parameters:
       natural_parameterization:
         value: False
       gravity:
-        values: [0., 0.01]
+        values: [0., 0.01, 0.1]
+      energy_weakening:
+        values: [10., 1., 0.1]
       weight_decay:
         value: 0.0
       remove_initial_permutation:

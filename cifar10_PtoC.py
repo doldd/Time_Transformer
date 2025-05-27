@@ -416,7 +416,8 @@ def single_run(logger, config, n_samples_nuts=None):
                     batch_size: int,
                     optimizer_conf: dict,
                     natural_parameterization: bool,
-                    gravity: float, 
+                    gravity: float,
+                    energy_weakening: float,
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
@@ -435,7 +436,7 @@ def single_run(logger, config, n_samples_nuts=None):
         s_model = RepulsiveCategorySubspaceBatchNorm(model, k=k, weight_decay=weight_decay, 
                                                      perm_spec=perm_spec,
                                                      natural_parameterization=natural_parameterization,
-                                                     gravity=gravity)
+                                                     gravity=gravity, energy_weakening=energy_weakening)
         
         # load params from wandb artifact if path is given in config
         if 'params_path' in config:
@@ -715,6 +716,23 @@ def single_run(logger, config, n_samples_nuts=None):
             epochs, losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm
             )
         ]
+        # log metrics as artifact
+        jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
+                  loss=losses,
+                  epochs=epochs,
+                  valid_loss=valid_losses,
+                  valid_acc=valid_acc,
+                  curve_length=length,
+                  curve_lower_bound=l_bound,
+                  curve_upper_bound=u_bound,
+                  curve_gyration=gyra,
+                  curve_center=center,
+                  curve_rel_center=rel_center,
+                  curve_grad_norm=grad_norm)
+        art = wandb.Artifact(name="metrics", type="npz")
+        art.add_file(f'tmp_files/{logger.id}_metrics.npz')
+        logger.log_artifact(art)
+
         params = carry[4]  # select best parameters
         last_params = carry[1]
         rng_key = carry[0]
@@ -873,7 +891,7 @@ if __name__ == '__main__':
         else:
             print("Using perdefined config")
             config = {
-                'rng_seed': 0,
+                'rng_seed': 3,
                 'net_kwargs':{'num_blocks': (3, 3, 3),
                             'c_hidden': (16, 32, 64),
                             'num_classes': 10,
@@ -881,20 +899,22 @@ if __name__ == '__main__':
                             'block_class': 'ResNetBlock'},
                 'params_path': 'ddold/cifar_PtoC/params:v1',
                 'eval_every_n_batch': 20,
-                'curve_params': {'k': 10,
-                                'num_epochs': 50,
-                                'batch_size': 100,
+                'curve_params': {'k': 2,
+                                'num_epochs': 10,
+                                'batch_size': 200,
                                 'natural_parameterization': False,
-                                'gravity': 0.,
+                                'gravity': 0.1,
+                                'energy_weakening': 0.1,
                                 'weight_decay': 0.,
                                 'remove_initial_permutation': False,
-                                'jitter': 1e-6,
+                                'jitter': 1e-8,
                                 #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
-                                                                                                'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
-                                                                                'momentum': 0.9, 
-                                                                                'nesterov': True},},
+                                 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},
+                                # 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
+                                                                                                # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
+                                                                                # 'momentum': 0.9, 
+                                                                                # 'nesterov': True},},
                             }}
             logger = wandb.init(project="cifar_PtoC", name="cifar_curve", entity="ddold", config=config)
             single_run(logger, config)

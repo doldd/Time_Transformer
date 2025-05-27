@@ -781,7 +781,7 @@ class CategorySubspaceBatchNorm(SubspaceModelBatchNorm):
 
 
 class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
-    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0):
+    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1):
         """
         Initializes the RepulsiveCategorySubspaceBatchNorm class.
 
@@ -794,6 +794,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         """
         super().__init__(model, k, weight_decay, perm_spec, natural_parameterization)
         self.gravity = gravity
+        self.energy_weaker = energy_weakening
 
     def repulsive_force(self, params):
         """
@@ -812,7 +813,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = A - A[i]
                 dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = self.gravity/(dists+1e-3)
+                dists = self.gravity/(dists+self.energy_weaker)
                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
                 return acc + jnp.sum(dists)
             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
@@ -836,7 +837,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = jnp.abs(A - A[i])
                 dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = self.gravity/(dists+1e-3)
+                dists = self.gravity/(dists+self.energy_weaker)
                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
                 return acc + jnp.sum(dists)
             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
@@ -858,6 +859,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         - The negative log-likelihood loss.
         """
         nll, batch_stats = super().nll(params, param_stats, t, x, y)
+        # rep_force = self.repulsive_force(params)
         rep_force = self.repulsive_energy(params)
         # jax.debug.print("nll: {}",nll)
         # jax.debug.print("forece: {}",rep_force)

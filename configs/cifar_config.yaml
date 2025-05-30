@@ -48,7 +48,7 @@ parameters:
           kwargs:
             parameters:
               learning_rate:
-                values: [0.05, 0.005]
+                value: 0.005
               momentum:
                 value: 0.9
               nesterov:

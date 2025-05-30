@@ -813,7 +813,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = A - A[i]
                 dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = self.gravity/(dists+self.energy_weaker)
+                dists = self.gravity/(dists+self.energy_weaker+1e-8)
                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
                 return acc + jnp.sum(dists)
             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
@@ -837,12 +837,13 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = jnp.abs(A - A[i])
                 dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = self.gravity/(dists+self.energy_weaker)
-                dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
-                return acc + jnp.sum(dists)
+                energy = self.gravity/(dists+self.energy_weaker+1e-8)
+                log_energy = jnp.log(energy)
+                log_energy = jnp.where(jnp.arange(0,n)>i, log_energy, 0.) # masking: use only i+1: elements
+                return acc + jnp.sum(log_energy)
             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
-        force = sum_pairwise_distances(cp_w)
-        return force
+        log_energy = sum_pairwise_distances(cp_w)
+        return log_energy
 
     
     def nll(self, params, param_stats, t, x, y):
@@ -859,8 +860,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         - The negative log-likelihood loss.
         """
         nll, batch_stats = super().nll(params, param_stats, t, x, y)
-        # rep_force = self.repulsive_force(params)
-        rep_force = self.repulsive_energy(params)
+        rep_force = self.repulsive_force(params)
         # jax.debug.print("nll: {}",nll)
         # jax.debug.print("forece: {}",rep_force)
         return nll + rep_force, batch_stats

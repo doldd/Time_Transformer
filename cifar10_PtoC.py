@@ -557,7 +557,7 @@ def single_run(logger, config, n_samples_nuts=None):
                 entropy = jnp.mean(entropy, axis=0)
                 return loss, acc, entropy  # mean over epochs
             return acc_fn
-        valid_metrics_fn = setup_metrics(250, x_val, y_val, n_samples=50)
+        valid_metrics_fn = setup_metrics(250, x_val, y_val, n_samples=10)
 
         # Bezier curve length
         # define function to compute bezier curve length

@@ -418,6 +418,7 @@ def single_run(logger, config, n_samples_nuts=None):
                     natural_parameterization: bool,
                     gravity: float,
                     energy_weakening: float,
+                    regularizer: str,
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
@@ -436,7 +437,7 @@ def single_run(logger, config, n_samples_nuts=None):
         s_model = RepulsiveCategorySubspaceBatchNorm(model, k=k, weight_decay=weight_decay, 
                                                      perm_spec=perm_spec,
                                                      natural_parameterization=natural_parameterization,
-                                                     gravity=gravity, energy_weakening=energy_weakening)
+                                                     gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
         
         # load params from wandb artifact if path is given in config
         if 'params_path' in config:
@@ -532,26 +533,31 @@ def single_run(logger, config, n_samples_nuts=None):
                         loss = jnp.mean(optax.losses.softmax_cross_entropy_with_integer_labels(
                             logits=logits, labels=y_batch))
                         acc = jnp.mean(jnp.argmax(logits, axis=-1) == y_batch)
-                        return loss, acc  # mean over batch
+                        # entropy
+                        probs = jax.nn.softmax(logits, axis=-1)
+                        entropy = -jnp.sum(probs*jnp.log(probs), axis=-1)
+                        mean_batch_entropy = jnp.mean(entropy)
+                        return loss, acc, mean_batch_entropy  # mean over batch
                     key, subkey = random.split(key)
 
-                    # draw 10 samples to approximate curve performance
+                    # draw samples to approximate curve performance
                     t = get_t(subkey)
-                    loss, acc = jax.vmap(eval)(t)
+                    loss, acc, entropy = jax.vmap(eval)(t)
 
                     if average:
                         # mean over samples
-                        return key, (jnp.mean(loss), jnp.mean(acc))
+                        return key, (jnp.mean(loss), jnp.mean(acc), jnp.mean(entropy))
                     else:
-                        return key, (loss, acc)  # no mean over samples
+                        return key, (loss, acc, entropy)  # no mean over samples
 
                 # shape (n_data, draws, output_dim)
-                rng_key, (loss, acc) = jax.lax.scan(pred, rng_key, (x_, y_))
+                rng_key, (loss, acc, entropy) = jax.lax.scan(pred, rng_key, (x_, y_))
                 loss = jnp.mean(loss, axis=0)
                 acc = jnp.mean(acc, axis=0)
-                return loss, acc  # mean over epochs
+                entropy = jnp.mean(entropy, axis=0)
+                return loss, acc, entropy  # mean over epochs
             return acc_fn
-        valid_metrics_fn = setup_metrics(250, x_val, y_val, n_samples=10)
+        valid_metrics_fn = setup_metrics(250, x_val, y_val, n_samples=50)
 
         # Bezier curve length
         # define function to compute bezier curve length
@@ -642,8 +648,8 @@ def single_run(logger, config, n_samples_nuts=None):
             # best_loss = jnp.minimum(best_loss, val_loss)
 
             # acc, val_loss = valid_metrics_fn(valid_key, params)
-            val_loss, acc = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                valid_key, params), lambda x: (jnp.inf, -jnp.inf), None)
+            val_loss, acc, m_entropy = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
+                valid_key, params), lambda x: (jnp.inf, -jnp.inf, -jnp.inf), None)
             best_params = jax.lax.cond(
                 val_loss < best_loss, lambda x: params, lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, val_loss)
@@ -657,8 +663,9 @@ def single_run(logger, config, n_samples_nuts=None):
             # mean_curv = mean_curvature2(cp_w)
             rel_center = rel_center_fn(cp_w)
             grad_norm = jnp.linalg.norm(pytree_to_matrix(grad_['params'], k), axis=1).mean()
+            cos_sim = s_model.summed_cosine_similarity(params)
 
-            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm)
+            return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, m_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -670,12 +677,12 @@ def single_run(logger, config, n_samples_nuts=None):
             # x_ = x
             x_ = x_[shuffel].reshape(-1, batch_size, 32, 32, 3)
             y_ = y[shuffel].reshape(-1, batch_size)
-            carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm) = jax.lax.scan(
+            carry, (loss, val_loss, val_acc, val_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
-            return carry, (loss, val_loss, val_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm)
+            return carry, (loss, val_loss, val_acc, val_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
         carry = (rng_key, params, opt_state, best_loss, best_params)
-        carry, (losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm) = jax.lax.scan(
+        carry, (losses, valid_losses, valid_acc, val_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
             train_epoch, carry, jnp.arange(num_epochs))
 
         # log losses for wandb
@@ -688,9 +695,12 @@ def single_run(logger, config, n_samples_nuts=None):
             EVAL_EVERY_N_BATCH, axis=1)[:,:valid_losses.shape[1]]
         valid_acc = valid_acc[:, ::EVAL_EVERY_N_BATCH].repeat(
             EVAL_EVERY_N_BATCH, axis=1)[:, :valid_acc.shape[1]]
+        val_entropy = val_entropy[:, ::EVAL_EVERY_N_BATCH].repeat(
+            EVAL_EVERY_N_BATCH, axis=1)[:, :val_entropy.shape[1]]
 
         valid_losses = jnp.array(valid_losses).flatten()
         valid_acc = jnp.array(valid_acc).flatten()
+        val_entropy = jnp.array(val_entropy).flatten()
         length = jnp.array(length).flatten()
         l_bound = jnp.array(l_bound).flatten()
         u_bound = jnp.array(u_bound).flatten()
@@ -698,11 +708,13 @@ def single_run(logger, config, n_samples_nuts=None):
         center = jnp.array(center).flatten()
         rel_center = jnp.array(rel_center).flatten()
         grad_norm = jnp.array(grad_norm).flatten()
+        cos_sim = jnp.array(cos_sim).flatten()
         _ = [
             logger.log({
             "train_loss": l,
             "Curve valid_loss": vl,
             "Curve valid ACC": vacc,
+            "Curve valid Entropy": ve,
             "epoch": e,
             "curve_length": le,
             "curve_lower_bound": lb,
@@ -711,9 +723,10 @@ def single_run(logger, config, n_samples_nuts=None):
             "curve_center": ce,
             "curve_rel_center": rc,
             "curve_grad_norm": gn,
+            "summed_cosine_similarity": cs,
             })
-            for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn in zip(
-            epochs, losses, valid_losses, valid_acc, length, l_bound, u_bound, gyra, center, rel_center, grad_norm
+            for e, l, vl, vacc, ve, le, lb, ub, gy, ce, rc, gn, cs in zip(
+            epochs, losses, valid_losses, valid_acc, val_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
             )
         ]
         # log metrics as artifact
@@ -722,13 +735,15 @@ def single_run(logger, config, n_samples_nuts=None):
                   epochs=epochs,
                   valid_loss=valid_losses,
                   valid_acc=valid_acc,
+                  val_entropy=val_entropy,
                   curve_length=length,
                   curve_lower_bound=l_bound,
                   curve_upper_bound=u_bound,
                   curve_gyration=gyra,
                   curve_center=center,
                   curve_rel_center=rel_center,
-                  curve_grad_norm=grad_norm)
+                  curve_grad_norm=grad_norm,
+                  summed_cosine_similarity=cos_sim)
         art = wandb.Artifact(name="metrics", type="npz")
         art.add_file(f'tmp_files/{logger.id}_metrics.npz')
         logger.log_artifact(art)
@@ -753,20 +768,20 @@ def single_run(logger, config, n_samples_nuts=None):
     
 
         # valid
-        nll, acc = valid_metrics_fn_final(rng_key, params)
-        logger.log({'acc_val_curve': acc.mean(), 'nll_val_curve': nll.mean()})
+        nll, acc, entropy = valid_metrics_fn_final(rng_key, params)
+        logger.log({'acc_val_curve': acc.mean(), 'nll_val_curve': nll.mean(), 'entropy_val_curve': entropy.mean()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax.twinx()
         ax2.plot(t_space, acc, label="valid acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         # train
-        nll, acc = train_metrics_fn_final(rng_key, params)
+        nll, acc, entropy = train_metrics_fn_final(rng_key, params)
         ax.plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
         ax2.plot(t_space, acc, label="train acc",
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
-        nll, acc = test_metrics_fn_final(rng_key, params)
-        logger.log({'acc_test_curve': acc.mean(), 'nll_test_curve': nll.mean()})
+        nll, acc, entropy = test_metrics_fn_final(rng_key, params)
+        logger.log({'acc_test_curve': acc.mean(), 'nll_test_curve': nll.mean(), 'entropy_test_curve': entropy.mean()})
         ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, acc, label="test acc",
                  c=plt.get_cmap('tab10')(2), linestyle="--")
@@ -780,20 +795,20 @@ def single_run(logger, config, n_samples_nuts=None):
         
         # valid
         fig, ax = plt.subplots(1, 1)
-        nll, acc = valid_metrics_fn_final(rng_key, last_params)
-        logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean()})
+        nll, acc, entropy = valid_metrics_fn_final(rng_key, last_params)
+        logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean(), 'entropy_val_curve_last': entropy.mean()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax.twinx()
         ax2.plot(t_space, acc, label="valid acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         # train
-        nll, acc = train_metrics_fn_final(rng_key, last_params)
+        nll, acc, entropy = train_metrics_fn_final(rng_key, last_params)
         ax.plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
         ax2.plot(t_space, acc, label="train acc",
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
-        nll, acc = test_metrics_fn_final(rng_key, last_params)
-        logger.log({'acc_test_curve_last': acc.mean(), 'nll_test_curve_last': nll.mean()})
+        nll, acc, entropy = test_metrics_fn_final(rng_key, last_params)
+        logger.log({'acc_test_curve_last': acc.mean(), 'nll_test_curve_last': nll.mean(), 'entropy_test_curve_last': entropy.mean()})
         ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, acc, label="test acc",
                  c=plt.get_cmap('tab10')(2), linestyle="--")

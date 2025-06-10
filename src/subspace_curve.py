@@ -781,7 +781,7 @@ class CategorySubspaceBatchNorm(SubspaceModelBatchNorm):
 
 
 class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
-    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1):
+    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1, regularizer="force"):
         """
         Initializes the RepulsiveCategorySubspaceBatchNorm class.
 
@@ -791,10 +791,24 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         - out_scale: The output scale.
         - optimize_distparams: Whether to optimize the distribution parameters.
         - gravity: The gravity parameter.
+        - energy_weakening: The energy weakening parameter.
+        - regularizer: The regularizer type ("force", "energy", "cosine_similarity").
         """
         super().__init__(model, k, weight_decay, perm_spec, natural_parameterization)
         self.gravity = gravity
         self.energy_weaker = energy_weakening
+        self.regularizer = self._get_regularizer(regularizer)
+
+    def _get_regularizer(self, regularizer):
+        reg = regularizer.lower()
+        if reg == "force":
+            return self.repulsive_force
+        elif reg == "energy":
+            return self.repulsive_energy
+        elif reg in ("cosine_similarity", "cosine", "similarity"):
+            return self.summed_cosine_similarity
+        else:
+            raise ValueError(f"Unknown regularizer type: {regularizer}")
 
     def repulsive_force(self, params):
         """
@@ -845,6 +859,29 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         log_energy = sum_pairwise_distances(cp_w)
         return log_energy
 
+    def summed_cosine_similarity(self, params):
+        """
+        Computes the sum of pairwise cosine similarities to minimize.
+
+        Equation:
+            β · Σ_{j ≠ k} cos²(ω_j, ω_k) = β · Σ_{j ≠ k} (⟨ω_j, ω_k⟩ / (||ω_j|| ||ω_k||))²
+            $\beta \cdot \sum_{j \neq k} \cos^2(\omega_j, \omega_k) = \beta \cdot \sum_{j \neq k} \left( \frac{\langle \omega_j, \omega_k \rangle}{\|\omega_j\| \|\omega_k\|} \right)^2$
+
+        Parameters:
+        - params: The parameters of the model.
+
+        Returns:
+        - The summed pairwise cosine similarity.
+        """
+        cp_w = pytree_to_matrix(params['params'], self.k)
+        n = cp_w.shape[0]
+        cp_w = cp_w / jnp.linalg.norm(cp_w, axis=-1, keepdims=True)
+        dot_res = jnp.dot(cp_w, cp_w.T) # k x k matrix of cosine similarities
+        # upper triangular part without diagonal
+        upper_triangular_indices = jnp.triu_indices(n, k=1)
+        cosine_sim = self.gravity * jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
+        return cosine_sim
+
     
     def nll(self, params, param_stats, t, x, y):
         """
@@ -860,7 +897,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         - The negative log-likelihood loss.
         """
         nll, batch_stats = super().nll(params, param_stats, t, x, y)
-        rep_force = self.repulsive_force(params)
+        rep_force = self.regularizer(params)
         # jax.debug.print("nll: {}",nll)
         # jax.debug.print("forece: {}",rep_force)
         return nll + rep_force, batch_stats

@@ -827,7 +827,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = A - A[i]
                 dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = self.gravity/(dists+self.energy_weaker+1e-8)
+                dists = 1./(dists+self.energy_weaker+1e-8)
                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
                 return acc + jnp.sum(dists)
             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
@@ -851,7 +851,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
                 diffs = jnp.abs(A - A[i])
                 dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                energy = self.gravity/(dists+self.energy_weaker+1e-8)
+                energy = 1./(dists+self.energy_weaker+1e-8)
                 log_energy = jnp.log(energy)
                 log_energy = jnp.where(jnp.arange(0,n)>i, log_energy, 0.) # masking: use only i+1: elements
                 return acc + jnp.sum(log_energy)
@@ -879,7 +879,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         dot_res = jnp.dot(cp_w, cp_w.T) # k x k matrix of cosine similarities
         # upper triangular part without diagonal
         upper_triangular_indices = jnp.triu_indices(n, k=1)
-        cosine_sim = self.gravity * jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
+        cosine_sim = jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
         return cosine_sim
 
     
@@ -900,7 +900,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         rep_force = self.regularizer(params)
         # jax.debug.print("nll: {}",nll)
         # jax.debug.print("forece: {}",rep_force)
-        return nll + rep_force, batch_stats
+        return nll + self.gravity * rep_force, batch_stats
 
 #@partial(jit, static_argnums=(1))
 def pytree_to_matrix(pytree, k):

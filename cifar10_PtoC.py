@@ -664,7 +664,7 @@ def single_run(logger, config, n_samples_nuts=None):
             rel_center = rel_center_fn(cp_w)
             grad_norm = jnp.linalg.norm(pytree_to_matrix(grad_['params'], k), axis=1).mean()
             cos_sim = s_model.summed_cosine_similarity(params)
-
+            cos_sim /= ((k+1)*k/2)
             return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, m_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
         @scan_tqdm(num_epochs)

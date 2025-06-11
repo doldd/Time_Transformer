@@ -806,7 +806,7 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         elif reg == "energy":
             return self.repulsive_energy
         elif reg in ("cosine_similarity", "cosine", "similarity"):
-            return self.summed_cosine_similarity
+            return self.summed_cosine_similarity_square
         else:
             raise ValueError(f"Unknown regularizer type: {regularizer}")
 
@@ -881,7 +881,9 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
         upper_triangular_indices = jnp.triu_indices(n, k=1)
         cosine_sim = jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
         return cosine_sim
-
+    
+    def summed_cosine_similarity_square(self, params):
+        return self.summed_cosine_similarity(params)** 2
     
     def nll(self, params, param_stats, t, x, y):
         """

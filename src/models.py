@@ -20,7 +20,7 @@ class MLPModel(nn.Module):
         return super().setup()
 
     @nn.compact
-    def __call__(self, x,):
+    def __call__(self, x, train=True):
         x = jnp.concat([x, x**2, x**3], axis=-1)
         for _ in range(self.depth):
             x = nn.Dense(self.width)(x)
@@ -39,7 +39,7 @@ class MLPModelUCI(nn.Module):
         return super().setup()
 
     @nn.compact
-    def __call__(self, x,):
+    def __call__(self, x, train=True):
         for _ in range(self.depth):
             x = nn.Dense(self.width)(x)
             x = self.activation_fn(x)

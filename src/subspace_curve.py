@@ -5,7 +5,7 @@ import optax
 import numpy as np
 from functools import partial
 from jax import custom_jvp
-from typing import Callable
+from typing import Callable, Tuple
 from numpyro import distributions as dist
 from jaxopt import Bisection
 from jax.scipy.special import gammaln
@@ -193,13 +193,14 @@ class BezierTspaceUnifrom(dist.Uniform):
         raise NotImplementedError
 
 
-class SubspaceModel:
+class SubspaceBaseModel:
     """
     A class representing a subspace model which can be used to train the curve model.
 
     Parameters:
     - model: The underlying model used in the subspace model.
     - k: The number of parameter sets to sample.
+    - mutuable_param_name (str or bool, optional): Name of the mutable parameter or False if not used. Default is False.
 
     Attributes:
     - model: The underlying model used in the subspace model.
@@ -215,294 +216,15 @@ class SubspaceModel:
 
     """
 
-    def __init__(self, model, k, n_samples=1, out_scale=0.05, optimize_distparams=False):
-        self.model = model
-        self.k = k
-        self.bezier = jax.vmap(bezier_coeff_fn(k + 1))
-        self.n_samples = n_samples
-        self.out_scale = out_scale
-        self.optimize_distparams = optimize_distparams
-
-
-    def init_params(self, key, x):
-            """
-            Initializes the parameters of the model.
-
-            Parameters:
-            - key: The random key for parameter initialization.
-            - x: The input data.
-
-            Returns:
-            - The initialized parameters.
-
-            """
-            keys = random.split(key, self.k+1)
-            # list of params and variables (such as batch statistics)
-            params_and_var = [self.model.init(k, x) for k in keys]
-            # now pytree of stacked params (each leaf has leading dim of k+1)
-            stacked_params_var = jax.tree.map(
-                lambda *x: jnp.stack(x), *params_and_var)
-            
-            stacked_params_var['dist_params'] = {'log_scale': jnp.log(
-                jnp.array(self.out_scale))}
-            # only trainable params from pytree
-            return stacked_params_var
-
-    @partial(jit, static_argnums=(0,))
-    def __call__(self, params, t, x):
-        """
-        Computes the output of the model for given parameters, time, and input.
-
-        Parameters:
-        - params: The parameters of the model.
-        - t: The time parameter.
-        - x: The input data.
-
-        Returns:
-        - The output of the model.
-
-        """
-        # sample Bezier coefficient
-        bezier_coeff = self.bezier(t)
-        # Compute one parameter set per sample
-        sample_param = jax.tree.map(lambda p: jnp.einsum(
-            'sk,k...->s...', bezier_coeff, p), params)
-        sample_param = dict(params=sample_param)
-        # forward pass per sample
-        out = jax.vmap(self.model.apply, in_axes=(0, None))(sample_param, x)
-        return out
-
-    @partial(jit, static_argnums=(0,))
-    def nll(self, params, t, x, y):
-        """
-        Computes the negative log-likelihood loss of the model.
-
-        Parameters:
-        - params: The parameters of the model.
-        - t: The time parameter.
-        - x: The input data.
-        - y: The target output.
-
-        Returns:
-        - The negative log-likelihood loss.
-
-        """
-        out = self(params['params'], t, x)  # shape (n_samples, n_data, output_dim)
-        nll = -jax.scipy.stats.norm.logpdf(y,
-                                           loc=out.squeeze(axis=-1), scale=jnp.exp(params['dist_params']['log_scale'])+1e-8)
-        return nll
-
-    @partial(jit, static_argnums=(0, 5))
-    def compute_loss(self, key, params, x, y, n_samples=1):
-        """
-        Computes the loss of the model.
-
-        Parameters:
-        - key: The random key for generating random numbers.
-        - params: The parameters of the model.
-        - x: The input data.
-        - y: The target output.
-        - n_samples: The number of samples to use for computing the loss.
-
-        Returns:
-        - The computed loss.
-
-        """
-        # Sample t param of Bezier curve
-        t = random.uniform(key, (n_samples,), minval=0., maxval=1.)
-        loss = self.nll(params, t, x, y)
-        return loss.mean()
-    
-    @partial(jit, static_argnums=(0, 5))
-    def compute_loss_natural_t(self, key, params, x, y, n_samples=1):
-        """
-        Computes the loss of the model.
-
-        Parameters:
-        - key: The random key for generating random numbers.
-        - params: The parameters of the model.
-        - x: The input data.
-        - y: The target output.
-        - n_samples: The number of samples to use for computing the loss.
-
-        Returns:
-        - The computed loss.
-
-        """
-        # Sample t param of Bezier curve
-
-        t = random.uniform(key, (n_samples,), minval=0., maxval=1.)
-        loss = self.nll(params, t, x, y).mean(-1)
-        # jax.debug.print(f'loss shape: {loss.shape}')
-
-        cp_w = pytree_to_matrix(params['params'], self.k)
-        curve, d_bezier = bezier_curve(self.k+1, cp_w)
-        tt = jnp.linspace(0., 1., 10_000)
-        bezier_grad = jax.vmap(d_bezier)(tt)
-        normalized_grad = jnp.trapezoid(
-            jnp.linalg.norm(bezier_grad, axis=-1), tt)
-        grads = jax.vmap(d_bezier)(t)
-        weights = jnp.linalg.norm(grads, axis=-1) / normalized_grad
-
-        # t_dist = BezierTspaceUnifrom(d_bezier)
-        # t = t_dist.sample(key, (n_samples,))
-
-        weighted_loss = jnp.einsum('n,n->', weights, loss)/n_samples
-        return weighted_loss
-
-    @partial(jit, static_argnums=(0, 6))
-    def train_step(self, key, params, x, y, opt_state, optimizer):
-        """
-        Performs a single training step.
-
-        Parameters:
-        - key: The random key for generating random numbers.
-        - params: The parameters of the model.
-        - x: The input data.
-        - y: The target output.
-        - opt_state: The optimizer state.
-        - optimizer: The optimizer.
-
-        Returns:
-        - The loss, updated parameters, and updated optimizer state.
-
-        """
-        loss, grads = jax.value_and_grad(
-            self.compute_loss, argnums=(1,), )(key, params, x, y, self.n_samples)
-        if self.optimize_distparams:
-            updates, opt_state = optimizer.update(grads[0], opt_state, params)
-            params = optax.apply_updates(params, updates)
-        else:
-            updates, opt_state = optimizer.update(grads[0]['params'], opt_state, params['params'])
-            params['params'] = optax.apply_updates(params['params'], updates)
-        return loss, params, opt_state, grads[0]
-    
-
-class UniformTSubspace(SubspaceModel):
-    # slow implementation and not working because of gradient computation
-    # @partial(jit, static_argnums=(0, 5))
-    # def compute_loss(self, key, params, x, y, n_samples=1):
-    #     """
-    #     Computes the loss of the model.
-
-    #     Parameters:
-    #     - key: The random key for generating random numbers.
-    #     - params: The parameters of the model.
-    #     - x: The input data.
-    #     - y: The target output.
-    #     - n_samples: The number of samples to use for computing the loss.
-
-    #     Returns:
-    #     - The computed loss.
-
-    #     """
-    #     # Sample t param of Bezier curve
-    #     cp_w = pytree_to_matrix(params['params'], self.k)
-    #     curve, d_bezier = bezier_curve(self.k+1, cp_w)
-    #     t_dist = BezierTspaceUnifrom(d_bezier)
-    #     t = t_dist.sample(key, (n_samples,))
-    #     loss = self.nll(params, t, x, y)
-    #     return loss.mean()
-    
-    @partial(jit, static_argnums=(0, 5))
-    def compute_loss(self, key, params, x, y, n_samples=1):
-        """
-        Computes the loss of the model.
-
-        Parameters:
-        - key: The random key for generating random numbers.
-        - params: The parameters of the model.
-        - x: The input data.
-        - y: The target output.
-        - n_samples: The number of samples to use for computing the loss.
-
-        Returns:
-        - The computed loss.
-
-        """
-        # Sample t param of Bezier curve
-
-        t = random.uniform(key, (n_samples,), minval=0., maxval=1.)
-        loss = self.nll(params, t, x, y).mean(-1)
-        # jax.debug.print(f'loss shape: {loss.shape}')
-
-        cp_w = pytree_to_matrix(params['params'], self.k)
-        curve, d_bezier = bezier_curve(self.k+1, cp_w)
-        tt = jnp.linspace(0., 1., 10_000)
-        bezier_grad = jax.vmap(d_bezier)(tt)
-        curve_length = jnp.trapezoid(
-            jnp.linalg.norm(bezier_grad, axis=-1), tt)
-        grads = jax.vmap(d_bezier)(t)
-        weights = jnp.linalg.norm(grads, axis=-1) / curve_length
-
-        # t_dist = BezierTspaceUnifrom(d_bezier)
-        # t = t_dist.sample(key, (n_samples,))
-
-        weighted_loss = jnp.einsum('n,n->', weights, loss)/n_samples
-        return weighted_loss
-
-class CategorySubspace(SubspaceModel):
-    def __init__(self, model, k, n_samples):
-        super().__init__(model, k, n_samples, np.inf, False)
-
-    @partial(jit, static_argnums=(0,))
-    def nll(self, params, t, x, y):
-        """
-        Computes the negative log-likelihood loss of the model.
-
-        Parameters:
-        - params: The parameters of the model.
-        - t: The time parameter.
-        - x: The input data.
-        - y: The target output.
-
-        Returns:
-        - The negative log-likelihood loss.
-
-        """
-        logits = self(params['params'], t,
-                      x)  # shape (n_samples, n_data, output_dim)
-
-        nll = jax.vmap(
-            optax.softmax_cross_entropy_with_integer_labels, in_axes=(0, None))(logits, y)
-        return nll
-
-
-class UniformTCategory(CategorySubspace, UniformTSubspace):
-    pass
-
-
-class SubspaceModelBatchNorm:
-    """
-    A class representing a subspace model which can be used to train the curve model.
-
-    Parameters:
-    - model: The underlying model used in the subspace model.
-    - k: The number of parameter sets to sample.
-
-    Attributes:
-    - model: The underlying model used in the subspace model.
-    - k: The number of parameter sets to sample.
-    - bezier: The BezierCoeff object for computing Bezier coefficients.
-
-    Methods:
-    - init_params(x): Initializes the parameters of the model.
-    - __call__(params, t, x): Computes the output of the model for given parameters, time, and input.
-    - nll(params, t, x, y): Computes the negative log-likelihood loss of the model.
-    - compute_loss(key, params, x, y, n_samples=1): Computes the loss of the model.
-    - train_step(key, params, x, y, opt_state, optimizer): Performs a single training step.
-
-    """
-
-    def __init__(self, model, k, out_scale=0.05, optimize_distparams=False, weight_decay=0., perm_spec: PermutationSpec = False, natural_parameterization=False):
+    def __init__(self, model, k, weight_decay=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False):
         self.model = model
         self.k = k
         self.bezier = bezier_coeff_fn(k + 1)
-        self.out_scale = out_scale
-        self.optimize_distparams = optimize_distparams
         self.weight_decay = weight_decay
         self.perm_spec = perm_spec
+        self.mutable_name = mutuable_param_name
         self.compute_loss = self.compute_loss_natural_t if natural_parameterization else self.compute_loss_t
+        self.curve_mask = None
 
     def remove_permutation(self, key, params_list):
         """
@@ -530,8 +252,24 @@ class SubspaceModelBatchNorm:
             params_list[i] = unflatten_params(apply_permutation(
                 self.perm_spec, final_permutation, flatten_params(p)))
         return params_list
+
+    def init_mask(self, x, all_curves=False):
+        """
+        Initializes the mask for the model parameters.
+
+        Parameters:
+        - x: The input data.
+
+        Returns:
+        - A pytree of masks with the same structure as the model parameters, where each leaf is a boolean indicating whether the parameter is trainable.
+
+        """
+        params = self.model.init(random.PRNGKey(0), x)
+        mask = jax.tree.map(lambda x: all_curves, params['params'])
+        return mask
     
-    def init_params(self, key, x):
+    
+    def init_params(self, key, x, mask):
         """
         Initializes the parameters of the model.
 
@@ -554,37 +292,39 @@ class SubspaceModelBatchNorm:
             stacked_params = self.remove_permutation(key, stacked_params)
         # now pytree of stacked params (each leaf has leading dim of k+1)
         all_params['params'] = jax.tree.map(
-            lambda *x: jnp.stack(x), *stacked_params)
+            lambda m, *x: jnp.stack(x) if m else x[0], mask, *stacked_params)
 
-        all_params['dist_params'] = {'log_scale': jnp.log(
-            jnp.array(self.out_scale))}
-        # only trainable params from pytree
+        self.curve_mask = mask
         return all_params
+    
 
     @partial(jit, static_argnums=(0,))
-    def _predict(self, params, bn_params, inputs, train):
+    def _predict(self, params, state, inputs, train) -> Tuple[jnp.ndarray, dict]:
         # Predict out from inputs and parameters
-        all_params = {"params": params, "batch_stats": bn_params}
-
-        def train_fn(inputs):
-            out, net_state = self.model.apply(
-                all_params, inputs, train=True, mutable=["batch_stats"]
-            )
-            return out, net_state
+        if self.mutable_name:
+            all_params = {'params': params, self.mutable_name: state}
+            def train_fn(inputs):
+                out, net_state = self.model.apply(
+                    all_params, inputs, train=True, mutable=self.mutable_name)
+                return out, net_state[self.mutable_name]
+        else:
+            all_params = {'params': params}
+            def train_fn(inputs):
+                out = self.model.apply(all_params, inputs, train=True, mutable=False)
+                return out, {}
 
         def eval_fn(inputs):
             out = self.model.apply(all_params, inputs,
                                    train=False, mutable=False)
-            net_state = {"batch_stats": bn_params}
-            return out, net_state
+            return out, state
 
         out, net_state = jax.lax.cond(
-            train, lambda x: train_fn(x), lambda x: eval_fn(x), inputs
+            train, train_fn, eval_fn, inputs
         )
-        return out, net_state['batch_stats']
+        return out, net_state
 
     @partial(jit, static_argnums=(0,))
-    def __call__(self, params, batch_stats, t, x):
+    def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the output of the model for given parameters, time, and input.
 
@@ -600,30 +340,17 @@ class SubspaceModelBatchNorm:
         # sample Bezier coefficient
         bezier_coeff = self.bezier(t)
         # Compute one parameter set per sample
-        sample_param = jax.tree.map(lambda p: jnp.einsum(
-            'k,k...->...', bezier_coeff, p), params)
+        params = jax.tree.map(lambda p, m: jnp.einsum(
+            'k,k...->...', bezier_coeff, p) if m else p, params, self.curve_mask)
 
         # forward pass per sample
-        out, batch_stats = self._predict(
-            sample_param, batch_stats, x, train=True)
-        return out, batch_stats
-
-    def eval(self, params, batch_stats, t, x):
-        # sample Bezier coefficient
-        bezier_coeff = self.bezier(t)
-        # Compute one parameter set per sample
-        sample_param = jax.tree.map(lambda p: jnp.einsum(
-            'k,k...->...', bezier_coeff, p), params)
-
-        # forward pass per sample
-        out, batch_stats = self._predict(
-            sample_param, batch_stats, x, train=False)
-        return out, batch_stats
+        out, state = self._predict(params, state, x, train=train)
+        return out, state
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, param_stats, t, x, y):
+    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
         """
-        Computes the negative log-likelihood loss of the model.
+        Abstract method for computing the negative log-likelihood loss of the model.
 
         Parameters:
         - params: The parameters of the model.
@@ -634,23 +361,17 @@ class SubspaceModelBatchNorm:
         Returns:
         - The negative log-likelihood loss.
 
+        Raises:
+        - NotImplementedError: This method should be implemented by subclasses.
         """
-        out, batch_stats = self(
-            params['params'], param_stats['batch_stats'], t, x)  # shape (n_data, output_dim)
-        if self.optimize_distparams:
-            nll = -jax.scipy.stats.norm.logpdf(y,
-                                               loc=out.squeeze(axis=-1), scale=jnp.exp(params['dist_params']['log_scale'])+1e-8)
-        else:
-            nll = -jax.scipy.stats.norm.logpdf(y,
-                                               loc=out.squeeze(axis=-1), scale=jnp.exp(param_stats['dist_params']['log_scale'])+1e-8)
-        return nll, batch_stats
+        raise NotImplementedError("nll must be implemented by subclasses of SubspaceBaseModel.")
 
     @staticmethod
     def l2_loss(x, alpha):
         return alpha * (x ** 2).sum()
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, params, param_stats, x, y):
+    def compute_loss_t(self, key, params, state, x, y):
         """
         Computes the loss of the model.
 
@@ -667,13 +388,13 @@ class SubspaceModelBatchNorm:
         """
         # Sample t param of Bezier curve
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, batch_stats = self.nll(params, param_stats, t, x, y)
+        loss, state = self.nll(params, state, t, x, y)
         loss = loss.mean() + sum(self.l2_loss(w, alpha=self.weight_decay)
                                  for w in jax.tree.leaves(params))
-        return loss, batch_stats
+        return loss, state
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_natural_t(self, key, params, param_stats, x, y):
+    def compute_loss_natural_t(self, key, params, state, x, y):
         """
         Computes the loss of the model.
 
@@ -691,8 +412,9 @@ class SubspaceModelBatchNorm:
         # Sample t param of Bezier curve
 
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, batch_stats = self.nll(params, param_stats, t, x, y)
+        loss, state = self.nll(params, state, t, x, y)
 
+        raise ValueError("Natural parameterization currently not implemented for SubspaceBaseModel (pytree_to_matrix needs masking)")
         cp_w = pytree_to_matrix(params['params'], self.k)
         # cp_phi = 
         curve, d_bezier = bezier_curve(self.k+1, cp_w)
@@ -709,10 +431,10 @@ class SubspaceModelBatchNorm:
         # weighted_loss = jnp.einsum('n,n->', weights, loss)
         weighted_loss = weights.squeeze() * loss
         return weighted_loss + sum(self.l2_loss(w, alpha=self.weight_decay)
-                                 for w in jax.tree.leaves(params)), batch_stats
+                                 for w in jax.tree.leaves(params['params'])), state
 
     @partial(jit, static_argnums=(0, 6))
-    def train_step(self, key, all_params, x, y, opt_state, optimizer):
+    def train_step(self, key, params, x, y, opt_state, optimizer):
         """
         Performs a single training step.
 
@@ -728,35 +450,22 @@ class SubspaceModelBatchNorm:
         - The loss, updated parameters, and updated optimizer state.
 
         """
-        trainable_params = {'params': all_params['params']}
-        param_state = {'batch_stats': all_params['batch_stats']}
-        if self.optimize_distparams:
-            trainable_params['dist_params'] = all_params['dist_params']
-        else:
-            param_state['dist_params'] = all_params['dist_params']
 
         (loss, stats_params), grads = jax.value_and_grad(
-            self.compute_loss, argnums=1, has_aux=True)(key, trainable_params, param_state, x, y)
+            self.compute_loss, argnums=1, has_aux=True)(key, params['params'], params[self.mutable_name] if self.mutable_name else {}, x, y)
         # update params
         updates, opt_state = optimizer.update(
-            grads, opt_state, trainable_params)
-        trainable_params = optax.apply_updates(trainable_params, updates)
-
-        if self.optimize_distparams:
-            params = {'params': trainable_params['params'], 'batch_stats': stats_params,
-                      'dist_params': trainable_params['dist_params']}
-        else:
-            params = {'params': trainable_params['params'],
-                      'batch_stats': stats_params, 'dist_params': param_state['dist_params']}
+            grads, opt_state, params['params'])
+        params['params'] = optax.apply_updates(params['params'], updates)
+        if self.mutable_name:
+            params[self.mutable_name] = stats_params
         return loss, params, opt_state, grads
 
 
-class CategorySubspaceBatchNorm(SubspaceModelBatchNorm):
-    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False):
-        super().__init__(model, k, np.inf, False, weight_decay, perm_spec, natural_parameterization)
+class CategorySubspace(SubspaceBaseModel):
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, param_stats, t, x, y):
+    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -770,122 +479,31 @@ class CategorySubspaceBatchNorm(SubspaceModelBatchNorm):
         - The negative log-likelihood loss.
 
         """
-        out, batch_stats = self(
-            params['params'], param_stats['batch_stats'], t, x)  # shape (n_samples, n_data, output_dim)
+        out, state = self(params, state, t, x)  # shape (n_samples, n_data, output_dim)
 
         nll = jnp.mean(
             optax.losses.softmax_cross_entropy_with_integer_labels(
                 logits=out, labels=y)
         )
-        return nll, batch_stats
-
-
-class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
-    def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1, regularizer="force"):
+        return nll, state
+    
+class RegressionSubspace(SubspaceBaseModel):
+    def __init__(self, out_dist_log_scale=jnp.log(1.0), **kwargs):
         """
-        Initializes the RepulsiveCategorySubspaceBatchNorm class.
+        Initializes the RegressionSubspace class.
 
         Parameters:
         - model: The model to be used.
         - k: The number of control points.
-        - out_scale: The output scale.
-        - optimize_distparams: Whether to optimize the distribution parameters.
-        - gravity: The gravity parameter.
-        - energy_weakening: The energy weakening parameter.
-        - regularizer: The regularizer type ("force", "energy", "cosine_similarity").
+        - weight_decay: The weight decay factor for regularization.
+        - perm_spec: The permutation specification for the model.
+        - natural_parameterization: Whether to use natural parameterization.
         """
-        super().__init__(model, k, weight_decay, perm_spec, natural_parameterization)
-        self.gravity = gravity
-        self.energy_weaker = energy_weakening
-        self.regularizer = self._get_regularizer(regularizer)
+        super().__init__(**kwargs)
+        self.log_scale = out_dist_log_scale
 
-    def _get_regularizer(self, regularizer):
-        reg = regularizer.lower()
-        if reg == "force":
-            return self.repulsive_force
-        elif reg == "energy":
-            return self.repulsive_energy
-        elif reg in ("cosine_similarity", "cosine", "similarity"):
-            return self.summed_cosine_similarity_square
-        else:
-            raise ValueError(f"Unknown regularizer type: {regularizer}")
-
-    def repulsive_force(self, params):
-        """
-        Computes the repulsive force between the parameters.
-
-        Parameters:
-        - params: The parameters of the model.
-
-        Returns:
-        - The repulsive force.
-        """
-        cp_w = pytree_to_matrix(params['params'], self.k)
-        def sum_pairwise_distances(A):
-            n = A.shape[0]
-            def body_fun(i, acc):
-                diffs = A - A[i]
-                dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
-                # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                dists = 1./(dists+self.energy_weaker+1e-8)
-                dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
-                return acc + jnp.sum(dists)
-            return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
-        force = sum_pairwise_distances(cp_w)
-        return force
-
-    def repulsive_energy(self, params):
-        """
-        Computes the repulsive force between the parameters.
-
-        Parameters:
-        - params: The parameters of the model.
-
-        Returns:
-        - The repulsive force.
-        """
-        cp_w = pytree_to_matrix(params['params'], self.k)
-        def sum_pairwise_distances(A):
-            n = A.shape[0]
-            def body_fun(i, acc):
-                diffs = jnp.abs(A - A[i])
-                dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
-                # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-                energy = 1./(dists+self.energy_weaker+1e-8)
-                log_energy = jnp.log(energy)
-                log_energy = jnp.where(jnp.arange(0,n)>i, log_energy, 0.) # masking: use only i+1: elements
-                return acc + jnp.sum(log_energy)
-            return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
-        log_energy = sum_pairwise_distances(cp_w)
-        return log_energy
-
-    def summed_cosine_similarity(self, params):
-        """
-        Computes the sum of pairwise cosine similarities to minimize.
-
-        Equation:
-            β · Σ_{j ≠ k} cos²(ω_j, ω_k) = β · Σ_{j ≠ k} (⟨ω_j, ω_k⟩ / (||ω_j|| ||ω_k||))²
-            $\beta \cdot \sum_{j \neq k} \cos^2(\omega_j, \omega_k) = \beta \cdot \sum_{j \neq k} \left( \frac{\langle \omega_j, \omega_k \rangle}{\|\omega_j\| \|\omega_k\|} \right)^2$
-
-        Parameters:
-        - params: The parameters of the model.
-
-        Returns:
-        - The summed pairwise cosine similarity.
-        """
-        cp_w = pytree_to_matrix(params['params'], self.k)
-        n = cp_w.shape[0]
-        cp_w = cp_w / jnp.linalg.norm(cp_w, axis=-1, keepdims=True)
-        dot_res = jnp.dot(cp_w, cp_w.T) # k x k matrix of cosine similarities
-        # upper triangular part without diagonal
-        upper_triangular_indices = jnp.triu_indices(n, k=1)
-        cosine_sim = jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
-        return cosine_sim
-    
-    def summed_cosine_similarity_square(self, params):
-        return self.summed_cosine_similarity(params)** 2
-    
-    def nll(self, params, param_stats, t, x, y):
+    @partial(jit, static_argnums=(0,))
+    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -897,12 +515,191 @@ class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
 
         Returns:
         - The negative log-likelihood loss.
+
         """
-        nll, batch_stats = super().nll(params, param_stats, t, x, y)
-        rep_force = self.regularizer(params)
-        # jax.debug.print("nll: {}",nll)
-        # jax.debug.print("forece: {}",rep_force)
-        return nll + self.gravity * rep_force, batch_stats
+        out, state = self(params, state, t, x)  # shape (n_data, output_dim)
+        nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(self.log_scale)+1e-8)
+        return nll, state
+
+
+class DistRegressionSubspace(SubspaceBaseModel):
+    def __init__(self, init_outDist_log_scale=jnp.log(1.0), **kwargs):
+        """
+        Initializes the RegressionSubspace class.
+
+        Parameters:
+        - model: The model to be used.
+        - k: The number of control points.
+        - weight_decay: The weight decay factor for regularization.
+        - perm_spec: The permutation specification for the model.
+        - natural_parameterization: Whether to use natural parameterization.
+        """
+        super().__init__(**kwargs)
+        self.init_log_scale = jnp.array(init_outDist_log_scale, dtype=jnp.float32)
+
+    def init_params(self, key, x, mask):
+        """
+        Initializes the parameters of the model.
+
+        Parameters:
+        - key: The random key for parameter initialization.
+        - x: The input data.
+        - mask: The mask for the parameters.
+
+        Returns:
+        - The initialized parameters.
+
+        """
+        params = super().init_params(key, x, mask)
+        # initialize log scale
+        params['params']['log_scale'] = self.init_log_scale
+        print(self.curve_mask)
+        self.curve_mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
+        return params
+
+    @partial(jit, static_argnums=(0,))
+    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
+        """
+        Computes the negative log-likelihood loss of the model.
+
+        Parameters:
+        - params: The parameters of the model.
+        - t: The time parameter.
+        - x: The input data.
+        - y: The target output.
+
+        Returns:
+        - The negative log-likelihood loss.
+
+        """
+        out, state = self(params, state, t, x)  # shape (n_data, output_dim)
+        nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
+        return nll, state
+
+
+# class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
+#     def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1, regularizer="force"):
+#         """
+#         Initializes the RepulsiveCategorySubspaceBatchNorm class.
+
+#         Parameters:
+#         - model: The model to be used.
+#         - k: The number of control points.
+#         - out_scale: The output scale.
+#         - optimize_distparams: Whether to optimize the distribution parameters.
+#         - gravity: The gravity parameter.
+#         - energy_weakening: The energy weakening parameter.
+#         - regularizer: The regularizer type ("force", "energy", "cosine_similarity").
+#         """
+#         super().__init__(model, k, weight_decay, perm_spec, natural_parameterization)
+#         self.gravity = gravity
+#         self.energy_weaker = energy_weakening
+#         self.regularizer = self._get_regularizer(regularizer)
+
+#     def _get_regularizer(self, regularizer):
+#         reg = regularizer.lower()
+#         if reg == "force":
+#             return self.repulsive_force
+#         elif reg == "energy":
+#             return self.repulsive_energy
+#         elif reg in ("cosine_similarity", "cosine", "similarity"):
+#             return self.summed_cosine_similarity_square
+#         else:
+#             raise ValueError(f"Unknown regularizer type: {regularizer}")
+
+#     def repulsive_force(self, params):
+#         """
+#         Computes the repulsive force between the parameters.
+
+#         Parameters:
+#         - params: The parameters of the model.
+
+#         Returns:
+#         - The repulsive force.
+#         """
+#         cp_w = pytree_to_matrix(params['params'], self.k)
+#         def sum_pairwise_distances(A):
+#             n = A.shape[0]
+#             def body_fun(i, acc):
+#                 diffs = A - A[i]
+#                 dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
+#                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
+#                 dists = 1./(dists+self.energy_weaker+1e-8)
+#                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
+#                 return acc + jnp.sum(dists)
+#             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
+#         force = sum_pairwise_distances(cp_w)
+#         return force
+
+#     def repulsive_energy(self, params):
+#         """
+#         Computes the repulsive force between the parameters.
+
+#         Parameters:
+#         - params: The parameters of the model.
+
+#         Returns:
+#         - The repulsive force.
+#         """
+#         cp_w = pytree_to_matrix(params['params'], self.k)
+#         def sum_pairwise_distances(A):
+#             n = A.shape[0]
+#             def body_fun(i, acc):
+#                 diffs = jnp.abs(A - A[i])
+#                 dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
+#                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
+#                 energy = 1./(dists+self.energy_weaker+1e-8)
+#                 log_energy = jnp.log(energy)
+#                 log_energy = jnp.where(jnp.arange(0,n)>i, log_energy, 0.) # masking: use only i+1: elements
+#                 return acc + jnp.sum(log_energy)
+#             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
+#         log_energy = sum_pairwise_distances(cp_w)
+#         return log_energy
+
+#     def summed_cosine_similarity(self, params):
+#         """
+#         Computes the sum of pairwise cosine similarities to minimize.
+
+#         Equation:
+#             β · Σ_{j ≠ k} cos²(ω_j, ω_k) = β · Σ_{j ≠ k} (⟨ω_j, ω_k⟩ / (||ω_j|| ||ω_k||))²
+#             $\beta \cdot \sum_{j \neq k} \cos^2(\omega_j, \omega_k) = \beta \cdot \sum_{j \neq k} \left( \frac{\langle \omega_j, \omega_k \rangle}{\|\omega_j\| \|\omega_k\|} \right)^2$
+
+#         Parameters:
+#         - params: The parameters of the model.
+
+#         Returns:
+#         - The summed pairwise cosine similarity.
+#         """
+#         cp_w = pytree_to_matrix(params['params'], self.k)
+#         n = cp_w.shape[0]
+#         cp_w = cp_w / jnp.linalg.norm(cp_w, axis=-1, keepdims=True)
+#         dot_res = jnp.dot(cp_w, cp_w.T) # k x k matrix of cosine similarities
+#         # upper triangular part without diagonal
+#         upper_triangular_indices = jnp.triu_indices(n, k=1)
+#         cosine_sim = jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
+#         return cosine_sim
+    
+#     def summed_cosine_similarity_square(self, params):
+#         return self.summed_cosine_similarity(params)** 2
+    
+#     def nll(self, params, param_stats, t, x, y):
+#         """
+#         Computes the negative log-likelihood loss of the model.
+
+#         Parameters:
+#         - params: The parameters of the model.
+#         - t: The time parameter.
+#         - x: The input data.
+#         - y: The target output.
+
+#         Returns:
+#         - The negative log-likelihood loss.
+#         """
+#         nll, batch_stats = super().nll(params, param_stats, t, x, y)
+#         rep_force = self.regularizer(params)
+#         # jax.debug.print("nll: {}",nll)
+#         # jax.debug.print("forece: {}",rep_force)
+#         return nll + self.gravity * rep_force, batch_stats
 
 #@partial(jit, static_argnums=(1))
 def pytree_to_matrix(pytree, k):

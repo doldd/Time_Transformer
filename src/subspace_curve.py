@@ -11,6 +11,7 @@ from jaxopt import Bisection
 from jax.scipy.special import gammaln
 from src.weight_matching import PermutationSpec, apply_permutation, weight_matching
 from flax import traverse_util
+from copy import deepcopy
 # from flax.core import freeze, unfreeze
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
@@ -268,6 +269,45 @@ class SubspaceBaseModel:
         mask = jax.tree.map(lambda x: all_curves, params['params'])
         return mask
     
+    def init_params_from_point(self, key, point, mask, jitter):
+        """
+        Initializes curve parameters from a given parameter point, optionally adding noise and handling permutation invariance.
+        Args:
+            key: A JAX PRNGKey used for random number generation.
+            point (dict): A dictionary containing at least a 'params' key with the base parameters to initialize from.
+            mask: A tree-like structure of booleans indicating which parameters should be handled by the curve.
+            jitter (float): The standard deviation of the Gaussian noise to add to the parameters.
+        Returns:
+            dict: A copy of the input `point` dictionary, with the 'params' key replaced by the initialized curve parameters.
+        Notes:
+            - If `self.perm_spec` is set, permutation invariance is handled by removing permutations from the curve parameters.
+            - The method adds Gaussian noise to each parameter in the curve, controlled by `jitter`.
+            - Non-curve parameters are reverted to their original values from `point['params']`.
+            - The mask used for curve parameters is stored in `self.curve_mask`.
+        """
+        curve_params = [deepcopy(point['params']) for _ in range(self.k+1)]
+        
+        # add noise to the parameters
+        param, struct = jax.tree.flatten(curve_params)
+        keys = random.split(key, len(param))
+        def apply_noise(p, key, jitter):
+            return p+jitter*jax.random.normal(key, p.shape)
+        noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
+        curve_params = jax.tree.unflatten(struct, noise_params)
+        
+        if self.perm_spec:
+            curve_params = self.remove_permutation(key, curve_params)
+        
+        curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
+
+        # revert all non-curve parameters to the original point
+        curve_params = jax.tree.map(
+            lambda p, m, o: p if m else o, curve_params, mask, point['params'])
+        all_params = deepcopy(point)
+        all_params['params'] = curve_params
+
+        self.curve_mask = mask
+        return all_params
     
     def init_params(self, key, x, mask):
         """
@@ -278,7 +318,7 @@ class SubspaceBaseModel:
         - x: The input data.
 
         Returns:
-        - The initialized parameters.
+        - The initialized parameters {params, batch_stats}.
 
         """
         keys = random.split(key, self.k+1)
@@ -576,130 +616,77 @@ class DistRegressionSubspace(SubspaceBaseModel):
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
         return nll, state
 
+class RepulsiveMixin:
+    def __init__(self, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
+        super().__init__(**kwargs)
+        self.gravity = gravity
+        self.energy_weakening = energy_weakening
+        self.regularizer = self._get_regularizer(regularizer)
 
-# class RepulsiveCategorySubspaceBatchNorm(CategorySubspaceBatchNorm):
-#     def __init__(self, model, k, weight_decay, perm_spec: PermutationSpec=False, natural_parameterization=False, gravity=0.0, energy_weakening=0.1, regularizer="force"):
-#         """
-#         Initializes the RepulsiveCategorySubspaceBatchNorm class.
+    def _get_regularizer(self, regularizer):
+        reg = regularizer.lower()
+        if reg == "force":
+            return self.repulsive_force
+        elif reg == "energy":
+            return self.repulsive_energy
+        elif reg in ("cosine_similarity", "cosine", "similarity"):
+            return self.summed_cosine_similarity_square
+        else:
+            raise ValueError(f"Unknown regularizer type: {regularizer}")
 
-#         Parameters:
-#         - model: The model to be used.
-#         - k: The number of control points.
-#         - out_scale: The output scale.
-#         - optimize_distparams: Whether to optimize the distribution parameters.
-#         - gravity: The gravity parameter.
-#         - energy_weakening: The energy weakening parameter.
-#         - regularizer: The regularizer type ("force", "energy", "cosine_similarity").
-#         """
-#         super().__init__(model, k, weight_decay, perm_spec, natural_parameterization)
-#         self.gravity = gravity
-#         self.energy_weaker = energy_weakening
-#         self.regularizer = self._get_regularizer(regularizer)
+    def repulsive_force(self, params):
+        cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
+        n = cp_w.shape[0]
+        def body_fun(i, acc):
+            diffs = cp_w - cp_w[i]
+            dists = jnp.sum(diffs**2, axis=-1)
+            dists = 1. / (dists + self.energy_weakening + 1e-8)
+            dists = jnp.where(jnp.arange(0, n) > i, dists, 0.)
+            return acc + jnp.sum(dists)
+        force = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
+        return force
 
-#     def _get_regularizer(self, regularizer):
-#         reg = regularizer.lower()
-#         if reg == "force":
-#             return self.repulsive_force
-#         elif reg == "energy":
-#             return self.repulsive_energy
-#         elif reg in ("cosine_similarity", "cosine", "similarity"):
-#             return self.summed_cosine_similarity_square
-#         else:
-#             raise ValueError(f"Unknown regularizer type: {regularizer}")
+    def repulsive_energy(self, params):
+        cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
+        n = cp_w.shape[0]
+        def body_fun(i, acc):
+            diffs = jnp.abs(cp_w - cp_w[i])
+            dists = jnp.sum(diffs, axis=-1)
+            energy = 1. / (dists + self.energy_weakening + 1e-8)
+            log_energy = jnp.log(energy)
+            log_energy = jnp.where(jnp.arange(0, n) > i, log_energy, 0.)
+            return acc + jnp.sum(log_energy)
+        log_energy = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
+        return log_energy
 
-#     def repulsive_force(self, params):
-#         """
-#         Computes the repulsive force between the parameters.
+    def summed_cosine_similarity(self, params):
+        cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
+        n = cp_w.shape[0]
+        cp_w = cp_w / jnp.linalg.norm(cp_w, axis=-1, keepdims=True)
+        dot_res = jnp.dot(cp_w, cp_w.T)
+        upper_triangular_indices = jnp.triu_indices(n, k=1)
+        cosine_sim = jnp.sum(dot_res[upper_triangular_indices])
+        return cosine_sim
 
-#         Parameters:
-#         - params: The parameters of the model.
+    def summed_cosine_similarity_square(self, params):
+        return self.summed_cosine_similarity(params) ** 2
 
-#         Returns:
-#         - The repulsive force.
-#         """
-#         cp_w = pytree_to_matrix(params['params'], self.k)
-#         def sum_pairwise_distances(A):
-#             n = A.shape[0]
-#             def body_fun(i, acc):
-#                 diffs = A - A[i]
-#                 dists = jnp.sum(diffs**2, axis=-1)      # shape: (n)    
-#                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-#                 dists = 1./(dists+self.energy_weaker+1e-8)
-#                 dists = jnp.where(jnp.arange(0,n)>i, dists, 0.) # masking: use only i+1: elements
-#                 return acc + jnp.sum(dists)
-#             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
-#         force = sum_pairwise_distances(cp_w)
-#         return force
+    @partial(jit, static_argnums=(0,))
+    def nll(self, params, state, t, x, y):
+        nll, state = super().nll(params, state, t, x, y)
+        rep_force = self.regularizer(params)
+        return nll + self.gravity * rep_force, state
 
-#     def repulsive_energy(self, params):
-#         """
-#         Computes the repulsive force between the parameters.
+# Define classes:
+class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):
+    pass
 
-#         Parameters:
-#         - params: The parameters of the model.
+class RepulsiveDistRegressionSubspace(RepulsiveMixin, DistRegressionSubspace):
+    pass
 
-#         Returns:
-#         - The repulsive force.
-#         """
-#         cp_w = pytree_to_matrix(params['params'], self.k)
-#         def sum_pairwise_distances(A):
-#             n = A.shape[0]
-#             def body_fun(i, acc):
-#                 diffs = jnp.abs(A - A[i])
-#                 dists = jnp.sum(diffs, axis=-1)      # shape: (n)    
-#                 # dists = jnp.linalg.norm(diffs, axis=-1)      # shape: (n)
-#                 energy = 1./(dists+self.energy_weaker+1e-8)
-#                 log_energy = jnp.log(energy)
-#                 log_energy = jnp.where(jnp.arange(0,n)>i, log_energy, 0.) # masking: use only i+1: elements
-#                 return acc + jnp.sum(log_energy)
-#             return jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
-#         log_energy = sum_pairwise_distances(cp_w)
-#         return log_energy
+class RepulsiveCategorySubspace(RepulsiveMixin, CategorySubspace):
+    pass
 
-#     def summed_cosine_similarity(self, params):
-#         """
-#         Computes the sum of pairwise cosine similarities to minimize.
-
-#         Equation:
-#             β · Σ_{j ≠ k} cos²(ω_j, ω_k) = β · Σ_{j ≠ k} (⟨ω_j, ω_k⟩ / (||ω_j|| ||ω_k||))²
-#             $\beta \cdot \sum_{j \neq k} \cos^2(\omega_j, \omega_k) = \beta \cdot \sum_{j \neq k} \left( \frac{\langle \omega_j, \omega_k \rangle}{\|\omega_j\| \|\omega_k\|} \right)^2$
-
-#         Parameters:
-#         - params: The parameters of the model.
-
-#         Returns:
-#         - The summed pairwise cosine similarity.
-#         """
-#         cp_w = pytree_to_matrix(params['params'], self.k)
-#         n = cp_w.shape[0]
-#         cp_w = cp_w / jnp.linalg.norm(cp_w, axis=-1, keepdims=True)
-#         dot_res = jnp.dot(cp_w, cp_w.T) # k x k matrix of cosine similarities
-#         # upper triangular part without diagonal
-#         upper_triangular_indices = jnp.triu_indices(n, k=1)
-#         cosine_sim = jnp.sum(dot_res[upper_triangular_indices])  # summed cosine similarity
-#         return cosine_sim
-    
-#     def summed_cosine_similarity_square(self, params):
-#         return self.summed_cosine_similarity(params)** 2
-    
-#     def nll(self, params, param_stats, t, x, y):
-#         """
-#         Computes the negative log-likelihood loss of the model.
-
-#         Parameters:
-#         - params: The parameters of the model.
-#         - t: The time parameter.
-#         - x: The input data.
-#         - y: The target output.
-
-#         Returns:
-#         - The negative log-likelihood loss.
-#         """
-#         nll, batch_stats = super().nll(params, param_stats, t, x, y)
-#         rep_force = self.regularizer(params)
-#         # jax.debug.print("nll: {}",nll)
-#         # jax.debug.print("forece: {}",rep_force)
-#         return nll + self.gravity * rep_force, batch_stats
 
 #@partial(jit, static_argnums=(1))
 def pytree_to_matrix(pytree, k):
@@ -716,6 +703,21 @@ def pytree_to_matrix(pytree, k):
     return jax.tree.reduce(lambda x, y: jnp.concatenate(
         [x, y.reshape(k+1, -1)], axis=-1), pytree)
 
+#@partial(jit, static_argnums=(1))
+def masked_pytree_to_matrix(pytree, mask, k):
+    """
+    Converts a pytree of the subspace model into a matrix.
+
+    Args:
+        pytree: The pytree to be converted.
+
+    Returns:
+        matrix: The matrix representation of the pytree with shape (k+1, n_params).
+    """
+    # first argument of reduce fn is the accumulator and second is the current value
+    only_curve_params = jax.tree.map(lambda x, m: x if m else jnp.reshape(jnp.array([]), (k+1, 0)), pytree, mask)
+    return jax.tree.reduce(lambda x, y: jnp.concatenate(
+        [x, y.reshape(k+1, -1)], axis=-1), only_curve_params)
 
 # @partial(jit, static_argnums=(1))
 def pytree_to_vec(pytree):

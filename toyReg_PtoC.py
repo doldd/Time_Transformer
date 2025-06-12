@@ -28,7 +28,7 @@ import torch
 from flax import linen as nn
 from src.weight_matching import resnet20_permutation_spec2
 import argparse
-import src.models
+from src.models import MLPModel
 
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -37,115 +37,35 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # Assuming equivalent JAX implementations
 
 
+# Generate data by using the model itself
+def gen_data(rng_seed, net_kwargs, **kwargs):
+    rng_key = random.PRNGKey(rng_seed + 1133)
+    x = jnp.linspace(-2, 2, 100)
+    x = x[(jnp.abs(x) > 0.6)].reshape(-1, 1)
 
+    # define ground trouth model
+    rng_key, rng_init = random.split(rng_key)
+    model_gen = MLPModel(**net_kwargs)
+    params = model_gen.init(rng_init, x)
 
-def load_cifar10(seed=0):
-    PATH_DATASETS = "./datasets/cifar/cifar10_ds"
-    os.makedirs(PATH_DATASETS, exist_ok=True)
-    cifar10_normalization = torchvision.transforms.Normalize(
-        mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-        std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
-    )
+    # generate train data
+    y_gt = model_gen.apply(params, x).squeeze()
+    rng_key, rng = random.split(rng_key)
+    y = y_gt + jax.random.normal(rng, y_gt.shape) * 0.05
 
-    def cifar10_undo_normalization(image):
-        mean = jnp.array([x / 255.0 for x in [125.3, 123.0, 113.9]])
-        std = jnp.array([x / 255.0 for x in [63.0, 62.1, 66.7]])
-        return image * std + mean
+    # generate valid data
+    x_val = jnp.linspace(-2, 2, 25)
+    x_val = x_val[(jnp.abs(x_val) > 0.6)].reshape(-1, 1)
+    y_gt_val = model_gen.apply(params, x_val).squeeze()
+    rng_key, rng = random.split(rng_key)
+    y_val = y_gt_val + jax.random.normal(rng, y_gt_val.shape) * 0.05
 
-    def split_dataset(dataset, val_split=0.2):
-        """Splits the dataset into train and validation set."""
-        len_dataset = len(dataset)
-        splits = get_splits(len_dataset, val_split)
-        dataset_train, dataset_val = random_split(
-            dataset, splits, generator=torch.Generator().manual_seed(seed))
+    xt = jnp.linspace(-2.5, 2.5, 1000).reshape(-1, 1)
+    rng_key, rng = random.split(rng_key)
+    y_gtt = model_gen.apply(params, xt).squeeze()
+    yt = y_gtt + jax.random.normal(rng, y_gtt.shape) * 0.05
 
-        return dataset_train, dataset_val
-
-    def get_splits(len_dataset, val_split):
-        """Computes split lengths for train and validation set."""
-        if isinstance(val_split, int):
-            train_len = len_dataset - val_split
-            splits = [train_len, val_split]
-        elif isinstance(val_split, float):
-            val_len = int(val_split * len_dataset)
-            train_len = len_dataset - val_len
-            splits = [train_len, val_len]
-        else:
-            raise ValueError(f"Unsupported type {type(val_split)}")
-
-        return splits
-
-    # train_transforms = torchvision.transforms.Compose(
-    #     [
-    #         # torchvision.transforms.RandomCrop(32, padding=4),
-    #         # torchvision.transforms.RandomHorizontalFlip(),
-    #         torchvision.transforms.ToTensor(),
-    #         cifar10_normalization,
-    #         torchvision.transforms.Lambda(lambda x: x.permute(1, 2, 0)),
-    #     ]
-    # )
-    test_transforms = torchvision.transforms.Compose(
-        [
-            torchvision.transforms.ToTensor(),
-            cifar10_normalization,
-            torchvision.transforms.Lambda(lambda x: x.permute(1, 2, 0)),
-        ]
-    )
-
-    # dataset_train = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
-    #                                 download=True, transform=train_transforms)
-    dataset = torchvision.datasets.CIFAR10(PATH_DATASETS, train=True,
-                                download=True, transform=test_transforms)
-    dataset_train, dataset_val = split_dataset(dataset, val_split=0.02)
-    dataset_test = torchvision.datasets.CIFAR10(PATH_DATASETS, train=False,
-                                    download=True, transform=test_transforms)
-
-    def dataset_to_tensordataset(dataset):
-        with torch.no_grad():
-            test1 = dataset[0]
-            x_stack = torch.zeros(
-                (len(dataset), *(test1[0].shape)), dtype=test1[0].dtype)
-            if type(test1[1]) is int:
-                y_stack = torch.zeros((len(dataset)), dtype=torch.int64)
-            else:
-                y_stack = torch.zeros(
-                    (len(dataset), *(test1[1].shape)), dtype=test1[1].dtype)
-            for i in range(len(dataset)):
-                x_stack[i], y_stack[i] = dataset[i]
-            return TensorDataset(x_stack, y_stack)
-
-
-    dataset_train = dataset_to_tensordataset(dataset_train)
-    dataset_val = dataset_to_tensordataset(dataset_val)
-    dataset_test = dataset_to_tensordataset(dataset_test)
-
-    x = jnp.array(dataset_train[:][0].numpy())
-    y = jnp.array(dataset_train[:][1].numpy())
-    x_val = jnp.array(dataset_val[:][0].numpy())
-    y_val = jnp.array(dataset_val[:][1].numpy())
-    x_test = jnp.array(dataset_test[:][0].numpy())
-    y_test = jnp.array(dataset_test[:][1].numpy())
-    
-    return x, y, x_val, y_val, x_test, y_test, cifar10_undo_normalization
-
-
-def augment(key, image):
-    """Performs data augmentation."""
-    # random crop
-    image = jnp.pad(image, ((4, 4), (4, 4), (0, 0)), mode='edge')
-    key, subkey = random.split(key)
-    crop_x = random.randint(subkey, (), 0, 8)
-    key, subkey = random.split(key)
-    crop_y = random.randint(subkey, (), 0, 8)
-    image = jax.lax.dynamic_slice_in_dim(image, crop_x, 32, 0)
-    image = jax.lax.dynamic_slice_in_dim(image, crop_y, 32, 1)
-    # image = image[crop_x:crop_x+32, crop_y:crop_y+32, :]
-    # horizontal flip
-    key, subkey = random.split(key)
-    flip = random.bernoulli(subkey, 0.5)
-    # image = jax.lax.cond(flip, image, lambda x: x, jnp.flip, image)
-    image = jnp.where(flip, image, jnp.flip(image, axis=1))
-    return key, image
+    return x, y, x_val, y_val, xt, yt, y_gtt
 
 
 def setup_metrics_curve(eval_model, batch_size, x, target, n_samples, use_linspace=False, average=True):
@@ -199,16 +119,13 @@ def single_model_train(logger, config):
                       'act_fn': relu,
                       'block_class': ResNetBlock}}
     '''
-    config['net_kwargs']['act_fn'] = getattr(nn, config['net_kwargs']['act_fn'])
-    config['net_kwargs']['block_class'] = getattr(src.models, config['net_kwargs']['block_class'])
+    config['net_kwargs']['activation'] = getattr(nn, config['net_kwargs']['activation'])
     rng_key = random.PRNGKey(config['rng_seed'])
 
     # Load data
-    x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(
-        config['rng_seed'])  # get fold from seed
+    x, y, x_val, y_val, x_test, y_test, _ = gen_data(**config)
     
-
-    net = ResNet(**config['net_kwargs'])
+    net = MLPModel(**config['net_kwargs'])
     rng_key, init_key = random.split(rng_key)
     params = net.init(init_key, x[0:2])
     
@@ -368,10 +285,10 @@ def single_model_train(logger, config):
 def main():
     logger = wandb.init()
     config = wandb.config
-    single_run(logger, config)
+    train_curve(logger, config)
 
 
-def single_run(logger, config, n_samples_nuts=None):
+def train_curve(logger, config, n_samples_nuts=None):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
 
@@ -842,7 +759,7 @@ if __name__ == '__main__':
     #     'eval_every_n_batch': 50
     # }
     # logger = wandb.init(project="subspace_test", name="cifar", entity="ddold", config=config)
-    # single_run(logger, config, n_samples_nuts=200)
+    # train_curve(logger, config, n_samples_nuts=200)
     
     parser = argparse.ArgumentParser(description="Train a single model or a curve model.")
     parser.add_argument("--train", choices=["single", "curve"], required=True, help="Specify the training mode: 'single' for single model training, 'curve' for curve model training.")
@@ -870,7 +787,7 @@ if __name__ == '__main__':
             print("Using wandb config")
             logger = wandb.init()
             config = wandb.config
-            single_run(logger, config)
+            train_curve(logger, config)
         else:
             print("Using perdefined config")
             config = {
@@ -900,7 +817,7 @@ if __name__ == '__main__':
                                                                                 # 'nesterov': True},},
                             }}
             logger = wandb.init(project="cifar_PtoC", name="cifar_curve", entity="ddold", config=config)
-            single_run(logger, config)
+            train_curve(logger, config)
 
         # main()
 

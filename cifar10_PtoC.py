@@ -15,8 +15,8 @@ import arviz as az
 from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
-from src.subspace_curve import pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
-from src.subspace_curve import OrthoSpan, CategorySubspaceBatchNorm, RepulsiveCategorySubspaceBatchNorm
+from src.subspace_curve import masked_pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
+from src.subspace_curve import OrthoSpan, RepulsiveCategorySubspace
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
 from numpyro.infer.util import initialize_model
@@ -434,35 +434,25 @@ def single_run(logger, config, n_samples_nuts=None):
         if remove_initial_permutation:
             perm_spec = resnet20_permutation_spec2()
 
-        s_model = RepulsiveCategorySubspaceBatchNorm(model, k=k, weight_decay=weight_decay, 
-                                                     perm_spec=perm_spec,
-                                                     natural_parameterization=natural_parameterization,
-                                                     gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-        
+        s_model = RepulsiveCategorySubspace(model=model, k=k, weight_decay=weight_decay,
+                                            perm_spec=perm_spec,
+                                            natural_parameterization=natural_parameterization,
+                                            mutuable_param_name='batch_stats',
+                                            gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
+
         # load params from wandb artifact if path is given in config
         if 'params_path' in config:
             art = logger.use_artifact(config['params_path'], type='pytree')
             artifact_dir = art.download()
             filename = os.path.join(artifact_dir, f"{art.logged_by().id}_params.npy")
             init_params = jnp.load(filename, allow_pickle=True).item()
-            curve_params = [deepcopy(init_params['params']) for _ in range(k+1)]
             
-            # add noise to the parameters
-            param, struct = jax.tree.flatten(curve_params)
-            keys = random.split(rng_key, len(param))
-            def apply_noise(p, key, jitter):
-                return p+jitter*jax.random.normal(key, p.shape)
-            noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
-            curve_params = jax.tree.unflatten(struct, noise_params)
-            
-            if remove_initial_permutation:
-                curve_params = s_model.remove_permutation(init_key, curve_params)
-            
-            curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
-            params = {'params': curve_params, 'batch_stats': init_params['batch_stats'], 'dist_params': {}}
-
             # load data
             x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(art.logged_by().config['rng_seed'])  # get fold from seed
+            
+            # initialize curve parameter with pretrained point parameter
+            mask = s_model.init_mask(x_val[:10], all_curves=True)
+            params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
 
             def setup_init_metrics(batch_size, x, target, prefix='valid'):
                 def acc_fn(params):
@@ -487,9 +477,11 @@ def single_run(logger, config, n_samples_nuts=None):
             init_metrics = init_metrics_fn(init_params)
             logger.summary.update(init_metrics)
         else:
-            params = s_model.init_params(init_key, x[:2])
             # load data
             x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(config['rng_seed'])  # get fold from seed
+            
+            mask = s_model.init_mask(x_val[:10], all_curves=True)
+            params = s_model.init_params(init_key, x_val[:10], mask)
 
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
@@ -509,8 +501,7 @@ def single_run(logger, config, n_samples_nuts=None):
         #     "cosine", 0.01, {iter_per_epoch_train*50: 10., iter_per_epoch_train*200: 0.5, (iter_per_epoch_train*num_epochs*4)//5: 0.5})
 
         # optimizer = optax.sgd(lr_schedule, momentum=0.9, nesterov=True)
-        opt_state = optimizer.init(
-            {'params': params['params']})  # only dnn parameters
+        opt_state = optimizer.init(params['params'])  # only dnn parameters
         best_loss = np.inf
         best_params = params
 
@@ -528,8 +519,8 @@ def single_run(logger, config, n_samples_nuts=None):
                     x_batch, y_batch = data
 
                     def eval(t):
-                        logits, _ = s_model.eval(
-                            params['params'], params['batch_stats'], t, x_batch)  # params, batch_stats, t, x
+                        logits, _ = s_model(
+                            params['params'], params['batch_stats'], t, x_batch, train=False)  # params, batch_stats, t, x
                         loss = jnp.mean(optax.losses.softmax_cross_entropy_with_integer_labels(
                             logits=logits, labels=y_batch))
                         acc = jnp.mean(jnp.argmax(logits, axis=-1) == y_batch)
@@ -630,7 +621,7 @@ def single_run(logger, config, n_samples_nuts=None):
             return rel_center
         
         # init metric
-        cp_w = pytree_to_matrix(params['params'], k)
+        cp_w = masked_pytree_to_matrix(params['params'], mask, k)
         rel_center_fn = init_rel_center(cp_w)
 
         def train_batch(carry, batch):
@@ -654,7 +645,7 @@ def single_run(logger, config, n_samples_nuts=None):
                 val_loss < best_loss, lambda x: params, lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, val_loss)
 
-            cp_w = pytree_to_matrix(params['params'], k)
+            cp_w = masked_pytree_to_matrix(params['params'], mask, k)
             length = bezier_length(cp_w)
             l_bound = lower_bound(cp_w)
             u_bound = upper_bound(cp_w)
@@ -662,8 +653,8 @@ def single_run(logger, config, n_samples_nuts=None):
             center = mass_center(cp_w)
             # mean_curv = mean_curvature2(cp_w)
             rel_center = rel_center_fn(cp_w)
-            grad_norm = jnp.linalg.norm(pytree_to_matrix(grad_['params'], k), axis=1).mean()
-            cos_sim = s_model.summed_cosine_similarity(params)
+            grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
+            cos_sim = s_model.summed_cosine_similarity(params['params'])
             cos_sim /= ((k+1)*k/2)
             return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, acc, m_entropy, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
@@ -753,9 +744,9 @@ def single_run(logger, config, n_samples_nuts=None):
         rng_key = carry[0]
 
         # Bezier curve length        
-        cp = pytree_to_matrix(params['params'], k)
+        cp = masked_pytree_to_matrix(params['params'], mask, k)
         length_best = bezier_length(cp)
-        cp = pytree_to_matrix(last_params['params'], k)
+        cp = masked_pytree_to_matrix(last_params['params'], mask, k)
         length_last = bezier_length(cp)
         logger.log({'Curve length best': length_best, 'Curve length last': length_last})
 
@@ -906,7 +897,7 @@ if __name__ == '__main__':
         else:
             print("Using perdefined config")
             config = {
-                'rng_seed': 3,
+                'rng_seed': 0,
                 'net_kwargs':{'num_blocks': (3, 3, 3),
                             'c_hidden': (16, 32, 64),
                             'num_classes': 10,
@@ -915,17 +906,18 @@ if __name__ == '__main__':
                 'params_path': 'ddold/cifar_PtoC/params:v1',
                 'eval_every_n_batch': 20,
                 'curve_params': {'k': 2,
-                                'num_epochs': 10,
+                                'num_epochs': 200,
                                 'batch_size': 200,
                                 'natural_parameterization': False,
                                 'gravity': 0.01,
                                 'energy_weakening': 1.,
                                 'weight_decay': 0.,
                                 'remove_initial_permutation': False,
+                                'regularizer': 'cosine',
                                 'jitter': 1e-8,
                                 #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True}},
+                                 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},
                                 # 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 

@@ -388,7 +388,7 @@ class SubspaceBaseModel:
         return out, state
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
+    def nll(self, params, state, t, x, y, train:bool) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Abstract method for computing the negative log-likelihood loss of the model.
 
@@ -428,7 +428,7 @@ class SubspaceBaseModel:
         """
         # Sample t param of Bezier curve
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, state = self.nll(params, state, t, x, y)
+        loss, state, out = self.nll(params, state, t, x, y, train=True)
         loss = loss.mean() + sum(self.l2_loss(w, alpha=self.weight_decay)
                                  for w in jax.tree.leaves(params))
         return loss, state
@@ -452,7 +452,7 @@ class SubspaceBaseModel:
         # Sample t param of Bezier curve
 
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, state = self.nll(params, state, t, x, y)
+        loss, state, out = self.nll(params, state, t, x, y, train=True)
 
         raise ValueError("Natural parameterization currently not implemented for SubspaceBaseModel (pytree_to_matrix needs masking)")
         cp_w = pytree_to_matrix(params['params'], self.k)
@@ -505,7 +505,7 @@ class SubspaceBaseModel:
 class CategorySubspace(SubspaceBaseModel):
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
+    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -519,13 +519,13 @@ class CategorySubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x)  # shape (n_samples, n_data, output_dim)
+        out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
 
         nll = jnp.mean(
             optax.losses.softmax_cross_entropy_with_integer_labels(
                 logits=out, labels=y)
         )
-        return nll, state
+        return nll, state, out
     
 class RegressionSubspace(SubspaceBaseModel):
     def __init__(self, out_dist_log_scale=jnp.log(1.0), **kwargs):
@@ -543,7 +543,7 @@ class RegressionSubspace(SubspaceBaseModel):
         self.log_scale = out_dist_log_scale
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
+    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -557,13 +557,13 @@ class RegressionSubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x)  # shape (n_data, output_dim)
+        out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(self.log_scale)+1e-8)
-        return nll, state
+        return nll, state, out
 
 
 class DistRegressionSubspace(SubspaceBaseModel):
-    def __init__(self, init_outDist_log_scale=jnp.log(1.0), **kwargs):
+    def __init__(self, init_outDist_log_scale=jnp.log(1.), **kwargs):
         """
         Initializes the RegressionSubspace class.
 
@@ -576,6 +576,10 @@ class DistRegressionSubspace(SubspaceBaseModel):
         """
         super().__init__(**kwargs)
         self.init_log_scale = jnp.array(init_outDist_log_scale, dtype=jnp.float32)
+
+    def init_params_from_point(self, key, point, mask, jitter):
+        mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
+        return super().init_params_from_point(key, point, mask, jitter)
 
     def init_params(self, key, x, mask):
         """
@@ -598,7 +602,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         return params
 
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y) -> Tuple[jnp.ndarray, dict]:
+    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -612,9 +616,9 @@ class DistRegressionSubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x)  # shape (n_data, output_dim)
+        out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
-        return nll, state
+        return nll, state, out
 
 class RepulsiveMixin:
     def __init__(self, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
@@ -670,10 +674,11 @@ class RepulsiveMixin:
 
     def summed_cosine_similarity_square(self, params):
         return self.summed_cosine_similarity(params) ** 2
-
+    
     @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y):
-        nll, state = super().nll(params, state, t, x, y)
+    def compute_loss_t(self, key, params, state, x, y):
+        # Sample t param of Bezier curve
+        nll, state = super().compute_loss_t(key, params, state, x, y)
         rep_force = self.regularizer(params)
         return nll + self.gravity * rep_force, state
 

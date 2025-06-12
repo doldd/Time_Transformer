@@ -18,7 +18,7 @@ class MLPModel(nn.Module):
     def setup(self) -> None:
         self.activation_fn = getattr(nn, self.activation)
         return super().setup()
-
+    
     @nn.compact
     def __call__(self, x, train=True):
         x = jnp.concat([x, x**2, x**3], axis=-1)

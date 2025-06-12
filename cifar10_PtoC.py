@@ -29,6 +29,7 @@ from flax import linen as nn
 from src.weight_matching import resnet20_permutation_spec2
 import argparse
 import src.models
+import optax
 
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -488,20 +489,12 @@ def single_run(logger, config, n_samples_nuts=None):
 
         # Train
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
-            lr_schedule = eval(optimizer_conf['kwargs']['learning_rate']['name'])(
+            lr_schedule = getattr(optax, optimizer_conf['kwargs']['learning_rate']['name'])(
                 **optimizer_conf['kwargs']['learning_rate']['kwargs'])
             optimizer_conf['kwargs']['learning_rate'] = lr_schedule
-        optimizer = eval(optimizer_conf['name'])(**optimizer_conf['kwargs'])
-
-        # iter_per_epoch_train = len(x) // batch_size
-        # # lr_schedule = optax.linear_onecycle_schedule(
-        # #     num_epochs * iter_per_epoch_train, lr, pct_start=0.4, div_factor=10.0, final_div_factor=20.0
-        # # )
-        # lr_schedule = optax.piecewise_interpolate_schedule(
-        #     "cosine", 0.01, {iter_per_epoch_train*50: 10., iter_per_epoch_train*200: 0.5, (iter_per_epoch_train*num_epochs*4)//5: 0.5})
-
-        # optimizer = optax.sgd(lr_schedule, momentum=0.9, nesterov=True)
+        optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
         opt_state = optimizer.init(params['params'])  # only dnn parameters
+
         best_loss = np.inf
         best_params = params
 
@@ -621,7 +614,7 @@ def single_run(logger, config, n_samples_nuts=None):
             return rel_center
         
         # init metric
-        cp_w = masked_pytree_to_matrix(params['params'], mask, k)
+        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
         rel_center_fn = init_rel_center(cp_w)
 
         def train_batch(carry, batch):
@@ -645,7 +638,7 @@ def single_run(logger, config, n_samples_nuts=None):
                 val_loss < best_loss, lambda x: params, lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, val_loss)
 
-            cp_w = masked_pytree_to_matrix(params['params'], mask, k)
+            cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
             length = bezier_length(cp_w)
             l_bound = lower_bound(cp_w)
             u_bound = upper_bound(cp_w)
@@ -744,9 +737,9 @@ def single_run(logger, config, n_samples_nuts=None):
         rng_key = carry[0]
 
         # Bezier curve length        
-        cp = masked_pytree_to_matrix(params['params'], mask, k)
+        cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
         length_best = bezier_length(cp)
-        cp = masked_pytree_to_matrix(last_params['params'], mask, k)
+        cp = masked_pytree_to_matrix(last_params['params'], s_model.curve_mask, k)
         length_last = bezier_length(cp)
         logger.log({'Curve length best': length_best, 'Curve length last': length_last})
 
@@ -879,7 +872,7 @@ if __name__ == '__main__':
             'rng_seed': 0,
             'num_epochs': 500,
             'batch_size': 100,
-            'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True}},
+            'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True}},
             'net_kwargs':{'num_blocks': (3, 3, 3),
                           'c_hidden': (16, 32, 64),
                           'num_classes': 10,
@@ -917,8 +910,8 @@ if __name__ == '__main__':
                                 'jitter': 1e-8,
                                 #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},
-                                # 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "optax.linear_onecycle_schedule", 
+                                 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},
+                                # 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 
                                                                                 # 'nesterov': True},},

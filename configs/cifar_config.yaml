@@ -1,5 +1,5 @@
 program: cifar10_PtoC.py
-name: cifat_point_to_curve
+name: cifar pToC no BatchNorm Curve
 method: grid
 metric:
   goal: maximize
@@ -34,7 +34,7 @@ parameters:
       energy_weakening:
         value: 1.
       regularizer:
-        value: "cosine"
+        values: ["force", "cosine"]
       weight_decay:
         value: 0.0
       remove_initial_permutation:
@@ -43,6 +43,8 @@ parameters:
         value: 1e-8
       num_epochs:
         value: 200
+      no_curve_names:
+        value: ["BatchNorm",]
       optimizer_conf:
         parameters:
           name:

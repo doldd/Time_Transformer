@@ -180,222 +180,23 @@ def augment(key, image):
     image = jnp.where(flip, image, jnp.flip(image, axis=1))
     return key, image
 
-
-def setup_metrics_curve(eval_model, batch_size, x, target, n_samples, use_linspace=False, average=True):
-    if use_linspace:
-        get_t = lambda key: jnp.linspace(0, 1., n_samples)
-    else:
-        get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
-
-    def acc_fn(rng_key, params):
-        x_ = x.reshape(-1, batch_size, 32, 32, 3)
-        y_ = target.reshape(-1, batch_size)
-
-        def pred(key, data):
-            x_batch, y_batch = data
-            
-            def eval(t):
-                logits, _ = eval_model.eval(
-                    params['params'], params['batch_stats'], t, x_batch)  # params, batch_stats, t, x
-                loss = jnp.mean(optax.losses.softmax_cross_entropy_with_integer_labels(
-                    logits=logits, labels=y_batch))
-                acc = jnp.mean(jnp.argmax(logits, axis=-1) == y_batch)
-                return loss, acc  # mean over batch
-            
-            key, subkey = random.split(key)
-            # draw 10 samples to approximate curve performance
-            t = get_t(subkey)
-            loss, acc = jax.vmap(eval)(t)
-            if average:
-                return key, (jnp.mean(loss), jnp.mean(acc))  # mean over samples
-            else:
-                return key, (loss, acc)  # no mean over samples
-        # shape (n_data, draws, output_dim)
-        rng_key, (loss, acc) = jax.lax.scan(pred, rng_key, (x_, y_))
-        loss = jnp.mean(loss, axis=0)
-        acc = jnp.mean(acc, axis=0)
-        return loss, acc  # mean over epochs
-    return acc_fn
-
-
-
-def single_model_train(logger, config):
-    '''' example config:
-    config = {
-        'rng_seed': 0,
-        'num_epochs': 500,
-        'batch_size': 100,
-        'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True}},
-        'net_kwargs':{'num_blocks': (3, 3, 3),
-                      'c_hidden': (16, 32, 64),
-                      'num_classes': 10,
-                      'act_fn': relu,
-                      'block_class': ResNetBlock}}
-    '''
-    config['net_kwargs']['act_fn'] = getattr(nn, config['net_kwargs']['act_fn'])
-    config['net_kwargs']['block_class'] = getattr(src.models, config['net_kwargs']['block_class'])
-    rng_key = random.PRNGKey(config['rng_seed'])
-
-    # Load data
-    x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(
-        config['rng_seed'])  # get fold from seed
+def mask_as_no_curve(mask, *key_names):
+    """Convert a mask to a no-curve mask according key_name. 
+    Note: Function opperates in-place."""
+    if len(key_names) == 0:
+        return mask
     
-
-    net = ResNet(**config['net_kwargs'])
-    rng_key, init_key = random.split(rng_key)
-    params = net.init(init_key, x[0:2])
-    
-    def _predict(params, bn_params, inputs, train):
-        # Predict logits from inputs and parameters
-        all_params = {"params": params, "batch_stats": bn_params}
-
-        def train_fn(inputs):
-            logits, net_state = net.apply(
-                all_params, inputs, train=True, mutable=["batch_stats"]
-            )
-            return logits, net_state
-
-        def eval_fn(inputs):
-            logits = net.apply(all_params, inputs, train=False, mutable=False)
-            net_state = {"batch_stats": bn_params}
-            return logits, net_state
-
-        logits, net_state = jax.lax.cond(
-            train, lambda x: train_fn(x), lambda x: eval_fn(x), inputs
-        )
-        return logits, net_state['batch_stats']
-
-
-    def loss_fn(params, bn_params, inputs, targets, train:bool):
-        def l2_loss(x, alpha):
-            return alpha * (x ** 2).sum()
-        
-        logits, stats_params = _predict(params, bn_params, inputs, train)
-        #   print(logits.shape, targets.shape)
-        loss = jnp.mean(
-            optax.losses.softmax_cross_entropy_with_integer_labels(
-                logits=logits, labels=targets)
-        )
-        loss = jax.lax.cond(train, lambda x: x+sum(l2_loss(w, alpha=1e-4)
-                    for w in jax.tree.leaves(params)), lambda x: x, loss)
-        return loss, stats_params
-    
-
-    # Train
-    optimizer_conf = config['optimizer_conf']
-    if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
-        lr_schedule = eval(optimizer_conf['kwargs']['learning_rate']['name'])(
-            **optimizer_conf['kwargs']['learning_rate']['kwargs'])
-    else:
-        iter_per_epoch_train = len(x) // config['batch_size']
-        lr_schedule = optax.linear_onecycle_schedule(
-            config['num_epochs'] * iter_per_epoch_train, config['optimizer_conf']['kwargs']['learning_rate'])
-    optimizer_conf['kwargs']['learning_rate'] = lr_schedule
-    optimizer = eval(optimizer_conf['name'])(**optimizer_conf['kwargs'])
-    opt_state = optimizer.init(params['params'])
-
-    # Train
-    best_loss = np.inf
-    best_params = params
-    def setup_metrics(batch_size, x, target):
-        def acc_fn(params):
-            x_ = x.reshape(-1, batch_size, 32, 32, 3)
-            y_ = target.reshape(-1, batch_size)
-
-            def pred(carry, x):
-                logits, _ = _predict(
-                    params['params'], params['batch_stats'], x, train=False)
-                return None, logits
-            _, logits = jax.lax.scan(pred, None, x_)
-            loss = jnp.mean(
-                optax.losses.softmax_cross_entropy_with_integer_labels(
-                    logits=logits, labels=y_)
-            )
-            acc = jnp.mean(jnp.argmax(logits, axis=-1) == y_)
-            return {'Acc':acc, 'Loss':loss}
-        return acc_fn
-
-    valid_metrics_fn = setup_metrics(250, x_val, y_val)
-
-    def train_batch(carry, batch):
-        x_, y_ = batch
-        rng_key, params, opt_state, best_loss, best_params = carry
-        rng_key, subkey = random.split(rng_key)
-
-        net_params, stats_params = params['params'], params['batch_stats']
-
-        (loss, stats_params), grads = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)(net_params, stats_params, x_, y_, train=True)
-        updates, opt_state = optimizer.update(grads, opt_state, net_params)
-        net_params = optax.apply_updates(net_params, updates)
-
-        return (rng_key, {'params': net_params, 'batch_stats': stats_params}, opt_state, best_loss, best_params), loss
-
-    @scan_tqdm(config['num_epochs'])
-    def train(carry, _):
-        rng_key = carry[0]
-        rng_key, subkey = random.split(rng_key)
-        shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
-        # data augmentation
-        rng_key, x_ = jax.lax.scan(augment, rng_key, x)
-        # x_ = x
-        x_ = x_[shuffel].reshape(-1, config['batch_size'], 32, 32, 3)
-        y_ = y[shuffel].reshape(-1, config['batch_size'])
-        carry, loss_batch = jax.lax.scan(
-            train_batch, carry, (x_, y_))
-        
-        # validate
-        loss_epoch = jnp.mean(loss_batch)
-        params, best_loss, best_params = carry[1], carry[3], carry[4]
-
-        metrics = valid_metrics_fn(params)
-        val_loss = metrics['Loss']
-        best_params = jax.lax.cond(
-            val_loss < best_loss, lambda x: params, lambda x: best_params, None)
-        best_loss = jnp.minimum(best_loss, val_loss)
-
-        return (rng_key, params, carry[2], best_loss, best_params), (loss_batch, val_loss, metrics['Acc'])
-
-
-    carry = (rng_key, params, opt_state, best_loss, best_params)
-    # start training
-    carry, (losses, valid_losses, valid_acc) = jax.lax.scan(train, carry, jnp.arange(config['num_epochs']))
-    rng_key, params, opt_state, best_loss, best_params = carry
-
-    # log losses for wandb
-    n_steps_e = losses.shape[1]
-    epochs = np.repeat(np.arange(config['num_epochs']), n_steps_e)
-    _ = [logger.log({"train_loss": l, "valid_loss": vl, 'valid ACC': vacc, 'epoch': e})
-         for e, l, vl, vacc in zip(epochs, losses.flatten(), np.repeat(valid_losses, n_steps_e), np.repeat(valid_acc, n_steps_e))]
-
-    fig, ax = plt.subplots(1, 1)
-    ax.plot(np.array(losses).flatten(), alpha=0.2, label="train")
-    ax.plot(np.arange(n_steps_e, n_steps_e*config['num_epochs']+1, n_steps_e), np.array(
-        valid_losses).flatten(), alpha=0.2, label="valid")
-    ax.set_ylabel("nll")
-    ax.set_xlabel("steps")
-    ax.legend()
-    logger.log(
-            {'Nll vs epoch': wandb.Image(fig)})
-    
-    # log test performance
-    test_metrics_fn = setup_metrics(250, x_test, y_test)
-    test_metrics = test_metrics_fn(params)
-    logger.log({'test_loss': test_metrics['Loss'], 'test_acc': test_metrics['Acc']})
-    test_metrics = test_metrics_fn(best_params)
-    logger.log({'test_loss_best': test_metrics['Loss'], 'test_acc_best': test_metrics['Acc']})
-    
-    print("Save artifacts")
-    jnp.save(f'tmp_files/{logger.id}_params.npy', best_params)
-    jnp.save(f'tmp_files/{logger.id}_last_params.npy', params)
-    print("add files to artifact")
-    # create artifact for storing parameters
-    artifact = wandb.Artifact(name="params", type="pytree")
-    artifact.add_file(f'tmp_files/{logger.id}_params.npy')
-    artifact.add_file(f'tmp_files/{logger.id}_last_params.npy')
-    print("Log artifact")
-    logger.log_artifact(artifact)
-
-    logger.finish()
+    # Check if path contains all key names
+    def key_in_path(path):
+        return all(k in path for k in set(key_names)) 
+          
+    path_values, structure = jax.tree_util.tree_flatten_with_path(mask)
+    new_mask = jax.tree.leaves(mask)
+    for i, (k, v) in enumerate(path_values):
+        path = "/".join((dk.key for dk in k))
+        if key_in_path(path):
+            new_mask[i] = False
+    return jax.tree.unflatten(structure, new_mask)
 
 
 def main():
@@ -423,7 +224,8 @@ def single_run(logger, config, n_samples_nuts=None):
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
-                    jitter: float = 0.0,):
+                    jitter: float = 0.0,
+                    no_curve_names: list = []):
         rng_key, init_key = random.split(rng_key)
 
         
@@ -481,8 +283,13 @@ def single_run(logger, config, n_samples_nuts=None):
             # load data
             x, y, x_val, y_val, x_test, y_test, data_revert_norm_fn = load_cifar10(config['rng_seed'])  # get fold from seed
             
-            mask = s_model.init_mask(x_val[:10], all_curves=True)
-            params = s_model.init_params(init_key, x_val[:10], mask)
+            if k > 0:
+                mask = s_model.init_mask(x_val[:10], all_curves=True)
+                mask = mask_as_no_curve(mask, *no_curve_names)
+                params = s_model.init_params(init_key, x_val[:10], mask)
+            else:
+                mask = s_model.init_mask(x_val[:10], all_curves=False)
+                params = s_model.init_params(init_key, x_val[:10], mask)
 
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
@@ -753,7 +560,8 @@ def single_run(logger, config, n_samples_nuts=None):
 
         # valid
         nll, acc, entropy = valid_metrics_fn_final(rng_key, params)
-        logger.log({'acc_val_curve': acc.mean(), 'nll_val_curve': nll.mean(), 'entropy_val_curve': entropy.mean()})
+        logger.log({'acc_val_curve': acc.mean(), 'nll_val_curve': nll.mean(), 'entropy_val_curve': entropy.mean(), 
+            'acc_val_curve_max': acc.max(), 'nll_val_curve_min': nll.min(), 'entropy_val_curve_max': entropy.max()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax.twinx()
         ax2.plot(t_space, acc, label="valid acc",
@@ -765,7 +573,8 @@ def single_run(logger, config, n_samples_nuts=None):
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
         nll, acc, entropy = test_metrics_fn_final(rng_key, params)
-        logger.log({'acc_test_curve': acc.mean(), 'nll_test_curve': nll.mean(), 'entropy_test_curve': entropy.mean()})
+        logger.log({'acc_test_curve': acc.mean(), 'nll_test_curve': nll.mean(), 'entropy_test_curve': entropy.mean(), 
+            'acc_test_curve_max': acc.max(), 'nll_test_curve_min': nll.min(), 'entropy_test_curve_max': entropy.max()})
         ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, acc, label="test acc",
                  c=plt.get_cmap('tab10')(2), linestyle="--")
@@ -780,7 +589,8 @@ def single_run(logger, config, n_samples_nuts=None):
         # valid
         fig, ax = plt.subplots(1, 1)
         nll, acc, entropy = valid_metrics_fn_final(rng_key, last_params)
-        logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean(), 'entropy_val_curve_last': entropy.mean()})
+        logger.log({'acc_val_curve_last': acc.mean(), 'nll_val_curve_last': nll.mean(), 'entropy_val_curve_last': entropy.mean(), 
+            'acc_val_curve_last_max': acc.max(), 'nll_val_curve_last_min': nll.min(), 'entropy_val_curve_last_max': entropy.max()})
         ax.plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax.twinx()
         ax2.plot(t_space, acc, label="valid acc",
@@ -792,7 +602,8 @@ def single_run(logger, config, n_samples_nuts=None):
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
         nll, acc, entropy = test_metrics_fn_final(rng_key, last_params)
-        logger.log({'acc_test_curve_last': acc.mean(), 'nll_test_curve_last': nll.mean(), 'entropy_test_curve_last': entropy.mean()})
+        logger.log({'acc_test_curve_last': acc.mean(), 'nll_test_curve_last': nll.mean(), 'entropy_test_curve_last': entropy.mean(), 
+            'acc_test_curve_last_max': acc.max(), 'nll_test_curve_last_min': nll.min(), 'entropy_test_curve_last_max': entropy.max()})
         ax.plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, acc, label="test acc",
                  c=plt.get_cmap('tab10')(2), linestyle="--")
@@ -870,16 +681,32 @@ if __name__ == '__main__':
         print("Single model training")
         config = {
             'rng_seed': 0,
-            'num_epochs': 500,
-            'batch_size': 100,
-            'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True}},
             'net_kwargs':{'num_blocks': (3, 3, 3),
-                          'c_hidden': (16, 32, 64),
-                          'num_classes': 10,
-                          'act_fn': 'relu',
-                          'block_class': 'ResNetBlock'}}
-        logger = wandb.init(project="cifar_PtoC", name="cifar_point", entity="ddold", config=config)
-        single_model_train(logger, config)
+                        'c_hidden': (16, 32, 64),
+                        'num_classes': 10,
+                        'act_fn': 'relu',
+                        'block_class': 'ResNetBlock'},
+            'eval_every_n_batch': 20,
+            'curve_params': {'k': 0,    # no curve
+                            'num_epochs': 500,
+                            'batch_size': 200,
+                            'natural_parameterization': False,
+                            'gravity': 0.0,
+                            'energy_weakening': 1.,
+                            'weight_decay': 0.,
+                            'remove_initial_permutation': False,
+                            'regularizer': 'cosine','jitter': 1e-8,
+                            #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
+                            #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
+                                'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},
+                            # 'optimizer_conf': {'name': "optax.sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                                                                                            # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
+                                                                            # 'momentum': 0.9, 
+                                                                            # 'nesterov': True},},
+                        }}
+        logger = wandb.init(project="cifar_PtoC", name="cifar_curve", entity="ddold", config=config)
+        single_run(logger, config)
+
     elif args.train == "curve":
         print("Curve training")
         if args.use_sweep:
@@ -908,6 +735,8 @@ if __name__ == '__main__':
                                 'remove_initial_permutation': False,
                                 'regularizer': 'cosine',
                                 'jitter': 1e-8,
+                                'no_curve_names': ['BatchNorm',],  # names of parameters that should not be treated as curves
+                            
                                 #  'optimizer_conf': {'name': "optax.adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "optax.adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                  'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.005, 'momentum': 0.9, 'nesterov': True}},

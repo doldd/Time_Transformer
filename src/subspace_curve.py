@@ -619,6 +619,55 @@ class DistRegressionSubspace(SubspaceBaseModel):
         out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
         return nll, state, out
+    
+class QuantileSubspace(SubspaceBaseModel):
+    def __init__(self, model, k, quantiles, weight_decay=0, perm_spec = False, natural_parameterization=False, mutuable_param_name = False):
+        super().__init__(model, k, weight_decay, perm_spec, natural_parameterization, mutuable_param_name)
+        self.quantiles = jnp.array(quantiles, dtype=jnp.float32)
+
+    @staticmethod
+    @jit
+    def _quantile_loss(pred, actual, quantile: float):
+        """Calculates quantile loss.
+
+        Args:
+        pred: B x T
+        actual: B x T
+        quantile: quantile at which loss is computed.
+
+        Returns:
+        per coordinate loss.
+        """
+        dev = actual - pred
+        loss_first = dev * quantile
+        loss_second = -dev * (1.0 - quantile)
+        return 2 * jnp.where(loss_first >= 0, loss_first, loss_second)
+
+    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+        """
+        Computes the negative log-likelihood loss of the model.
+
+        Parameters:
+        - params: The parameters of the model.
+        - t: The time parameter.
+        - x: The input data.
+        - y: The target output.
+
+        Returns:
+        - The negative log-likelihood loss.
+
+        """
+        out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
+
+        out_quantile = out[1] # shape (n_samples, batch, tokens, dims, out_dim)
+
+        loss = jnp.square(out_quantile[:,:,0] - y)
+        def body_fun(loss, pred_and_quantile):
+            loss += self._quantile_loss(pred_and_quantile['preds'], y, quantile=pred_and_quantile['quantile'])
+            return loss, _
+        loss, _ = jax.lax.scan(body_fun, loss, {'quantile': self.quantiles, 'preds': out_quantile.transpose(2, 0, 1)[1:]})
+        return loss.mean(), state, out
+
 
 class RepulsiveMixin:
     def __init__(self, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
@@ -690,6 +739,9 @@ class RepulsiveDistRegressionSubspace(RepulsiveMixin, DistRegressionSubspace):
     pass
 
 class RepulsiveCategorySubspace(RepulsiveMixin, CategorySubspace):
+    pass
+
+class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
     pass
 
 

@@ -29,8 +29,10 @@ from src.models import MLPModel
 import optax
 import timesfm
 import pandas as pd
+from einshape import jax_einshape as es
 
 
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "./jax_cache"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # jax.config.update('jax_platform_name', 'cpu')
@@ -42,67 +44,81 @@ def gen_data(rng_seed, context_len, horizon_len, **kwargs):
     path = "datasets/SDWPF/SDWPF_dataset/sdwpf_full/sdwpf_2001_2112_full.parquet"
     df = pd.read_parquet(path)
     df.dropna(inplace=True)
+    df_sub = df[(df['TurbID'] < 120)]
+    df_ood = df[(df["TurbID"] >= 120)]
 
-    df.set_index(["TurbID", 'Tmstamp'], inplace=True)
+    df_sub.set_index(["TurbID", 'Tmstamp'], inplace=True)
+    df_ood.set_index(["TurbID", 'Tmstamp'], inplace=True)
     # standardize the data
-    data_mean = df.mean()
-    data_std = df.std()
-    df = (df - df.mean()) / df.std()
-    df = df.reset_index()
-
-    # df_sub = df[(df['TurbID'] == 57)]
-    df_sub = df
-
+    data_mean = df_sub.mean()
+    data_std = df_sub.std()
+    df_sub = (df_sub - data_mean) / data_std
+    df_ood = (df_ood - data_mean) / data_std
+    df_sub = df_sub.reset_index()
+    df_ood = df_ood.reset_index()
     df_sub.sort_values(by=["Tmstamp",], inplace=True)
+    df_ood.sort_values(by=["Tmstamp",], inplace=True)
+
+    # df_sub = df
+
     splits = df_sub['Tmstamp'].quantile([0.75, 0.85, 1.]).values
     # split train test data
     df_train = df_sub[df_sub["Tmstamp"] < splits[0]]
     df_val = df_sub[(df_sub["Tmstamp"] >= splits[0]) & (df_sub["Tmstamp"] < splits[1])]
     df_test = df_sub[df_sub["Tmstamp"] >= splits[1]]
-    df_val.describe()
 
+    all_turb_ids = df['TurbID'].unique()
+    
     def get_batched_data_fn(df):
-        all_TurbIDs = df['TurbID'].unique()
         inputs = []
         outputs = []
 
         num_examples = 0
-        for tubID in all_TurbIDs:
-            sub_df = df[df["TurbID"] == tubID]
+        for tub_id in all_turb_ids:
+            sub_df = df[df["TurbID"] == tub_id]
             for start in range(0, len(sub_df) - (context_len + horizon_len), horizon_len):
                 num_examples += 1
                 inputs.append(sub_df["Patv"][start:(context_end := start + context_len)].tolist())
                 outputs.append(sub_df["Patv"][context_end:(context_end + horizon_len)].tolist())
-        return jnp.array(inputs), jnp.array(outputs), num_examples
+        return jnp.array(np.array(inputs)), jnp.array(np.array(outputs)), num_examples
     x_train, y_train, _ = get_batched_data_fn(df_train)
     x_val, y_val, _ = get_batched_data_fn(df_val)
     x_test, y_test, _ = get_batched_data_fn(df_test)
-    return x_train, y_train, x_val, y_val, x_test, y_test, (data_mean, data_std)
+    x_ood, y_ood, _ = get_batched_data_fn(df_ood)
+    return x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std)
 
 
 
-def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, average=True):
+def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, average=True, rescale_fn=lambda x: x):
     if use_linspace:
         get_t = lambda key: jnp.linspace(0, 1., n_samples)
     else:
         get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
 
     def acc_fn(rng_key, params):
-        x_ = x.reshape(-1, batch_size, 1)
-        y_ = target.reshape(-1, batch_size)
+        x_ = es('(ib)...->ib...', x, b=batch_size)
+        y_ = es('(ib)...->ib...', target, b=batch_size)
 
         def pred(key, data):
             x_batch, y_batch = data
 
             def eval(t):
                 loss, _, out = model.nll(params['params'], {}, t, x_batch, y_batch, train=False)  # params, batch_stats, t, x
-                mse = jnp.mean(jnp.square(out[0] - y_batch))
+                mse = jnp.mean(jnp.square(rescale_fn(out[0][:len(y_batch)]) - rescale_fn(y_batch)))
                 return jnp.mean(loss), mse  # mean over batch
             key, subkey = random.split(key)
 
             # draw samples to approximate curve performance
             t = get_t(subkey)
-            loss, mse = jax.vmap(eval)(t)
+            # Sequential (for loop) instead of vmap
+            loss_list = []
+            mse_list = []
+            for t_i in t:
+                l, m = eval(t_i)
+                loss_list.append(l)
+                mse_list.append(m)
+            loss = jnp.stack(loss_list)
+            mse = jnp.stack(mse_list)
 
             if average:
                 # mean over samples
@@ -118,10 +134,10 @@ def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, a
     return acc_fn
 
 
-def main():
-    logger = wandb.init()
-    config = wandb.config
-    train_curve(logger, config)
+# def main():
+#     logger = wandb.init()
+#     config = wandb.config
+#     train_curve(logger, config)
 
 
 class timesfmWrapper:
@@ -130,29 +146,85 @@ class timesfmWrapper:
         self.freq = frequency  # Frequency of the model, e.g., 0 for daily data
         self.autoregressive = autoregressive  # Set to True if you want to use autoregressive decoding
 
+    def _preprocess(self, inputs, freq) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Formats and pads raw inputs to feed into the model.
+
+        This function both pads each time series to match the context length, and
+        pads the inputs to meet the SPMD shape requirement.
+
+        Args:
+        inputs: A list of 1d JTensors. Each JTensor is the context time series of
+            a single forecast task.
+        freq: list of frequencies
+
+        Returns:
+        A tuple of:
+        - the padded input time series to meet the model required context.
+        - the padding indicator.
+        - the frequency of each input time series.
+        - the number of padded examples for SPMD so that each core has the same
+            number (a multiple of `batch_size`) of examples.
+        """
+
+        input_ts, input_padding, inp_freq = [], [], []
+
+        pmap_pad = ((len(inputs) - 1) // self.model.global_batch_size +
+                    1) * self.model.global_batch_size - len(inputs)
+
+        for i, ts in enumerate(inputs):
+            input_len = ts.shape[0]
+            padding = jnp.zeros(shape=(input_len + self.model.horizon_len,), dtype=float)
+            if input_len < self.model.context_len:
+                num_front_pad = self.model.context_len - input_len
+                ts = jnp.concatenate([jnp.zeros(shape=(num_front_pad,), dtype=float), ts],
+                                    axis=0)
+                padding = jnp.concatenate(
+                    [jnp.ones(shape=(num_front_pad,), dtype=float), padding], axis=0)
+            elif input_len > self.model.context_len:
+                ts = ts[-self.model.context_len:]
+                padding = padding[-(self.model.context_len + self.model.horizon_len):]
+
+            input_ts.append(ts)
+            input_padding.append(padding)
+            inp_freq.append(freq[i])
+
+        # Padding the remainder batch.
+        for _ in range(pmap_pad):
+            input_ts.append(input_ts[-1])
+            input_padding.append(input_padding[-1])
+            inp_freq.append(inp_freq[-1])
+
+        return (
+            jnp.stack(input_ts, axis=0),
+            jnp.stack(input_padding, axis=0),
+            jnp.array(inp_freq).astype(jnp.int32).reshape(-1, 1),
+            pmap_pad,
+        )
+
+
     def _prepare_data(self, x):
         # Prepare the data for the model, e.g., add frequency information
         freq = jnp.full((len(x),1), self.freq, dtype=jnp.int32)
         input_ts = {}
-        input_ts['input_ts'], input_ts['input_padding'], input_ts['freq'], _ = self.model._preprocess(x, freq)
+        input_ts['input_ts'], input_ts['input_padding'], input_ts['freq'], _ = self._preprocess(x, freq)
         input_ts['input_padding'] = input_ts['input_padding'][:, :input_ts['input_ts'].shape[1]]
         return input_ts
 
-    def apply(self, params, x, train=False, mutuable=False):
+    def apply(self, params, x, train=False, mutable=False):
         param_model = self.model._model.bind(params)
         if self.autoregressive:
             # use decode of patched_decoder model to run autoregressive decoding for larger horzion lengths than output_patch_len=128
             freq = jnp.full((len(x),1), self.freq, dtype=jnp.int32)
             input_ts = {}
-            input_ts['input_ts'], input_ts['input_padding'], input_ts['freq'], _ = self.model._preprocess(x, freq)
+            input_ts['input_ts'], input_ts['input_padding'], input_ts['freq'], _ = self._preprocess(x, freq)
             return param_model.decode(inputs=input_ts,
                                       horizon_len=self.model.horizon_len)
         else:
             # use __call__ of patched_decoder model to run single forward pass with horizon length equal to output_patch_len=128
             input_ts = self._prepare_data(x)
-            fprop_outputs = param_model(input_ts)['output_ts'] # shape (BatchShape, Tokens, embedding_dim, output_dim) output_dim is 10 for quantile regression tasks
+            fprop_outputs = param_model(input_ts)['output_ts'] # shape (BatchShape, Tokens, output_patch_len, output_dim) output_dim is 10 for quantile regression tasks
             o_batch_len = self.model.output_patch_len
-            return (fprop_outputs[:, -1, :o_batch_len, 0], fprop_outputs[:, -1, :o_batch_len, 0])
+            return (fprop_outputs[:, -1, :o_batch_len, 0], fprop_outputs[:, -1, :o_batch_len, :])
 
     def init(self, key, x):
         return self.model._model.init(key, self._prepare_data(x))
@@ -174,7 +246,7 @@ def train(logger, config):
                     gravity: float,
                     energy_weakening: float,
                     regularizer: bool|str,
-                    pretrained: bool,
+                    pretrained: bool = False,
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
@@ -184,7 +256,7 @@ def train(logger, config):
         model_a = timesfm.TimesFm(
             hparams=timesfm.TimesFmHparams(
                 backend='gpu',
-                per_core_batch_size=256,
+                per_core_batch_size=batch_size,
                 num_layers=50,
                 **net_kwargs
             ),
@@ -192,6 +264,7 @@ def train(logger, config):
                 huggingface_repo_id="google/timesfm-2.0-500m-jax"),
         )
         model = timesfmWrapper(model_a, frequency=0, autoregressive=net_kwargs['horizon_len'] > 128) # learnd output_patchlen was 128. So larger horizon lengths require autoregressive decoding
+        print("Model is initialized")
 
         perm_spec = False
         if remove_initial_permutation:
@@ -212,7 +285,16 @@ def train(logger, config):
                                        natural_parameterization=natural_parameterization,
                                        mutuable_param_name = False)
         
-        x, y, x_val, y_val, x_test, y_test, (data_mean, data_std) = gen_data(config['rng_seed'], **net_kwargs)  # get fold from seed
+        print("Generate data")
+        times = time.time()
+        x, y, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(config['rng_seed'], **net_kwargs)  # get fold from seed
+        rescale_fn = lambda x: (x * data_std['Patv']) + data_mean['Patv']  # rescale function for predictions
+        # drop non matching batch size
+        x = x[:(x.shape[0]// batch_size) * batch_size]
+        y = y[:(x.shape[0]// batch_size) * batch_size]
+        print(f"Data is generated in {(time.time() - times):.2f} seconds")
+        print("Shapes: ", (x.shape, y.shape), (x_val.shape, y_val.shape), (x_test.shape, y_test.shape))
+
         # load params from wandb artifact if path is given in config
         if pretrained:
             assert k > 0, "Subspace dimension k must be greater than 0 when training a curve from point."
@@ -222,14 +304,14 @@ def train(logger, config):
             init_params = model_a._train_state.mdl_vars
             params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
             
-            init_metrics_fn = setup_metrics(s_model, 18, x_val, y_val, 1, use_linspace=True, average=True)
+            init_metrics_fn = setup_metrics(s_model, len(x_val), x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse = init_metrics_fn(init_key, params)
             logger.summary.update({'init_val_loss': loss, 'init_val_mse': mse})
-            init_metrics_fn = setup_metrics(s_model, 250, x_test, y_test, 1, use_linspace=True, average=True)
+            init_metrics_fn = setup_metrics(s_model, len(x_test), x_test, y_test, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse  = init_metrics_fn(init_key, params)
             logger.summary.update({'init_test_loss': loss, 'init_test_mse': mse})
         else:
-            del model_a._train_state.mdl_vars  # free memory
+            del model_a._train_state.mdl_vars['params']  # free memory
             
             if k > 0:
                 # initialize curve parameter with random parameters
@@ -254,7 +336,7 @@ def train(logger, config):
         best_loss = np.inf
         best_params = params
 
-        valid_metrics_fn = setup_metrics(s_model, 18, x_val, y_val, n_samples=20)
+        valid_metrics_fn = setup_metrics(s_model, len(x_val), x_val, y_val, n_samples=20, rescale_fn=rescale_fn)
 
         # Bezier curve length
         # define function to compute bezier curve length
@@ -392,9 +474,8 @@ def train(logger, config):
             rng_key = carry[0]
             rng_key, subkey = random.split(rng_key)
             shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
-            x_ = x
-            x_ = x_[shuffel].reshape(-1, batch_size, 1)
-            y_ = y[shuffel].reshape(-1, batch_size)
+            x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
+            y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
             carry, (loss, val_loss, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
             return carry, (loss, val_loss, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
@@ -474,10 +555,11 @@ def train(logger, config):
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
-        t_space = jnp.linspace(0, 1, 50)
-        valid_metrics_fn_final = setup_metrics(s_model, 18, x_val, y_val, n_samples=50, use_linspace=True, average=False)
-        train_metrics_fn_final = setup_metrics(s_model, 70, x, y, n_samples=50, use_linspace=True, average=False)
-        test_metrics_fn_final = setup_metrics(s_model, 250, x_test, y_test, n_samples=50, use_linspace=True, average=False)
+        t_space = jnp.linspace(0, 1, 25)
+        valid_metrics_fn_final = setup_metrics(s_model, len(x_val), x_val, y_val, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        train_metrics_fn_final = setup_metrics(s_model, len(x), x, y, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        test_metrics_fn_final = setup_metrics(s_model, len(x_test), x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        ood_metrics_fn_final = setup_metrics(s_model, len(x_ood), x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # valid
         nll, mse = valid_metrics_fn_final(rng_key, params)
@@ -601,15 +683,15 @@ if __name__ == '__main__':
         print("Single model training")
         config = {
             'rng_seed': 5,
-            'net_kwargs':{'horizon_len': 2*60*24//10,
+            'net_kwargs':{'horizon_len': 128,
                           'use_positional_embedding': False,
                           'context_len': 16*60*24//10
                           },
             'eval_every_n_batch': 10,
             'pretrained': args.pretrained,
             'curve_params': {'k': 0,
-                            'num_epochs': 100,
-                            'batch_size': 256,
+                            'num_epochs': 10,
+                            'batch_size': 64,
                             'natural_parameterization': False,
                             'gravity': 0.0,
                             'energy_weakening': 1., 

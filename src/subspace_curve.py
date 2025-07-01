@@ -658,13 +658,13 @@ class QuantileSubspace(SubspaceBaseModel):
 
         """
         out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
+        jax.debug.print(f"out shape: {out[1].shape}")
+        out_quantile = out[1][:len(y)] # len(y) because timesfm increses size to batch size
 
-        out_quantile = out[1] # shape (n_samples, batch, tokens, dims, out_dim)
-
-        loss = jnp.square(out_quantile[:,:,0] - y)
+        loss = jnp.square(out_quantile[:,:,0] - y) 
         def body_fun(loss, pred_and_quantile):
             loss += self._quantile_loss(pred_and_quantile['preds'], y, quantile=pred_and_quantile['quantile'])
-            return loss, _
+            return loss, None
         loss, _ = jax.lax.scan(body_fun, loss, {'quantile': self.quantiles, 'preds': out_quantile.transpose(2, 0, 1)[1:]})
         return loss.mean(), state, out
 

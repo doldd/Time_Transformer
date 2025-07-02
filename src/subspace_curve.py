@@ -658,7 +658,6 @@ class QuantileSubspace(SubspaceBaseModel):
 
         """
         out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
-        jax.debug.print(f"out shape: {out[1].shape}")
         out_quantile = out[1][:len(y)] # len(y) because timesfm increses size to batch size
 
         loss = jnp.square(out_quantile[:,:,0] - y) 
@@ -774,7 +773,7 @@ def masked_pytree_to_matrix(pytree, mask, k):
     # first argument of reduce fn is the accumulator and second is the current value
     only_curve_params = jax.tree.map(lambda x, m: x if m else jnp.reshape(jnp.array([]), (k+1, 0)), pytree, mask)
     return jax.tree.reduce(lambda x, y: jnp.concatenate(
-        [x, y.reshape(k+1, -1)], axis=-1), only_curve_params)
+        [x.reshape(k+1, -1), y.reshape(k+1, -1)], axis=-1), only_curve_params)
 
 # @partial(jit, static_argnums=(1))
 def pytree_to_vec(pytree):

@@ -885,3 +885,22 @@ def matrix_to_pytree(vec, subspace_params):
         flatten_leafs.append(jnp.reshape(vec[:, index: upper_index], s))
         index = upper_index
     return jax.tree.unflatten(structure, flatten_leafs)
+
+
+def filter_mask(mask, *key_names, as_curve=False):
+    """Convert a mask to a no-curve mask according key_name. 
+    Note: Function opperates in-place."""
+    if len(key_names) == 0:
+        return mask
+    
+    # Check if path contains all key names
+    def key_in_path(path):
+        return all(k in path for k in set(key_names)) 
+          
+    path_values, structure = jax.tree_util.tree_flatten_with_path(mask)
+    new_mask = jax.tree.leaves(mask)
+    for i, (k, v) in enumerate(path_values):
+        path = "/".join((dk.key for dk in k))
+        if key_in_path(path):
+            new_mask[i] = as_curve
+    return jax.tree.unflatten(structure, new_mask)

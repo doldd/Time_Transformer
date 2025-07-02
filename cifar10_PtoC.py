@@ -15,8 +15,8 @@ import arviz as az
 from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
-from src.subspace_curve import masked_pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
-from src.subspace_curve import OrthoSpan, RepulsiveCategorySubspace
+from src.subspace_curve import masked_pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve, filter_mask
+from src.subspace_curve, as_curve=False import OrthoSpan, RepulsiveCategorySubspace
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
 from numpyro.infer.util import initialize_model
@@ -180,24 +180,6 @@ def augment(key, image):
     image = jnp.where(flip, image, jnp.flip(image, axis=1))
     return key, image
 
-def mask_as_no_curve(mask, *key_names):
-    """Convert a mask to a no-curve mask according key_name. 
-    Note: Function opperates in-place."""
-    if len(key_names) == 0:
-        return mask
-    
-    # Check if path contains all key names
-    def key_in_path(path):
-        return all(k in path for k in set(key_names)) 
-          
-    path_values, structure = jax.tree_util.tree_flatten_with_path(mask)
-    new_mask = jax.tree.leaves(mask)
-    for i, (k, v) in enumerate(path_values):
-        path = "/".join((dk.key for dk in k))
-        if key_in_path(path):
-            new_mask[i] = False
-    return jax.tree.unflatten(structure, new_mask)
-
 
 def main():
     logger = wandb.init()
@@ -285,7 +267,7 @@ def single_run(logger, config, n_samples_nuts=None):
             
             if k > 0:
                 mask = s_model.init_mask(x_val[:10], all_curves=True)
-                mask = mask_as_no_curve(mask, *no_curve_names)
+                mask = filter_mask(mask, *no_curve_names, as_curve=False)
                 params = s_model.init_params(init_key, x_val[:10], mask)
             else:
                 mask = s_model.init_mask(x_val[:10], all_curves=False)

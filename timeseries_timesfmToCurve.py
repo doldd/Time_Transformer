@@ -1,3 +1,8 @@
+import os
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "./jax_cache"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".85"
+
 from numpyro import distributions as dist
 import numpyro
 import time
@@ -21,7 +26,6 @@ from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
 from numpyro.infer.util import initialize_model
 from jax_tqdm import scan_tqdm
-import os
 from flax import linen as nn
 from src.weight_matching import resnet20_permutation_spec2
 import argparse
@@ -30,10 +34,10 @@ import optax
 import timesfm
 import pandas as pd
 from einshape import jax_einshape as es
+from src.subspace_curve import filter_mask
 
 
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "./jax_cache"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
+
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # jax.config.update('jax_platform_name', 'cpu')
 # Assuming equivalent JAX implementations
@@ -246,13 +250,15 @@ def train(logger, config):
                     gravity: float,
                     energy_weakening: float,
                     regularizer: bool|str,
-                    pretrained: bool = False,
+                    pretrained: bool,
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
                     jitter: float = 0.0,):
         rng_key, init_key = random.split(rng_key)
 
+        print(f"pretrained:s {pretrained}")
+        print(f"Initialize TimesFM model {batch_size}, {net_kwargs}")
         model_a = timesfm.TimesFm(
             hparams=timesfm.TimesFmHparams(
                 backend='gpu',
@@ -297,12 +303,15 @@ def train(logger, config):
 
         # load params from wandb artifact if path is given in config
         if pretrained:
+            print("Initialize model with pretrained parameters")
             assert k > 0, "Subspace dimension k must be greater than 0 when training a curve from point."
 
             # initialize curve parameter with pretrained point parameter
-            mask = s_model.init_mask(x_val[:10], all_curves=True)
+            mask = s_model.init_mask(x_val[:10], all_curves=False)
+            mask = filter_mask(mask, "value", "x_layers_0", as_curve=True, BoolschenOperator=all)
             init_params = model_a._train_state.mdl_vars
             params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
+            del model_a._train_state.mdl_vars['params']  # free memory
             
             init_metrics_fn = setup_metrics(s_model, len(x_val), x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse = init_metrics_fn(init_key, params)
@@ -315,12 +324,18 @@ def train(logger, config):
             
             if k > 0:
                 # initialize curve parameter with random parameters
-                mask = s_model.init_mask(x_val[:2], all_curves=True)
+                mask = s_model.init_mask(x_val[:2], all_curves=False)
+                mask = filter_mask(mask, "value", "x_layers_0", as_curve=True, BoolschenOperator=all)
                 params = s_model.init_params(init_key, x[:2], mask=mask)
             else:
                 # initialize point model (vanilla training)
                 mask = s_model.init_mask(x_val[:2], all_curves=False)
                 params = s_model.init_params(init_key, x[:2], mask=mask)
+        
+        # compute number of parameters
+        n_params = sum(p.size for p in jax.tree.flatten(params)[0])
+        logger.summary.update({'n_params': n_params})
+        print(f"Number of parameters: {n_params}")
 
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
@@ -347,14 +362,18 @@ def train(logger, config):
             def clousure(cp):
                 n = cp.shape[0] - 1
                 cp_diff = cp[1:] - cp[:-1]
-                return jnp.einsum('tj,j...->t...', coeff, cp_diff) * n
+                # improve version to reduce memory usage
+                def d_length_t(cp_diff, c):
+                    d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * n)
+                    return cp_diff, d_t
+                return jax.lax.scan(d_length_t, cp_diff, coeff)
             return clousure
 
         @jit
         def bezier_length(cp):
             t = jnp.linspace(0, 1, 1000)
-            d_bezier = get_d_bezier(t)
-            d_t = jnp.linalg.norm(d_bezier(cp), axis=-1)
+            d_norm_bezier = get_d_bezier(t)
+            _, d_t = d_norm_bezier(cp)
             length = jax.scipy.integrate.trapezoid(d_t, t)
             return length
         
@@ -409,8 +428,8 @@ def train(logger, config):
             return rel_center
         
         # init metric
-        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        rel_center_fn = init_rel_center(cp_w)
+        # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+        # rel_center_fn = init_rel_center(cp_w)
 
         if k > 0:
             def train_batch(carry, batch):
@@ -419,6 +438,7 @@ def train(logger, config):
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, x_, y_, opt_state, optimizer)
+                jax.debug.print(f"loss: {loss}")
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -429,14 +449,21 @@ def train(logger, config):
                     val_loss < best_loss, lambda x: params, lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, val_loss)
 
-                cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-                length = bezier_length(cp_w)
-                l_bound = lower_bound(cp_w)
-                u_bound = upper_bound(cp_w)
-                gyra = gyration(cp_w)
-                center = mass_center(cp_w)
+                # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+                # length = bezier_length(cp_w)
+                # l_bound = lower_bound(cp_w)
+                # u_bound = upper_bound(cp_w)
+                # gyra = gyration(cp_w)
+                # center = mass_center(cp_w)
+                length = 0.
+                l_bound = 0.
+                u_bound = 0.
+                gyra = 0.
+                center = 0.
+                
                 # mean_curv = mean_curvature2(cp_w)
-                rel_center = rel_center_fn(cp_w)
+                # rel_center = rel_center_fn(cp_w)
+                rel_center = 0.
                 grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
                 cos_sim = s_model.summed_cosine_similarity(params['params'])
                 cos_sim /= ((k+1)*k/2)
@@ -480,6 +507,11 @@ def train(logger, config):
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
             return carry, (loss, val_loss, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
+        # print memory stats
+        memory_stats = jax.devices()[0].memory_stats()
+        for stats_name, v in memory_stats.items():
+            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+        
         carry = (rng_key, params, opt_state, best_loss, best_params)
         carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
             train_epoch, carry, jnp.arange(num_epochs))
@@ -524,6 +556,12 @@ def train(logger, config):
             epochs, losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
             )
         ]
+
+        # print memory stats
+        memory_stats = jax.devices()[0].memory_stats()
+        for stats_name, v in memory_stats.items():
+            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+
         # log metrics as artifact
         jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
                   loss=losses,
@@ -546,12 +584,13 @@ def train(logger, config):
         last_params = carry[1]
         rng_key = carry[0]
 
-        # Bezier curve length        
-        cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        length_best = bezier_length(cp)
-        cp = masked_pytree_to_matrix(last_params['params'], s_model.curve_mask, k)
-        length_last = bezier_length(cp)
-        logger.log({'Curve length best': length_best, 'Curve length last': length_last})
+        if k > 0:
+            # Bezier curve length        
+            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            length_best = bezier_length(cp)
+            cp = masked_pytree_to_matrix(last_params['params'], s_model.curve_mask, k)
+            length_last = bezier_length(cp)
+            logger.log({'Curve length best': length_best, 'Curve length last': length_last})
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
@@ -610,42 +649,42 @@ def train(logger, config):
         logger.log(
             {'Nll alonge curve': wandb.Image(fig)})
         
-        # plot predictive performance
-        fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
-        t_space = jnp.linspace(0, 1, 100)
-        # with best params
-        out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(params['params'], {}, t_space, x_val[:2], False)
-        out = out[0][:,0]  # shape (n_samples, n_data)
-        ax[0].plot(x, y, 'o', label='train')
-        # plt.fill_between(x.squeeze(), out.mean(axis=0) - out.std(axis=0), out.mean(axis=0) + out.std(axis=0), alpha=0.5)
-        # plot lines using viridis color map
-        colors = plt.cm.viridis(t_space)
-        for o, c in zip(out, colors):
-            ax[0].plot(o, color=c, alpha=0.3)
-        ax[0].plot(out.mean(axis=0), label='mean',
-                c='red', linewidth=2, alpha=0.8)
-        ax[0].set_ylabel("y")
-        ax[0].set_xlabel("x")
-        ax[0].set_title("Best params")
-        # compute functional diversity
-        functional_diff = {"Sample Std best":out.std(axis=0).mean()}  # std over samples
+        # # plot predictive performance
+        # fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
+        # t_space = jnp.linspace(0, 1, 100)
+        # # with best params
+        # out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(params['params'], {}, t_space, x_val[:2], False)
+        # out = out[0][:,0]  # shape (n_samples, n_data)
+        # ax[0].plot(x, y, 'o', label='train')
+        # # plt.fill_between(x.squeeze(), out.mean(axis=0) - out.std(axis=0), out.mean(axis=0) + out.std(axis=0), alpha=0.5)
+        # # plot lines using viridis color map
+        # colors = plt.cm.viridis(t_space)
+        # for o, c in zip(out, colors):
+        #     ax[0].plot(o, color=c, alpha=0.3)
+        # ax[0].plot(out.mean(axis=0), label='mean',
+        #         c='red', linewidth=2, alpha=0.8)
+        # ax[0].set_ylabel("y")
+        # ax[0].set_xlabel("x")
+        # ax[0].set_title("Best params")
+        # # compute functional diversity
+        # functional_diff = {"Sample Std best":out.std(axis=0).mean()}  # std over samples
         
-        # with last params
-        out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(last_params['params'], {}, t_space, x_val[:2], False)
-        out = out[0][:, 0]  # shape (n_samples, n_data)
-        ax[1].plot(x, y, 'o', label='train')
-        # plt.fill_between(x.squeeze(), out.mean(axis=0) - out.std(axis=0), out.mean(axis=0) + out.std(axis=0), alpha=0.5)
-        # plot lines using viridis color map
-        colors = plt.cm.viridis(t_space)
-        for o, c in zip(out, colors):
-            ax[1].plot(o, color=c, alpha=0.3)
-        ax[1].plot(out.mean(axis=0), label='mean',
-                c='red', linewidth=2, alpha=0.8)
-        ax[1].set_ylabel("y")
-        ax[1].set_xlabel("x")
-        ax[1].set_title("Last params")
-        functional_diff["Sample Std last"] = out.std(axis=0).mean()  # std over samples
-        logger.log(functional_diff)
+        # # with last params
+        # out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(last_params['params'], {}, t_space, x_val[:2], False)
+        # out = out[0][:, 0]  # shape (n_samples, n_data)
+        # ax[1].plot(x, y, 'o', label='train')
+        # # plt.fill_between(x.squeeze(), out.mean(axis=0) - out.std(axis=0), out.mean(axis=0) + out.std(axis=0), alpha=0.5)
+        # # plot lines using viridis color map
+        # colors = plt.cm.viridis(t_space)
+        # for o, c in zip(out, colors):
+        #     ax[1].plot(o, color=c, alpha=0.3)
+        # ax[1].plot(out.mean(axis=0), label='mean',
+        #         c='red', linewidth=2, alpha=0.8)
+        # ax[1].set_ylabel("y")
+        # ax[1].set_xlabel("x")
+        # ax[1].set_title("Last params")
+        # functional_diff["Sample Std last"] = out.std(axis=0).mean()  # std over samples
+        # logger.log(functional_diff)
 
         plt.tight_layout()
         logger.log(
@@ -676,6 +715,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a single model or a curve model.")
     parser.add_argument("--train", choices=["single", "curve"], required=True, help="Specify the training mode: 'single' for single model training, 'curve' for curve model training.")
     parser.add_argument("--pretrained", action="store_true", help="Use pretrained set.")
+    parser.add_argument("--use-sweep", action="store_true", help="Use sweep configuration.")
 
     args = parser.parse_args()
 
@@ -685,13 +725,12 @@ if __name__ == '__main__':
             'rng_seed': 5,
             'net_kwargs':{'horizon_len': 128,
                           'use_positional_embedding': False,
-                          'context_len': 16*60*24//10
+                          'context_len': 8*60*24//10
                           },
             'eval_every_n_batch': 10,
-            'pretrained': args.pretrained,
             'curve_params': {'k': 0,
-                            'num_epochs': 10,
-                            'batch_size': 64,
+                            'num_epochs': 100,
+                            'batch_size': 256,
                             'natural_parameterization': False,
                             'gravity': 0.0,
                             'energy_weakening': 1., 
@@ -699,9 +738,10 @@ if __name__ == '__main__':
                             'weight_decay': 0.,
                             'remove_initial_permutation': False,
                             'jitter': 1e-8,
+                            'pretrained': args.pretrained,
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.002, 'momentum': 0.9, 'nesterov': True}},
+                                'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.0005, 'momentum': 0.9, 'nesterov': True}},
                             # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                             # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                             # 'momentum': 0.9, 
@@ -720,22 +760,22 @@ if __name__ == '__main__':
             print("Using perdefined config")
             config = {
                 'rng_seed': 3,
-                'net_kwargs':{'horizon_len': 2*60*24//10,
+                'net_kwargs':{'horizon_len': 128,
                               'use_positional_embedding': False,
-                              'context_len': 16*60*24//10
+                              'context_len': 8*60*24//10
                               },
                 'eval_every_n_batch': 10,
-                'pretrained': args.pretrained,
                 'curve_params': {'k': 2,
-                                'num_epochs': 1000,
-                                'batch_size': 256,
+                                'num_epochs': 10,
+                                'batch_size': 32,
                                 'natural_parameterization': False,
-                                'gravity': 1.,
+                                'gravity': .1,
                                 'energy_weakening': 1.,
                                 'weight_decay': 0.,
                                 'remove_initial_permutation': False,
                                 'regularizer': 'cosine',
                                 'jitter': 1e-8,
+                                'pretrained': args.pretrained,
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                  'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.001, 'momentum': 0.9, 'nesterov': True}},

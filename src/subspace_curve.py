@@ -217,7 +217,7 @@ class SubspaceBaseModel:
 
     """
 
-    def __init__(self, model, k, weight_decay=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False):
+    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False):
         self.model = model
         self.k = k
         self.bezier = bezier_coeff_fn(k + 1)
@@ -332,7 +332,8 @@ class SubspaceBaseModel:
             stacked_params = self.remove_permutation(key, stacked_params)
         # now pytree of stacked params (each leaf has leading dim of k+1)
         all_params['params'] = jax.tree.map(
-            lambda m, *x: jnp.stack(x) if m else x[0], mask, *stacked_params)
+            lambda m, *x: jnp.stack(x).copy() if m else x[0].copy(), mask, *stacked_params)
+        del stacked_params
 
         self.curve_mask = mask
         return all_params
@@ -429,9 +430,12 @@ class SubspaceBaseModel:
         # Sample t param of Bezier curve
         t = random.uniform(key, (1,), minval=0., maxval=1.)
         loss, state, out = self.nll(params, state, t, x, y, train=True)
-        loss = loss.mean() + sum(self.l2_loss(w, alpha=self.weight_decay)
-                                 for w in jax.tree.leaves(params))
-        return loss, state
+        if self.weight_decay == 0.:
+            return loss.mean(), state
+        else:
+            loss = loss.mean() + sum(self.l2_loss(w, alpha=self.weight_decay)
+                                    for w in jax.tree.leaves(params))
+            return loss, state
 
     @partial(jit, static_argnums=(0,))
     def compute_loss_natural_t(self, key, params, state, x, y):
@@ -643,6 +647,7 @@ class QuantileSubspace(SubspaceBaseModel):
         loss_second = -dev * (1.0 - quantile)
         return 2 * jnp.where(loss_first >= 0, loss_first, loss_second)
 
+    @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.

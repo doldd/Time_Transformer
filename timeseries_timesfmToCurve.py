@@ -21,7 +21,7 @@ from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
 from src.subspace_curve import masked_pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
-from src.subspace_curve import OrthoSpan, QuantileSubspace, RepulsiveQuantileSubspace
+from src.subspace_curve import OrthoSpan, QuantileSubspace, RepulsiveQuantileSubspace, SubspaceBaseModel
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
 from numpyro.infer.util import initialize_model
@@ -100,40 +100,47 @@ def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, a
         get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
 
     def acc_fn(rng_key, params):
-        x_ = es('(ib)...->ib...', x, b=batch_size)
-        y_ = es('(ib)...->ib...', target, b=batch_size)
+        x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+        x_last = x[matching_limit:]
+        y_ = target[:matching_limit]  # drop non matching batch size
+        y_last = target[matching_limit:]
+        x_ = es('(ib)...->ib...', x_, b=batch_size)
+        y_ = es('(ib)...->ib...', y_, b=batch_size)
 
-        def pred(key, data):
+        def pred(key_param, data):
             x_batch, y_batch = data
+            key, param = key_param
 
             def eval(t):
-                loss, _, out = model.nll(params['params'], {}, t, x_batch, y_batch, train=False)  # params, batch_stats, t, x
-                mse = jnp.mean(jnp.square(rescale_fn(out[0][:len(y_batch)]) - rescale_fn(y_batch)))
-                return jnp.mean(loss), mse  # mean over batch
+                loss, _, out = model.nll(param, {}, t, x_batch, y_batch, train=False)  # params, batch_stats, t, x
+                mse = jnp.sum(jnp.square(rescale_fn(out[0][:len(y_batch)]) - rescale_fn(y_batch)))
+                return jnp.sum(loss), mse  # mean over batch
+            
             key, subkey = random.split(key)
 
             # draw samples to approximate curve performance
             t = get_t(subkey)
-            # Sequential (for loop) instead of vmap
-            loss_list = []
-            mse_list = []
-            for t_i in t:
-                l, m = eval(t_i)
-                loss_list.append(l)
-                mse_list.append(m)
-            loss = jnp.stack(loss_list)
-            mse = jnp.stack(mse_list)
+            loss, mse = jax.vmap(eval)(t)
 
             if average:
                 # mean over samples
-                return key, (jnp.mean(loss), jnp.mean(mse))
+                return (key, param), (jnp.sum(loss), jnp.sum(mse))
             else:
-                return key, (loss, mse)  # no mean over samples
+                return (key, param), (loss, mse)  # no mean over samples
 
         # shape (n_data, draws, output_dim)
-        rng_key, (loss, mse) = jax.lax.scan(pred, rng_key, (x_, y_))
-        loss = jnp.mean(loss, axis=0)
-        mse = jnp.mean(mse, axis=0)
+        rng_key, (loss, mse) = jax.lax.scan(pred, (rng_key, params['params']), (x_, y_))
+        # compute loss of last irregular batch
+        if len(x_last) > 0:
+            rng_key, (loss_last, mse_last) = pred(rng_key, (x_last, y_last))
+            loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
+            mse = jnp.concatenate([mse, mse_last[jnp.newaxis, ...]], axis=0)
+        if average:
+            loss = loss.sum() / (n_samples * x.shape[0])
+            mse = mse.sum() / (n_samples * x.shape[0])
+        else:
+            loss = jnp.sum(loss, axis=0) / x.shape[0]
+            mse = jnp.sum(mse, axis=0) / x.shape[0]
         return loss, mse  # mean over epochs
     return acc_fn
 
@@ -145,7 +152,7 @@ def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, a
 
 
 class timesfmWrapper:
-    def __init__(self, model, frequency=0, autoregressive=False):
+    def __init__(self, model:timesfm.TimesFm, frequency=0, autoregressive=False):
         self.model = model
         self.freq = frequency  # Frequency of the model, e.g., 0 for daily data
         self.autoregressive = autoregressive  # Set to True if you want to use autoregressive decoding
@@ -257,7 +264,6 @@ def train(logger, config):
                     jitter: float = 0.0,):
         rng_key, init_key = random.split(rng_key)
 
-        print(f"pretrained:s {pretrained}")
         print(f"Initialize TimesFM model {batch_size}, {net_kwargs}")
         model_a = timesfm.TimesFm(
             hparams=timesfm.TimesFmHparams(
@@ -278,6 +284,7 @@ def train(logger, config):
             perm_spec = resnet20_permutation_spec2()
 
         if regularizer:
+            print("Using RepulsiveQuantileSubspace with regularizer")
             s_model = RepulsiveQuantileSubspace(model=model, k=k, weight_decay=weight_decay,
                                                 quantiles=model_a._model.quantiles, 
                                                 perm_spec=perm_spec,
@@ -285,6 +292,7 @@ def train(logger, config):
                                                 mutuable_param_name = False,
                                                 gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
         else:
+            print("Using QuantileSubspace without repulsive force")
             s_model = QuantileSubspace(model=model, k=k, weight_decay=weight_decay, 
                                        quantiles=model_a._model.quantiles,
                                        perm_spec=perm_spec,
@@ -308,15 +316,15 @@ def train(logger, config):
 
             # initialize curve parameter with pretrained point parameter
             mask = s_model.init_mask(x_val[:10], all_curves=False)
-            mask = filter_mask(mask, "value", "x_layers_0", as_curve=True, BoolschenOperator=all)
+            mask = filter_mask(mask, "value", as_curve=True, BoolschenOperator=any)
             init_params = model_a._train_state.mdl_vars
             params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
             del model_a._train_state.mdl_vars['params']  # free memory
             
-            init_metrics_fn = setup_metrics(s_model, len(x_val), x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
+            init_metrics_fn = setup_metrics(s_model, 512, x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse = init_metrics_fn(init_key, params)
             logger.summary.update({'init_val_loss': loss, 'init_val_mse': mse})
-            init_metrics_fn = setup_metrics(s_model, len(x_test), x_test, y_test, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
+            init_metrics_fn = setup_metrics(s_model, 512, x_test, y_test, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse  = init_metrics_fn(init_key, params)
             logger.summary.update({'init_test_loss': loss, 'init_test_mse': mse})
         else:
@@ -325,7 +333,7 @@ def train(logger, config):
             if k > 0:
                 # initialize curve parameter with random parameters
                 mask = s_model.init_mask(x_val[:2], all_curves=False)
-                mask = filter_mask(mask, "value", "x_layers_0", as_curve=True, BoolschenOperator=all)
+                mask = filter_mask(mask, "value", "x_layers_0", "b", as_curve=True, BoolschenOperator=all)
                 params = s_model.init_params(init_key, x[:2], mask=mask)
             else:
                 # initialize point model (vanilla training)
@@ -340,18 +348,30 @@ def train(logger, config):
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
 
-        # Train
+        # Define optimizer
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
             lr_schedule = getattr(optax, optimizer_conf['kwargs']['learning_rate']['name'])(
                 **optimizer_conf['kwargs']['learning_rate']['kwargs'])
             optimizer_conf['kwargs']['learning_rate'] = lr_schedule
         optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
+        # Add gradient clipping to the optimizer using optax.chain
+        if "grad_clip_norm" in optimizer_conf:
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]),
+                optimizer
+            )
         opt_state = optimizer.init(params['params'])  # only dnn parameters
+
+        cp_w = masked_pytree_to_matrix(params['params'], mask, k)
+        print(f"Control points shape: {cp_w.shape}")
+        loss, params, opt_state, grad_ = s_model.train_step(
+                    random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
+        print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
 
         best_loss = np.inf
         best_params = params
 
-        valid_metrics_fn = setup_metrics(s_model, len(x_val), x_val, y_val, n_samples=20, rescale_fn=rescale_fn)
+        valid_metrics_fn = setup_metrics(s_model, 50, x_val, y_val, n_samples=10, rescale_fn=rescale_fn)
 
         # Bezier curve length
         # define function to compute bezier curve length
@@ -362,7 +382,7 @@ def train(logger, config):
             def clousure(cp):
                 n = cp.shape[0] - 1
                 cp_diff = cp[1:] - cp[:-1]
-                # improve version to reduce memory usage
+                # improved version to reduce memory usage
                 def d_length_t(cp_diff, c):
                     d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * n)
                     return cp_diff, d_t
@@ -438,7 +458,6 @@ def train(logger, config):
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, x_, y_, opt_state, optimizer)
-                jax.debug.print(f"loss: {loss}")
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -465,8 +484,10 @@ def train(logger, config):
                 # rel_center = rel_center_fn(cp_w)
                 rel_center = 0.
                 grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
-                cos_sim = s_model.summed_cosine_similarity(params['params'])
-                cos_sim /= ((k+1)*k/2)
+                # cos_sim = s_model.summed_cosine_similarity(params['params'])
+                # cos_sim /= ((k+1)*k/2)
+                # grad_norm = 0.
+                cos_sim = 0.
                 return (rng_key, params, opt_state, best_loss, best_params), (loss, val_loss, mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
         else:
             def train_batch(carry, batch):
@@ -507,11 +528,44 @@ def train(logger, config):
                 train_batch, carry, (x_, y_, jnp.arange(x_.shape[0])))
             return carry, (loss, val_loss, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim)
 
-        # print memory stats
-        memory_stats = jax.devices()[0].memory_stats()
-        for stats_name, v in memory_stats.items():
-            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+        # # print memory stats
+        # memory_stats = jax.devices()[0].memory_stats()
+        # for stats_name, v in memory_stats.items():
+        #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
+
+        # # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_0.json')
+        # for e in tqdm(range(num_epochs)):
+        #     print(f"Epoch {e+1}/{num_epochs}")
+        #     rng_key, subkey = random.split(rng_key)
+        #     shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
+        #     x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
+        #     y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
+
+        #     # train on batches
+        #     for b, (xb_, yb_) in tqdm(enumerate(zip(x_, y_))):
+        #         rng_key, subkey = random.split(rng_key)
+        #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
+        #         loss, params, opt_state, grad_ = s_model.train_step(
+        #             subkey, params, xb_, yb_, opt_state, optimizer)
+        #         print(f"Batch {b+1}/{x_.shape[0]}, Loss: {loss} ")
+        #         logger.log({'train_loss': loss, 'epoch': e+1, 'batch': b+1, 'stepp':e*x_.shape[0]+b})
+        #         if jnp.isnan(loss):
+        #             print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
+        #             break
+                
+        #         # validate
+        #         rng_key, valid_key = random.split(rng_key)
+        #         if b % EVAL_EVERY_N_BATCH == 0:
+        #             val_loss, mse = valid_metrics_fn(valid_key, params)
+        #             logger.log({'valid_loss': val_loss, 'valid_mse': mse, 'epoch': e+1, 'batch': b+1, 'stepp':e*batch_size+b})
+        #             if val_loss < best_loss:
+        #                 best_params = params
+        #                 best_loss = val_loss
+        #     if jnp.isnan(loss):
+        #         break
+        # last_params = params  
+
         carry = (rng_key, params, opt_state, best_loss, best_params)
         carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
             train_epoch, carry, jnp.arange(num_epochs))
@@ -586,7 +640,7 @@ def train(logger, config):
 
         if k > 0:
             # Bezier curve length        
-            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            cp = masked_pytree_to_matrix(best_params['params'], s_model.curve_mask, k)
             length_best = bezier_length(cp)
             cp = masked_pytree_to_matrix(last_params['params'], s_model.curve_mask, k)
             length_last = bezier_length(cp)
@@ -595,25 +649,25 @@ def train(logger, config):
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 25)
-        valid_metrics_fn_final = setup_metrics(s_model, len(x_val), x_val, y_val, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        train_metrics_fn_final = setup_metrics(s_model, len(x), x, y, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        test_metrics_fn_final = setup_metrics(s_model, len(x_test), x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        ood_metrics_fn_final = setup_metrics(s_model, len(x_ood), x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        valid_metrics_fn_final = setup_metrics(s_model, 100, x_val, y_val, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        train_metrics_fn_final = setup_metrics(s_model, 100, x, y, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        test_metrics_fn_final = setup_metrics(s_model, 100, x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        ood_metrics_fn_final = setup_metrics(s_model, 100, x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # valid
-        nll, mse = valid_metrics_fn_final(rng_key, params)
+        nll, mse = valid_metrics_fn_final(rng_key, best_params)
         logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
         ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax[0].twinx()
         ax2.plot(t_space, mse, label="valid mse",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         # train
-        nll, mse = train_metrics_fn_final(rng_key, params)
+        nll, mse = train_metrics_fn_final(rng_key, best_params)
         ax[0].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
         ax2.plot(t_space, mse, label="train mse",
                  c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
-        nll, mse = test_metrics_fn_final(rng_key, params)
+        nll, mse = test_metrics_fn_final(rng_key, best_params)
         logger.log({'mse_test_curve': mse.mean(), 'nll_test_curve': nll.mean(), 'mse_test_curve_min': mse.min(), 'nll_test_curve_min': nll.min()})
         ax[0].plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
         ax2.plot(t_space, mse, label="test mse",
@@ -759,26 +813,28 @@ if __name__ == '__main__':
         else:
             print("Using perdefined config")
             config = {
-                'rng_seed': 3,
+                'rng_seed': 5,
                 'net_kwargs':{'horizon_len': 128,
                               'use_positional_embedding': False,
                               'context_len': 8*60*24//10
                               },
-                'eval_every_n_batch': 10,
+                'eval_every_n_batch': 50,
                 'curve_params': {'k': 2,
-                                'num_epochs': 10,
-                                'batch_size': 32,
+                                'num_epochs': 20,
+                                'batch_size': 128,
                                 'natural_parameterization': False,
-                                'gravity': .1,
-                                'energy_weakening': 1.,
+                                'gravity': 0.0,
+                                'energy_weakening': 1., 
+                                'regularizer': False,
                                 'weight_decay': 0.,
                                 'remove_initial_permutation': False,
-                                'regularizer': 'cosine',
                                 'jitter': 1e-8,
                                 'pretrained': args.pretrained,
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.001, 'momentum': 0.9, 'nesterov': True}},
+                                    'optimizer_conf': {'name': "sgd", 
+                                                       'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
+                                                       'grad_clip_norm': 10.0},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 

@@ -1,7 +1,7 @@
 import os
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "./jax_cache"
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".85"
+# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".85"
 
 from numpyro import distributions as dist
 import numpyro
@@ -244,6 +244,7 @@ class timesfmWrapper:
 def train(logger, config):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
+    BATCH_SIZE_EVAL = config['curve_params']['batch_size']
 
     # create artifact for storing parameters
     artifact = wandb.Artifact(name="params", type="pytree")
@@ -302,6 +303,7 @@ def train(logger, config):
         print("Generate data")
         times = time.time()
         x, y, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(config['rng_seed'], **net_kwargs)  # get fold from seed
+        del x_ood, y_ood  # remove ood data for now
         rescale_fn = lambda x: (x * data_std['Patv']) + data_mean['Patv']  # rescale function for predictions
         # drop non matching batch size
         x = x[:(x.shape[0]// batch_size) * batch_size]
@@ -321,10 +323,10 @@ def train(logger, config):
             params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
             del model_a._train_state.mdl_vars['params']  # free memory
             
-            init_metrics_fn = setup_metrics(s_model, 512, x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
+            init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse = init_metrics_fn(init_key, params)
             logger.summary.update({'init_val_loss': loss, 'init_val_mse': mse})
-            init_metrics_fn = setup_metrics(s_model, 512, x_test, y_test, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
+            init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, x_test, y_test, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
             loss, mse  = init_metrics_fn(init_key, params)
             logger.summary.update({'init_test_loss': loss, 'init_test_mse': mse})
         else:
@@ -355,23 +357,25 @@ def train(logger, config):
             optimizer_conf['kwargs']['learning_rate'] = lr_schedule
         optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
         # Add gradient clipping to the optimizer using optax.chain
+        opt_chain_list = []
         if "grad_clip_norm" in optimizer_conf:
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]),
-                optimizer
-            )
+            opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]))
+        opt_chain_list.append(optimizer)
+        if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
+            opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
+        optimizer = optax.chain(*opt_chain_list)
         opt_state = optimizer.init(params['params'])  # only dnn parameters
 
         cp_w = masked_pytree_to_matrix(params['params'], mask, k)
         print(f"Control points shape: {cp_w.shape}")
-        loss, params, opt_state, grad_ = s_model.train_step(
-                    random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
-        print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
+        # loss, params, opt_state, grad_ = s_model.train_step(
+        #             random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
+        # print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
 
         best_loss = np.inf
         best_params = params
 
-        valid_metrics_fn = setup_metrics(s_model, 50, x_val, y_val, n_samples=10, rescale_fn=rescale_fn)
+        valid_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, x_val, y_val, n_samples=10, rescale_fn=rescale_fn)
 
         # Bezier curve length
         # define function to compute bezier curve length
@@ -534,109 +538,113 @@ def train(logger, config):
         #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
 
-        # # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_0.json')
-        # for e in tqdm(range(num_epochs)):
-        #     print(f"Epoch {e+1}/{num_epochs}")
-        #     rng_key, subkey = random.split(rng_key)
-        #     shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
-        #     x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
-        #     y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
+        # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_0.json')
+        for e in tqdm(range(num_epochs)):
+            print(f"Epoch {e+1}/{num_epochs}")
+            rng_key, subkey = random.split(rng_key)
+            shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
+            x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
+            y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
 
-        #     # train on batches
-        #     for b, (xb_, yb_) in tqdm(enumerate(zip(x_, y_))):
-        #         rng_key, subkey = random.split(rng_key)
-        #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
-        #         loss, params, opt_state, grad_ = s_model.train_step(
-        #             subkey, params, xb_, yb_, opt_state, optimizer)
-        #         print(f"Batch {b+1}/{x_.shape[0]}, Loss: {loss} ")
-        #         logger.log({'train_loss': loss, 'epoch': e+1, 'batch': b+1, 'stepp':e*x_.shape[0]+b})
-        #         if jnp.isnan(loss):
-        #             print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
-        #             break
+            # train on batches
+            batch_loop = tqdm(enumerate(zip(x_, y_)), leave=False)
+            for b, (xb_, yb_) in batch_loop:
+                rng_key, subkey = random.split(rng_key)
+                # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
+                loss, params, opt_state, grad_ = s_model.train_step(
+                    subkey, params, xb_, yb_, opt_state, optimizer)
+                grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
+
+                batch_loop.set_postfix({"Loss": loss})
+                logger.log({'train_loss': loss, 'epoch': e+1, 'batch': b+1, 'stepp':e*x_.shape[0]+b, 'grad_norm': grad_norm})
+                if jnp.isnan(loss):
+                    print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
+                    break
                 
-        #         # validate
-        #         rng_key, valid_key = random.split(rng_key)
-        #         if b % EVAL_EVERY_N_BATCH == 0:
-        #             val_loss, mse = valid_metrics_fn(valid_key, params)
-        #             logger.log({'valid_loss': val_loss, 'valid_mse': mse, 'epoch': e+1, 'batch': b+1, 'stepp':e*batch_size+b})
-        #             if val_loss < best_loss:
-        #                 best_params = params
-        #                 best_loss = val_loss
-        #     if jnp.isnan(loss):
-        #         break
-        # last_params = params  
+                # validate
+                rng_key, valid_key = random.split(rng_key)
+                if b % EVAL_EVERY_N_BATCH == 0:
+                    val_loss, mse = valid_metrics_fn(valid_key, params)
+                    logger.log({'valid_loss': val_loss, 'valid_mse': mse, 'epoch': e+1, 'batch': b+1, 'stepp':e*batch_size+b})
+                    if val_loss < best_loss:
+                        best_params = params
+                        best_loss = val_loss
+            batch_loop.close()
+            if jnp.isnan(loss):
+                break
+        last_params = params  
 
-        carry = (rng_key, params, opt_state, best_loss, best_params)
-        carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
-            train_epoch, carry, jnp.arange(num_epochs))
+        # carry = (rng_key, params, opt_state, best_loss, best_params)
+        # carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
+        #     train_epoch, carry, jnp.arange(num_epochs))
 
-        # log losses for wandb
-        n_batches = np.array(losses).shape[-1]
-        epochs = np.repeat(np.arange(num_epochs), n_batches)
-        losses = jnp.array(losses).flatten()
+        # # log losses for wandb
+        # n_batches = np.array(losses).shape[-1]
+        # epochs = np.repeat(np.arange(num_epochs), n_batches)
+        # losses = jnp.array(losses).flatten()
 
-        # clean up inf values because of lazy validation
-        val_losses = val_losses[:, ::EVAL_EVERY_N_BATCH].repeat(
-            EVAL_EVERY_N_BATCH, axis=1)[:,:val_losses.shape[1]]
-        val_mse = val_mse[:, ::EVAL_EVERY_N_BATCH].repeat(
-            EVAL_EVERY_N_BATCH, axis=1)[:, :val_mse.shape[1]]
+        # # clean up inf values because of lazy validation
+        # val_losses = val_losses[:, ::EVAL_EVERY_N_BATCH].repeat(
+        #     EVAL_EVERY_N_BATCH, axis=1)[:,:val_losses.shape[1]]
+        # val_mse = val_mse[:, ::EVAL_EVERY_N_BATCH].repeat(
+        #     EVAL_EVERY_N_BATCH, axis=1)[:, :val_mse.shape[1]]
 
-        val_losses = jnp.array(val_losses).flatten()
-        val_mse = jnp.array(val_mse).flatten()
-        length = jnp.array(length).flatten()
-        l_bound = jnp.array(l_bound).flatten()
-        u_bound = jnp.array(u_bound).flatten()
-        gyra = jnp.array(gyra).flatten()
-        center = jnp.array(center).flatten()
-        rel_center = jnp.array(rel_center).flatten()
-        grad_norm = jnp.array(grad_norm).flatten()
-        cos_sim = jnp.array(cos_sim).flatten()
-        _ = [
-            logger.log({
-            "train_loss": l,
-            "Curve valid_loss": vl,
-            "Curve valid MSE": vacc,
-            "epoch": e,
-            "curve_length": le,
-            "curve_lower_bound": lb,
-            "curve_upper_bound": ub,
-            "curve_gyration": gy,
-            "curve_center": ce,
-            "curve_rel_center": rc,
-            "curve_grad_norm": gn,
-            "cosine_similarity": cs,
-            })
-            for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn, cs in zip(
-            epochs, losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
-            )
-        ]
+        # val_losses = jnp.array(val_losses).flatten()
+        # val_mse = jnp.array(val_mse).flatten()
+        # length = jnp.array(length).flatten()
+        # l_bound = jnp.array(l_bound).flatten()
+        # u_bound = jnp.array(u_bound).flatten()
+        # gyra = jnp.array(gyra).flatten()
+        # center = jnp.array(center).flatten()
+        # rel_center = jnp.array(rel_center).flatten()
+        # grad_norm = jnp.array(grad_norm).flatten()
+        # cos_sim = jnp.array(cos_sim).flatten()
+        # _ = [
+        #     logger.log({
+        #     "train_loss": l,
+        #     "Curve valid_loss": vl,
+        #     "Curve valid MSE": vacc,
+        #     "epoch": e,
+        #     "curve_length": le,
+        #     "curve_lower_bound": lb,
+        #     "curve_upper_bound": ub,
+        #     "curve_gyration": gy,
+        #     "curve_center": ce,
+        #     "curve_rel_center": rc,
+        #     "curve_grad_norm": gn,
+        #     "cosine_similarity": cs,
+        #     })
+        #     for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn, cs in zip(
+        #     epochs, losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
+        #     )
+        # ]
 
-        # print memory stats
-        memory_stats = jax.devices()[0].memory_stats()
-        for stats_name, v in memory_stats.items():
-            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+        # # print memory stats
+        # memory_stats = jax.devices()[0].memory_stats()
+        # for stats_name, v in memory_stats.items():
+        #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
 
-        # log metrics as artifact
-        jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
-                  loss=losses,
-                  epochs=epochs,
-                  val_loss=val_losses,
-                  val_mse=val_mse,
-                  curve_length=length,
-                  curve_lower_bound=l_bound,
-                  curve_upper_bound=u_bound,
-                  curve_gyration=gyra,
-                  curve_center=center,
-                  curve_rel_center=rel_center,
-                  curve_grad_norm=grad_norm,
-                  cosine_similarity=cos_sim)
-        art = wandb.Artifact(name="metrics", type="npz")
-        art.add_file(f'tmp_files/{logger.id}_metrics.npz')
-        logger.log_artifact(art)
+        # # log metrics as artifact
+        # jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
+        #           loss=losses,
+        #           epochs=epochs,
+        #           val_loss=val_losses,
+        #           val_mse=val_mse,
+        #           curve_length=length,
+        #           curve_lower_bound=l_bound,
+        #           curve_upper_bound=u_bound,
+        #           curve_gyration=gyra,
+        #           curve_center=center,
+        #           curve_rel_center=rel_center,
+        #           curve_grad_norm=grad_norm,
+        #           cosine_similarity=cos_sim)
+        # art = wandb.Artifact(name="metrics", type="npz")
+        # art.add_file(f'tmp_files/{logger.id}_metrics.npz')
+        # logger.log_artifact(art)
 
-        params = carry[4]  # select best parameters
-        last_params = carry[1]
-        rng_key = carry[0]
+        # params = carry[4]  # select best parameters
+        # last_params = carry[1]
+        # rng_key = carry[0]
 
         if k > 0:
             # Bezier curve length        
@@ -649,10 +657,10 @@ def train(logger, config):
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 25)
-        valid_metrics_fn_final = setup_metrics(s_model, 100, x_val, y_val, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        train_metrics_fn_final = setup_metrics(s_model, 100, x, y, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        test_metrics_fn_final = setup_metrics(s_model, 100, x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
-        ood_metrics_fn_final = setup_metrics(s_model, 100, x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        valid_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_val, y_val, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        train_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x, y, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        test_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # valid
         nll, mse = valid_metrics_fn_final(rng_key, best_params)
@@ -770,6 +778,7 @@ if __name__ == '__main__':
     parser.add_argument("--train", choices=["single", "curve"], required=True, help="Specify the training mode: 'single' for single model training, 'curve' for curve model training.")
     parser.add_argument("--pretrained", action="store_true", help="Use pretrained set.")
     parser.add_argument("--use-sweep", action="store_true", help="Use sweep configuration.")
+    parser.add_argument("--batch-size", type=int, default=128, help="batch size for training. Default is 128.")
 
     args = parser.parse_args()
 
@@ -784,7 +793,7 @@ if __name__ == '__main__':
             'eval_every_n_batch': 10,
             'curve_params': {'k': 0,
                             'num_epochs': 100,
-                            'batch_size': 256,
+                            'batch_size': args.batch_size,
                             'natural_parameterization': False,
                             'gravity': 0.0,
                             'energy_weakening': 1., 
@@ -820,8 +829,8 @@ if __name__ == '__main__':
                               },
                 'eval_every_n_batch': 50,
                 'curve_params': {'k': 2,
-                                'num_epochs': 20,
-                                'batch_size': 128,
+                                'num_epochs': 2,
+                                'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,
                                 'energy_weakening': 1., 
@@ -834,7 +843,8 @@ if __name__ == '__main__':
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                     'optimizer_conf': {'name': "sgd", 
                                                        'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
-                                                       'grad_clip_norm': 10.0},
+                                                       'grad_clip_norm': 10.0,
+                                                       'freeze_non_curve_params': True},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 

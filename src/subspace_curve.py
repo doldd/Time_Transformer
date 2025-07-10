@@ -285,29 +285,42 @@ class SubspaceBaseModel:
             - Non-curve parameters are reverted to their original values from `point['params']`.
             - The mask used for curve parameters is stored in `self.curve_mask`.
         """
-        curve_params = [deepcopy(point['params']) for _ in range(self.k+1)]
-        
-        # add noise to the parameters
-        param, struct = jax.tree.flatten(curve_params)
-        keys = random.split(key, len(param))
+        assert ('params' in point) and len(point.keys())==1, "Point must contain 'params' key and no other keys."
+        # curve_params = [deepcopy(point['params']) for _ in range(self.k+1)]
+        # # add noise to the parameters
+        # param, struct = jax.tree.flatten(curve_params)
+        # keys = random.split(key, len(param))
         def apply_noise(p, key, jitter):
             return p+jitter*jax.random.normal(key, p.shape)
-        noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
-        curve_params = jax.tree.unflatten(struct, noise_params)
+        # noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
+        # curve_params = jax.tree.unflatten(struct, noise_params)
         
         if self.perm_spec:
-            curve_params = self.remove_permutation(key, curve_params)
-        
-        curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
+            raise ValueError("Permutation specification is not supported in init_params_from_point method.")
+        #     curve_params = self.remove_permutation(key, curve_params)
+        # curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
 
-        # revert all non-curve parameters to the original point
-        curve_params = jax.tree.map(
-            lambda p, m, o: p if m else o, curve_params, mask, point['params'])
-        all_params = deepcopy(point)
-        all_params['params'] = curve_params
+        # # revert all non-curve parameters to the original point
+        # curve_params = jax.tree.map(
+        #     lambda p, m, o: p if m else o, curve_params, mask, point['params'])
+        # all_params = deepcopy(point)
+        # all_params['params'] = curve_params
+
+        def make_curve(m, p, key):
+            if m:
+                curve_param = jnp.stack([p] * (self.k + 1))
+                curve_param = apply_noise(curve_param, key, jitter)
+                return curve_param
+            else:
+                return p
+
+        mf, struct = jax.tree.flatten(mask)
+        rng_keys = random.split(key, len(mf))
+        rng_keys = jax.tree.unflatten(struct, rng_keys)
+        all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
 
         self.curve_mask = mask
-        return all_params
+        return {'params': all_params}
     
     def init_params(self, key, x, mask):
         """
@@ -332,7 +345,7 @@ class SubspaceBaseModel:
             stacked_params = self.remove_permutation(key, stacked_params)
         # now pytree of stacked params (each leaf has leading dim of k+1)
         all_params['params'] = jax.tree.map(
-            lambda m, *x: jnp.stack(x).copy() if m else x[0].copy(), mask, *stacked_params)
+            lambda m, *x: jnp.stack(x) if m else x[0], mask, *stacked_params)
         del stacked_params
 
         self.curve_mask = mask

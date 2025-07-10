@@ -267,7 +267,11 @@ def train(logger, config):
         rng_key, init_key = random.split(rng_key)
 
         print(f"Initialize TimesFM model {batch_size}, {net_kwargs}")
-        model_a = timesfm.TimesFm(
+
+        class noJitDecodeTimes(timesfm.TimesFm):
+            def jit_decode(self):
+                pass
+        model_a = noJitDecodeTimes(
             hparams=timesfm.TimesFmHparams(
                 backend='gpu',
                 per_core_batch_size=batch_size,
@@ -321,8 +325,7 @@ def train(logger, config):
             mask = s_model.init_mask(x_val[:10], all_curves=False)
             for f in filter_masks:
                 mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-            init_params = model_a._train_state.mdl_vars
-            params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
+            params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, mask, jitter=jitter)
             del model_a._train_state.mdl_vars['params']  # free memory
             
             init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
@@ -541,7 +544,7 @@ def train(logger, config):
         #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
 
-        # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_0.json')
+        # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
         for e in tqdm(range(num_epochs)):
             print(f"Epoch {e+1}/{num_epochs}")
             rng_key, subkey = random.split(rng_key)
@@ -582,6 +585,8 @@ def train(logger, config):
             if jnp.isnan(loss):
                 break
         last_params = params  
+
+        # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
 
         # carry = (rng_key, params, opt_state, best_loss, best_params)
         # carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
@@ -840,7 +845,7 @@ if __name__ == '__main__':
                               'context_len': 8*60*24//10
                               },
                 'eval_every_n_batch': 50,
-                'curve_params': {'k': 2,
+                'curve_params': {'k': 10,
                                 'num_epochs': 2,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
@@ -856,8 +861,8 @@ if __name__ == '__main__':
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                     'optimizer_conf': {'name': "sgd", 
                                                        'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
-                                                       'grad_clip_norm': 10.0,
-                                                       'freeze_non_curve_params': True},
+                                                       'grad_clip_norm': 15.0,
+                                                       'freeze_non_curve_params': False},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 

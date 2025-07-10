@@ -262,6 +262,7 @@ def train(logger, config):
                     weight_decay: float = 0.0, 
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
+                    filter_masks: list = None,
                     jitter: float = 0.0,):
         rng_key, init_key = random.split(rng_key)
 
@@ -318,7 +319,8 @@ def train(logger, config):
 
             # initialize curve parameter with pretrained point parameter
             mask = s_model.init_mask(x_val[:10], all_curves=False)
-            mask = filter_mask(mask, "value", as_curve=True, BoolschenOperator=any)
+            for f in filter_masks:
+                mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
             init_params = model_a._train_state.mdl_vars
             params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
             del model_a._train_state.mdl_vars['params']  # free memory
@@ -335,7 +337,8 @@ def train(logger, config):
             if k > 0:
                 # initialize curve parameter with random parameters
                 mask = s_model.init_mask(x_val[:2], all_curves=False)
-                mask = filter_mask(mask, "value", "x_layers_0", "b", as_curve=True, BoolschenOperator=all)
+                for f in filter_masks:
+                    mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
                 params = s_model.init_params(init_key, x[:2], mask=mask)
             else:
                 # initialize point model (vanilla training)
@@ -556,7 +559,11 @@ def train(logger, config):
                 grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
 
                 batch_loop.set_postfix({"Loss": loss})
-                logger.log({'train_loss': loss, 'epoch': e+1, 'batch': b+1, 'stepp':e*x_.shape[0]+b, 'grad_norm': grad_norm})
+                logs = {
+                    'epoch': e+1, 'batch': b+1, 'stepp': e*x_.shape[0]+b+1,
+                    'train_loss': loss,
+                    'grad_norm': grad_norm
+                }
                 if jnp.isnan(loss):
                     print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
                     break
@@ -565,10 +572,12 @@ def train(logger, config):
                 rng_key, valid_key = random.split(rng_key)
                 if b % EVAL_EVERY_N_BATCH == 0:
                     val_loss, mse = valid_metrics_fn(valid_key, params)
-                    logger.log({'valid_loss': val_loss, 'valid_mse': mse, 'epoch': e+1, 'batch': b+1, 'stepp':e*batch_size+b})
+                    logs = {**logs, 'valid_loss': val_loss, 'valid_mse': mse}
                     if val_loss < best_loss:
                         best_params = params
                         best_loss = val_loss
+                logger.log(logs)
+                
             batch_loop.close()
             if jnp.isnan(loss):
                 break
@@ -662,28 +671,30 @@ def train(logger, config):
         test_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_test, y_test, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
         # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
     
-        # valid
-        nll, mse = valid_metrics_fn_final(rng_key, best_params)
-        logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
-        ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
-        ax2 = ax[0].twinx()
-        ax2.plot(t_space, mse, label="valid mse",
-                 c=plt.get_cmap('tab10')(1), linestyle="--")
-        # train
-        nll, mse = train_metrics_fn_final(rng_key, best_params)
-        ax[0].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
-        ax2.plot(t_space, mse, label="train mse",
-                 c=plt.get_cmap('tab10')(0), linestyle="--")
-        # test
-        nll, mse = test_metrics_fn_final(rng_key, best_params)
-        logger.log({'mse_test_curve': mse.mean(), 'nll_test_curve': nll.mean(), 'mse_test_curve_min': mse.min(), 'nll_test_curve_min': nll.min()})
-        ax[0].plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
-        ax2.plot(t_space, mse, label="test mse",
-                 c=plt.get_cmap('tab10')(2), linestyle="--")
-        ax[0].set_xlabel("t")
-        ax[0].set_ylabel("mean log likelihood")
-        ax[0].set_title("Best params")
+        # # plot best params
+        # # valid
+        # nll, mse = valid_metrics_fn_final(rng_key, best_params)
+        # logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
+        # ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
+        # ax2 = ax[0].twinx()
+        # ax2.plot(t_space, mse, label="valid mse",
+        #          c=plt.get_cmap('tab10')(1), linestyle="--")
+        # # train
+        # nll, mse = train_metrics_fn_final(rng_key, best_params)
+        # ax[0].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
+        # ax2.plot(t_space, mse, label="train mse",
+        #          c=plt.get_cmap('tab10')(0), linestyle="--")
+        # # test
+        # nll, mse = test_metrics_fn_final(rng_key, best_params)
+        # logger.log({'mse_test_curve': mse.mean(), 'nll_test_curve': nll.mean(), 'mse_test_curve_min': mse.min(), 'nll_test_curve_min': nll.min()})
+        # ax[0].plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
+        # ax2.plot(t_space, mse, label="test mse",
+        #          c=plt.get_cmap('tab10')(2), linestyle="--")
+        # ax[0].set_xlabel("t")
+        # ax[0].set_ylabel("mean log likelihood")
+        # ax[0].set_title("Best params")
         
+        # plot last params
         # valid
         nll, mse = valid_metrics_fn_final(rng_key, last_params)
         logger.log({'mse_val_curve_last': mse.mean(), 'nll_val_curve_last': nll.mean(), 'mse_val_curve_last_min': mse.min(), 'nll_val_curve_last_min': nll.min()})
@@ -691,11 +702,11 @@ def train(logger, config):
         ax2 = ax[1].twinx()
         ax2.plot(t_space, mse, label="valid mse",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
-        # train
-        nll, mse = train_metrics_fn_final(rng_key, last_params)
-        ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
-        ax2.plot(t_space, mse, label="train mse",
-                 c=plt.get_cmap('tab10')(0), linestyle="--")
+        # # train
+        # nll, mse = train_metrics_fn_final(rng_key, last_params)
+        # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
+        # ax2.plot(t_space, mse, label="train mse",
+        #          c=plt.get_cmap('tab10')(0), linestyle="--")
         # test
         nll, mse = test_metrics_fn_final(rng_key, last_params)
         logger.log({'mse_test_curve_last': mse.mean(), 'nll_test_curve_last': nll.mean(), 'mse_test_curve_last_min': mse.min(), 'nll_test_curve_last_min': nll.min()})
@@ -802,6 +813,7 @@ if __name__ == '__main__':
                             'remove_initial_permutation': False,
                             'jitter': 1e-8,
                             'pretrained': args.pretrained,
+                            'filter_masks': [{'keys': ("value", "x_layers_0"), 'op': 'all'}],
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.0005, 'momentum': 0.9, 'nesterov': True}},
@@ -839,6 +851,7 @@ if __name__ == '__main__':
                                 'remove_initial_permutation': False,
                                 'jitter': 1e-8,
                                 'pretrained': args.pretrained,
+                                'filter_masks': [{'keys': ("value", "x_layers_0"), 'op': 'all'}],
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                     'optimizer_conf': {'name': "sgd", 

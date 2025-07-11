@@ -30,7 +30,7 @@ parameters:
       natural_parameterization:
         value: False
       gravity:
-        values: [0.001, 0.01, 0.1, 1.]
+        values: [0.001, 0.01, 0.1,]
       energy_weakening:
         value: 1.
       regularizer:
@@ -48,7 +48,7 @@ parameters:
       optimizer_conf:
         parameters:
           name:
-            value: "optax.sgd"
+            value: "sgd"
           kwargs:
             parameters:
               learning_rate:

@@ -12,7 +12,14 @@ from jax.scipy.special import gammaln
 from src.weight_matching import PermutationSpec, apply_permutation, weight_matching
 from flax import traverse_util
 from copy import deepcopy
-# from flax.core import freeze, unfreeze
+from flax.core import freeze, unfreeze
+# def freeze(x):
+#     """Flax freeze function."""
+#     return x
+# def unfreeze(x):
+#     """Flax unfreeze function."""
+#     return x
+
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
            'vec_to_pytree', 'bezier_curve', 'UniformTSubspace', 'UniformTCategory']
@@ -226,6 +233,7 @@ class SubspaceBaseModel:
         self.mutable_name = mutuable_param_name
         self.compute_loss = self.compute_loss_natural_t if natural_parameterization else self.compute_loss_t
         self.curve_mask = None
+        self.train_mask = None
 
     def remove_permutation(self, key, params_list):
         """
@@ -267,6 +275,8 @@ class SubspaceBaseModel:
         """
         params = self.model.init(random.PRNGKey(0), x)
         mask = jax.tree.map(lambda x: all_curves, params['params'])
+        self.curve_mask = mask
+        self.train_mask = mask
         return mask
     
     def init_params_from_point(self, key, point, mask, jitter):
@@ -320,6 +330,7 @@ class SubspaceBaseModel:
         all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
 
         self.curve_mask = mask
+        self.train_mask = mask
         return {'params': all_params}
     
     def init_params(self, key, x, mask):
@@ -349,6 +360,7 @@ class SubspaceBaseModel:
         del stacked_params
 
         self.curve_mask = mask
+        self.train_mask = mask
         return all_params
     
 
@@ -425,7 +437,7 @@ class SubspaceBaseModel:
         return alpha * (x ** 2).sum()
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, params, state, x, y):
+    def compute_loss_t(self, key, params, state, freezed_params, x, y):
         """
         Computes the loss of the model.
 
@@ -442,7 +454,8 @@ class SubspaceBaseModel:
         """
         # Sample t param of Bezier curve
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, state, out = self.nll(params, state, t, x, y, train=True)
+        joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
+        loss, state, out = self.nll(joind_param, state, t, x, y, train=True)
         if self.weight_decay == 0.:
             return loss.mean(), state
         else:
@@ -491,6 +504,7 @@ class SubspaceBaseModel:
                                  for w in jax.tree.leaves(params['params'])), state
 
     @partial(jit, static_argnums=(0, 6))
+    # @profile
     def train_step(self, key, params, x, y, opt_state, optimizer):
         """
         Performs a single training step.
@@ -507,13 +521,16 @@ class SubspaceBaseModel:
         - The loss, updated parameters, and updated optimizer state.
 
         """
-
+        trainable_params = jax.tree.map(lambda x, m: x if m else jnp.array([]), params['params'], self.train_mask)
+        freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
         (loss, stats_params), grads = jax.value_and_grad(
-            self.compute_loss, argnums=1, has_aux=True)(key, params['params'], params[self.mutable_name] if self.mutable_name else {}, x, y)
+            self.compute_loss, argnums=1, has_aux=True)(key, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
         # update params
         updates, opt_state = optimizer.update(
-            grads, opt_state, params['params'])
-        params['params'] = optax.apply_updates(params['params'], updates)
+            grads, opt_state, trainable_params)
+        trainable_params = optax.apply_updates(trainable_params, updates)
+        joind_param = jax.tree.map(lambda x, y, m: x if m else y, trainable_params, unfreeze(freezed_params), self.train_mask)
+        params = {'params': joind_param}
         if self.mutable_name:
             params[self.mutable_name] = stats_params
         return loss, params, opt_state, grads

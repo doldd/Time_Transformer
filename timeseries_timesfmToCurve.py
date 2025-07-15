@@ -327,8 +327,12 @@ def train(logger, config):
                 mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
             params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, mask, jitter=jitter)
 
-            # train only curve points
-            s_model.set_train_mask(mask)  
+            if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
+                # train only curve points
+                s_model.set_train_mask(mask)
+            else:
+                # train all parameters
+                s_model.set_train_mask(jax.tree.map(lambda m: True, mask))
             
             del model_a._train_state.mdl_vars['params']  # free memory
             
@@ -347,14 +351,19 @@ def train(logger, config):
                 for f in filter_masks:
                     mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
                 params = s_model.init_params(init_key, x[:2], mask=mask)
-                # train only curve points
-                s_model.set_train_mask(mask)  
+                
+                if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
+                    # train only curve points
+                    s_model.set_train_mask(mask)
+                else:
+                    # train all parameters
+                    s_model.set_train_mask(jax.tree.map(lambda m: True, mask))
             else:
                 # initialize model (vanilla training/ no curve points)
                 mask = s_model.init_mask(x_val[:2], all_curves=False)
                 params = s_model.init_params(init_key, x[:2], mask=mask)
                 # train all parameters
-                s_model.set_train_mask(jax.tree.map(lambda m: not m, mask))  
+                s_model.set_train_mask(jax.tree.map(lambda m: True, mask))  
         
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
@@ -375,8 +384,8 @@ def train(logger, config):
         if "grad_clip_norm" in optimizer_conf:
             opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]))
         opt_chain_list.append(optimizer)
-        if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
-            opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
+        # if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
+        #     opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
         optimizer = optax.chain(*opt_chain_list)
 
         only_train_params = s_model.only_trainable_params(params['params'])

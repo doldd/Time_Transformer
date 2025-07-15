@@ -13,12 +13,6 @@ from src.weight_matching import PermutationSpec, apply_permutation, weight_match
 from flax import traverse_util
 from copy import deepcopy
 from flax.core import freeze, unfreeze
-# def freeze(x):
-#     """Flax freeze function."""
-#     return x
-# def unfreeze(x):
-#     """Flax unfreeze function."""
-#     return x
 
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
@@ -235,6 +229,9 @@ class SubspaceBaseModel:
         self.curve_mask = None
         self.train_mask = None
 
+    def only_trainable_params(self, params):
+        return jax.tree.map(lambda x, m: x if m else jnp.array([]), params, self.train_mask)
+
     def remove_permutation(self, key, params_list):
         """
         Removes the permutation from the parameters.
@@ -262,6 +259,17 @@ class SubspaceBaseModel:
                 self.perm_spec, final_permutation, flatten_params(p)))
         return params_list
 
+    def set_train_mask(self, train_mask):
+        """
+        Sets the train mask and curve mask for the model.
+
+        Parameters:
+        - train_mask: The mask indicating which parameters are trainable.
+        - curve_mask: The mask indicating which parameters are part of the curve.
+
+        """
+        self.train_mask = train_mask
+
     def init_mask(self, x, all_curves=False):
         """
         Initializes the mask for the model parameters.
@@ -276,7 +284,6 @@ class SubspaceBaseModel:
         params = self.model.init(random.PRNGKey(0), x)
         mask = jax.tree.map(lambda x: all_curves, params['params'])
         self.curve_mask = mask
-        self.train_mask = mask
         return mask
     
     def init_params_from_point(self, key, point, mask, jitter):
@@ -330,7 +337,6 @@ class SubspaceBaseModel:
         all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
 
         self.curve_mask = mask
-        self.train_mask = mask
         return {'params': all_params}
     
     def init_params(self, key, x, mask):
@@ -360,7 +366,6 @@ class SubspaceBaseModel:
         del stacked_params
 
         self.curve_mask = mask
-        self.train_mask = mask
         return all_params
     
 
@@ -521,7 +526,7 @@ class SubspaceBaseModel:
         - The loss, updated parameters, and updated optimizer state.
 
         """
-        trainable_params = jax.tree.map(lambda x, m: x if m else jnp.array([]), params['params'], self.train_mask)
+        trainable_params = self.only_trainable_params(params['params'])
         freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
         (loss, stats_params), grads = jax.value_and_grad(
             self.compute_loss, argnums=1, has_aux=True)(key, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)

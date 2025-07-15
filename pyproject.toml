@@ -30,6 +30,7 @@ jaxopt = "^0.8.3"
 pyarrow = "^19.0.0"
 timesfm = {version = "1.2.8", extras = ["pax"]}
 einshape = "^1.0"
+xprof = "^2.20.1"
 
 
 [[tool.poetry.source]]

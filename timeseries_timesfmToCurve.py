@@ -326,6 +326,10 @@ def train(logger, config):
             for f in filter_masks:
                 mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
             params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, mask, jitter=jitter)
+
+            # train only curve points
+            s_model.set_train_mask(mask)  
+            
             del model_a._train_state.mdl_vars['params']  # free memory
             
             init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, x_val, y_val, 1, use_linspace=True, average=True, rescale_fn=rescale_fn)
@@ -343,10 +347,14 @@ def train(logger, config):
                 for f in filter_masks:
                     mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
                 params = s_model.init_params(init_key, x[:2], mask=mask)
+                # train only curve points
+                s_model.set_train_mask(mask)  
             else:
-                # initialize point model (vanilla training)
+                # initialize model (vanilla training/ no curve points)
                 mask = s_model.init_mask(x_val[:2], all_curves=False)
                 params = s_model.init_params(init_key, x[:2], mask=mask)
+                # train all parameters
+                s_model.set_train_mask(jax.tree.map(lambda m: not m, mask))  
         
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
@@ -370,7 +378,11 @@ def train(logger, config):
         if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
             opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
         optimizer = optax.chain(*opt_chain_list)
-        opt_state = optimizer.init(params['params'])  # only dnn parameters
+
+        only_train_params = s_model.only_trainable_params(params['params'])
+        n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
+        print(f"Number of trainable parameters: {n_params}")
+        opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
 
         cp_w = masked_pytree_to_matrix(params['params'], mask, k)
         print(f"Control points shape: {cp_w.shape}")
@@ -544,121 +556,121 @@ def train(logger, config):
         #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
 
-        # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
-        for e in tqdm(range(num_epochs)):
-            print(f"Epoch {e+1}/{num_epochs}")
-            rng_key, subkey = random.split(rng_key)
-            shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
-            x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
-            y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
+        # # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
+        # for e in tqdm(range(num_epochs)):
+        #     print(f"Epoch {e+1}/{num_epochs}")
+        #     rng_key, subkey = random.split(rng_key)
+        #     shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
+        #     x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
+        #     y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
 
-            # train on batches
-            batch_loop = tqdm(enumerate(zip(x_, y_)), leave=False)
-            for b, (xb_, yb_) in batch_loop:
-                rng_key, subkey = random.split(rng_key)
-                # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
-                loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, xb_, yb_, opt_state, optimizer)
-                grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
+        #     # train on batches
+        #     batch_loop = tqdm(enumerate(zip(x_, y_)), leave=False)
+        #     for b, (xb_, yb_) in batch_loop:
+        #         rng_key, subkey = random.split(rng_key)
+        #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
+        #         loss, params, opt_state, grad_ = s_model.train_step(
+        #             subkey, params, xb_, yb_, opt_state, optimizer)
+        #         grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
 
-                batch_loop.set_postfix({"Loss": loss})
-                logs = {
-                    'epoch': e+1, 'batch': b+1, 'stepp': e*x_.shape[0]+b+1,
-                    'train_loss': loss,
-                    'grad_norm': grad_norm
-                }
-                if jnp.isnan(loss):
-                    print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
-                    break
+        #         batch_loop.set_postfix({"Loss": loss})
+        #         logs = {
+        #             'epoch': e+1, 'batch': b+1, 'stepp': e*x_.shape[0]+b+1,
+        #             'train_loss': loss,
+        #             'grad_norm': grad_norm
+        #         }
+        #         if jnp.isnan(loss):
+        #             print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
+        #             break
                 
-                # validate
-                rng_key, valid_key = random.split(rng_key)
-                if b % EVAL_EVERY_N_BATCH == 0:
-                    val_loss, mse = valid_metrics_fn(valid_key, params)
-                    logs = {**logs, 'valid_loss': val_loss, 'valid_mse': mse}
-                    if val_loss < best_loss:
-                        best_params = params
-                        best_loss = val_loss
-                logger.log(logs)
+        #         # validate
+        #         rng_key, valid_key = random.split(rng_key)
+        #         if b % EVAL_EVERY_N_BATCH == 0:
+        #             val_loss, mse = valid_metrics_fn(valid_key, params)
+        #             logs = {**logs, 'valid_loss': val_loss, 'valid_mse': mse}
+        #             if val_loss < best_loss:
+        #                 best_params = params
+        #                 best_loss = val_loss
+        #         logger.log(logs)
                 
-            batch_loop.close()
-            if jnp.isnan(loss):
-                break
-        last_params = params  
+        #     batch_loop.close()
+        #     if jnp.isnan(loss):
+        #         break
+        # last_params = params  
 
         # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
 
-        # carry = (rng_key, params, opt_state, best_loss, best_params)
-        # carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
-        #     train_epoch, carry, jnp.arange(num_epochs))
+        carry = (rng_key, params, opt_state, best_loss, best_params)
+        carry, (losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim) = jax.lax.scan(
+            train_epoch, carry, jnp.arange(num_epochs))
 
-        # # log losses for wandb
-        # n_batches = np.array(losses).shape[-1]
-        # epochs = np.repeat(np.arange(num_epochs), n_batches)
-        # losses = jnp.array(losses).flatten()
+        # log losses for wandb
+        n_batches = np.array(losses).shape[-1]
+        epochs = np.repeat(np.arange(num_epochs), n_batches)
+        losses = jnp.array(losses).flatten()
 
-        # # clean up inf values because of lazy validation
-        # val_losses = val_losses[:, ::EVAL_EVERY_N_BATCH].repeat(
-        #     EVAL_EVERY_N_BATCH, axis=1)[:,:val_losses.shape[1]]
-        # val_mse = val_mse[:, ::EVAL_EVERY_N_BATCH].repeat(
-        #     EVAL_EVERY_N_BATCH, axis=1)[:, :val_mse.shape[1]]
+        # clean up inf values because of lazy validation
+        val_losses = val_losses[:, ::EVAL_EVERY_N_BATCH].repeat(
+            EVAL_EVERY_N_BATCH, axis=1)[:,:val_losses.shape[1]]
+        val_mse = val_mse[:, ::EVAL_EVERY_N_BATCH].repeat(
+            EVAL_EVERY_N_BATCH, axis=1)[:, :val_mse.shape[1]]
 
-        # val_losses = jnp.array(val_losses).flatten()
-        # val_mse = jnp.array(val_mse).flatten()
-        # length = jnp.array(length).flatten()
-        # l_bound = jnp.array(l_bound).flatten()
-        # u_bound = jnp.array(u_bound).flatten()
-        # gyra = jnp.array(gyra).flatten()
-        # center = jnp.array(center).flatten()
-        # rel_center = jnp.array(rel_center).flatten()
-        # grad_norm = jnp.array(grad_norm).flatten()
-        # cos_sim = jnp.array(cos_sim).flatten()
-        # _ = [
-        #     logger.log({
-        #     "train_loss": l,
-        #     "Curve valid_loss": vl,
-        #     "Curve valid MSE": vacc,
-        #     "epoch": e,
-        #     "curve_length": le,
-        #     "curve_lower_bound": lb,
-        #     "curve_upper_bound": ub,
-        #     "curve_gyration": gy,
-        #     "curve_center": ce,
-        #     "curve_rel_center": rc,
-        #     "curve_grad_norm": gn,
-        #     "cosine_similarity": cs,
-        #     })
-        #     for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn, cs in zip(
-        #     epochs, losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
-        #     )
-        # ]
+        val_losses = jnp.array(val_losses).flatten()
+        val_mse = jnp.array(val_mse).flatten()
+        length = jnp.array(length).flatten()
+        l_bound = jnp.array(l_bound).flatten()
+        u_bound = jnp.array(u_bound).flatten()
+        gyra = jnp.array(gyra).flatten()
+        center = jnp.array(center).flatten()
+        rel_center = jnp.array(rel_center).flatten()
+        grad_norm = jnp.array(grad_norm).flatten()
+        cos_sim = jnp.array(cos_sim).flatten()
+        _ = [
+            logger.log({
+            "train_loss": l,
+            "Curve valid_loss": vl,
+            "Curve valid MSE": vacc,
+            "epoch": e,
+            "curve_length": le,
+            "curve_lower_bound": lb,
+            "curve_upper_bound": ub,
+            "curve_gyration": gy,
+            "curve_center": ce,
+            "curve_rel_center": rc,
+            "curve_grad_norm": gn,
+            "cosine_similarity": cs,
+            })
+            for e, l, vl, vacc, le, lb, ub, gy, ce, rc, gn, cs in zip(
+            epochs, losses, val_losses, val_mse, length, l_bound, u_bound, gyra, center, rel_center, grad_norm, cos_sim
+            )
+        ]
 
-        # # print memory stats
-        # memory_stats = jax.devices()[0].memory_stats()
-        # for stats_name, v in memory_stats.items():
-        #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+        # print memory stats
+        memory_stats = jax.devices()[0].memory_stats()
+        for stats_name, v in memory_stats.items():
+            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
 
-        # # log metrics as artifact
-        # jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
-        #           loss=losses,
-        #           epochs=epochs,
-        #           val_loss=val_losses,
-        #           val_mse=val_mse,
-        #           curve_length=length,
-        #           curve_lower_bound=l_bound,
-        #           curve_upper_bound=u_bound,
-        #           curve_gyration=gyra,
-        #           curve_center=center,
-        #           curve_rel_center=rel_center,
-        #           curve_grad_norm=grad_norm,
-        #           cosine_similarity=cos_sim)
-        # art = wandb.Artifact(name="metrics", type="npz")
-        # art.add_file(f'tmp_files/{logger.id}_metrics.npz')
-        # logger.log_artifact(art)
+        # log metrics as artifact
+        jnp.savez(f'tmp_files/{logger.id}_metrics.npz', 
+                  loss=losses,
+                  epochs=epochs,
+                  val_loss=val_losses,
+                  val_mse=val_mse,
+                  curve_length=length,
+                  curve_lower_bound=l_bound,
+                  curve_upper_bound=u_bound,
+                  curve_gyration=gyra,
+                  curve_center=center,
+                  curve_rel_center=rel_center,
+                  curve_grad_norm=grad_norm,
+                  cosine_similarity=cos_sim)
+        art = wandb.Artifact(name="metrics", type="npz")
+        art.add_file(f'tmp_files/{logger.id}_metrics.npz')
+        logger.log_artifact(art)
 
-        # params = carry[4]  # select best parameters
-        # last_params = carry[1]
-        # rng_key = carry[0]
+        params = carry[4]  # select best parameters
+        last_params = carry[1]
+        rng_key = carry[0]
 
         if k > 0:
             # Bezier curve length        

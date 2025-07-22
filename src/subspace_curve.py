@@ -5,7 +5,7 @@ import optax
 import numpy as np
 from functools import partial
 from jax import custom_jvp
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Any
 from numpyro import distributions as dist
 from jaxopt import Bisection
 from jax.scipy.special import gammaln
@@ -13,10 +13,42 @@ from src.weight_matching import PermutationSpec, apply_permutation, weight_match
 from flax import traverse_util
 from copy import deepcopy
 from flax.core import freeze, unfreeze
+from jax.tree_util import register_pytree_node_class
 
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
            'vec_to_pytree', 'bezier_curve', 'UniformTSubspace', 'UniformTCategory']
+
+def tree_broadcast(prefix_tree: Any, full_tree: Any,
+                   is_leaf: Callable[[Any], bool] | None = None
+                  ) -> Any:
+    """Alias of :func:`jax.tree.broadcast`."""
+    # broadcast_prefix is not exported
+    def broadcast_prefix(prefix_tree: Any, full_tree: Any,
+                        is_leaf: Callable[[Any], bool] | None = None
+                        ) -> list[Any]:
+        """Broadcasts tree prefix leaves into the full set of leaves for a given full tree.
+
+            Args:
+            prefix_tree: a pytree that is a tree prefix of full_tree.
+            full_tree: a pytree with the structure to broadcast the prefix leaves into.
+            is_leaf: an optionally specified function that will be called at each
+                flattening step. It should return a boolean, with true stopping the
+                traversal and the whole subtree being treated as a leaf, and false
+                indicating the flattening should traverse the current object.
+
+            Returns:
+            A list of leaves matching the expected count for the full tree,
+            with the leaf of each prefix tree being duplicated to match the count of
+            its corresponding subtree.
+        """
+        result = []
+        num_leaves = lambda t: jax.tree.structure(t).num_leaves
+        add_leaves = lambda x, subtree: result.extend([x] * num_leaves(subtree))
+        jax.tree.map(add_leaves, prefix_tree, full_tree, is_leaf=is_leaf)
+        return result
+    broadcast_leaves = broadcast_prefix(prefix_tree, full_tree, is_leaf=is_leaf)
+    return jax.tree.structure(full_tree).unflatten(broadcast_leaves)
 
 @custom_jvp
 def pos_pow(x, pow):
@@ -597,6 +629,8 @@ class RegressionSubspace(SubspaceBaseModel):
 
         """
         out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
+        assert out.shape[-1] == 1, "RegressionSubspace expects output_dim=1"
+        assert y.ndim == 1, "RegressionSubspace expects y to be 1D"
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(self.log_scale)+1e-8)
         return nll, state, out
 
@@ -617,6 +651,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         self.init_log_scale = jnp.array(init_outDist_log_scale, dtype=jnp.float32)
 
     def init_params_from_point(self, key, point, mask, jitter):
+        raise ValueError("need some adjustements for lora, train and curve mask.")
         mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
         return super().init_params_from_point(key, point, mask, jitter)
 
@@ -633,6 +668,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         - The initialized parameters.
 
         """
+        raise ValueError("need some adjustements for lora, train and curve mask.")
         params = super().init_params(key, x, mask)
         # initialize log scale
         params['params']['log_scale'] = self.init_log_scale
@@ -783,6 +819,162 @@ class RepulsiveCategorySubspace(RepulsiveMixin, CategorySubspace):
 class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
     pass
 
+
+@register_pytree_node_class
+class LoRAParams:
+    def __init__(self, A, B, w0, dims: tuple):
+        self.A = A
+        self.B = B
+        self.w0 = w0
+        self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes
+
+    @property
+    def shape(self):
+        return {'A':self.A.shape, 'B':self.B.shape, 'w0':self.w0.shape}
+
+    def __repr__(self):
+        # return f"LoRAParams(A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape})"
+        return f"LoRAParams(A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims})"
+    
+    def tree_flatten(self):
+        children = (self.A, self.B, self.w0)
+        aux_data = self.dims
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        A, B, w0 = children
+        return cls(A, B, w0, aux_data)
+    
+    def apply(self):
+        # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
+        w = jnp.matmul(self.B, self.A)  # Apply LoRA transformation
+        w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
+        return w / self.B.shape[-1] + self.w0  # Add the original parameter w0
+
+class LoRAMixin:
+    """
+    Mixin class for LoRA (Low-Rank Adaptation) functionality.
+    This class provides methods to convert a pytree of parameters into a matrix and vice versa.
+    """
+
+    def __init__(self, r, lora_mask, **kwargs):
+        super().__init__(**kwargs)
+        self.r = r
+        self.lora_mask = lora_mask
+        self.w0_params = None  # Placeholder for non-LoRA parameters
+
+    @staticmethod
+    def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True):
+        mask = tree_broadcast(mask, lora_params) # broadcast mask to the shape of lora_params
+        def adapt_mask(mask):
+            """Set B and w0 to False and A corresponds to the original curve mask."""
+            if isinstance(mask, LoRAParams):
+                # Do not use LoRA for w0 and B
+                if b_off:
+                    mask.B = False
+                if w0_off:
+                    mask.w0 = False
+                return mask
+            else:
+                # For other parameters, keep the mask as is
+                return mask
+        mask = jax.tree.map(lambda m: adapt_mask(m), mask, is_leaf=lambda x: isinstance(x, LoRAParams))
+        return mask
+    
+    def init_params_from_point(self, key, point, mask, jitter):
+        """Initialize parameters from a point in the latent space.
+
+        Args:
+            key (jax.random.PRNGKey): Random key for initialization.
+            point (dict): Point in the latent space. {params: ...}
+            mask (dict): Mask indicating which parameters to be handled by the curve. {...: bool}
+            jitter (float): Jitter to add to the initialization for the curve params. As A matrix of LoRA is initialized with N(0,1) this could probably be set to 1.
+
+        Returns:
+            _type_: _description_
+        """
+        assert ('params' in point) and len(point.keys())==1, "Point must contain 'params' key and no other keys."
+
+        def initialize_lora_params(rng_key, params, lora_mask, rank):
+            """
+            Initialize LoRA parameters based on the base model and the provided LoRA mask.
+            lora_masl of the form:
+                'Dense_0': {
+                    'kernel': [1, 0],  # Apply Low Rank for kernel on dimension 1 and 0
+                    'bias': False,  # Do not use LoRA for bias
+                    }
+            returns:
+                w0_params: Parameters of the model used as w0 by LoRA.
+                lora_params: Parameters of the model. LoRA marked parameters are tuples of (A, B) where:
+                    A: The low-rank matrix of shape (rank, param_shape[m[1]])
+                    B: The low-rank matrix of shape (param_shape[m[0]], rank)
+                    Non LoRA parameters are returned as is.
+            """
+            # Initialize the base model parameters
+            mask_, structure = jax.tree_util.tree_flatten_with_path(lora_mask)
+            def shape_builder(shape, r_dim):
+                shape = list(shape)
+                shape[r_dim] = rank
+                return tuple(shape)
+
+            lora_params = []
+            for (key, m), p in zip(mask_, jax.tree.leaves(params)):
+                param_name = '/'.join([k.key for k in key])
+                # change to a lora param 
+                if (type(m) != bool):
+                    assert p.ndim > 1, f"Param {param_name} cannot be used for LoRA. Too few dimensions for parameter with shape {p.shape}"
+                    assert p.ndim > np.max(m), f"Mask {m} incompatible with param {param_name} and shape {p.shape}"
+                    B = jnp.zeros(shape_builder(p.shape, m[1]), dtype=p.dtype)
+                    B = jnp.moveaxis(B, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
+                    rng_key, subkey = random.split(rng_key)
+                    A = jax.random.normal(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)
+                    A = jnp.moveaxis(A, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
+                    lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m)))  # Store A and B as a tuple
+                    # lora_params.append(dict(A=A, B=B))  # Store A and B
+                else:
+                    lora_params.append(p)
+
+            lora_params = jax.tree_util.tree_unflatten(structure, lora_params)
+            return lora_params
+        lora_params = initialize_lora_params(key, point['params'], self.lora_mask, rank=self.r)
+
+        # update the original curve mask to include LoRA parameter A into curve approach if the parameter was originally selected by the mask
+        mask = self.update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True)
+        
+        # initialize curve parameters according mask
+        return super().init_params_from_point(key, {'params': lora_params}, mask, jitter)
+    
+    def init_params(self, key, x, mask):
+        raise NotImplementedError("init_params not possible for LoRA.")
+    
+    @partial(jit, static_argnums=(0,))
+    def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
+        """
+        Computes the output of the model for given parameters, time, and input.
+
+        Parameters:
+        - params: The parameters of the model.
+        - t: The time parameter. Only single value supported.
+        - x: The input data.
+
+        Returns:
+        - The output of the model.
+
+        """
+        # sample Bezier coefficient
+        bezier_coeff = self.bezier(t)
+        # Compute one parameter set per sample
+        params = jax.tree.map(lambda p, m: jnp.einsum(
+            'k,k...->...', bezier_coeff, p) if m else p, params, self.curve_mask)
+        
+        # Apply LoRA to the parameters
+        params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoRAParams) else lp, params, is_leaf=lambda x: isinstance(x, LoRAParams))
+
+        # forward pass per sample
+        out, state = self._predict(params, state, x, train=train)
+        return out, state
+    
 
 #@partial(jit, static_argnums=(1))
 def pytree_to_matrix(pytree, k):

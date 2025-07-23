@@ -396,6 +396,7 @@ def train(logger, config):
         only_train_params = s_model.only_trainable_params(params['params'])
         n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
         print(f"Number of trainable parameters: {n_params:_}")
+        logger.summary.update({'n_params_trainable': n_params})
         opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
 
         cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)

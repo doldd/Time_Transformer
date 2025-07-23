@@ -15,6 +15,18 @@ parameters:
         value: 1152
   eval_every_n_batch:
     value: 50
+  lora_params:
+    parameters:
+      use_lora:
+        value: True
+      r:
+        value: 8
+      filter_masks:
+        values:
+          - [{keys: ["query", "w"], op: "all", dims: [0, 2]},]          
+          - [{keys: ["value", "w"], op: "all", dims: [0, 2]},]          
+          - [{keys: ["value", "w"], op: "all", dims: [2, 0]},]          
+          - [{keys: ["value", "w"], op: "all", dims: [0, 2]}, {keys: ["query", "w"], op: "all", dims: [0, 2]}]          
   curve_params:
     parameters:
       k:
@@ -45,9 +57,9 @@ parameters:
           # - [{keys: ["input_ff_layer",], op: "all"},]
           # - [{keys: ["input_ff_layer", "horizon_ff_layer"], op: "any"},]
           # - [{keys: ["horizon_ff_layer",], op: "all"},]
-          - [{keys: ["query", "w"], op: "all"},]
-          - [{keys: ["value", "w"], op: "all"},]
-          - [{keys: ["query", "w"], op: "all"}, {keys: ["value", "w"], op: "all"}]
+          - [{keys: ["query"], op: "all"},]
+          - [{keys: ["value"], op: "all"},]
+          - [{keys: ["query"], op: "all"}, {keys: ["value"], op: "all"}]
 
       optimizer_conf:
         parameters:
@@ -64,7 +76,7 @@ parameters:
           grad_clip_norm:
             value: 15.0
           freeze_non_curve_params:
-            values: [True, ]
+            value: True
   rng_seed:
     values: [1,4]
 

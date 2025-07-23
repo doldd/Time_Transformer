@@ -1,5 +1,5 @@
 program: timeseries_timesfmToCurve.py
-name: Timeseries P2C masking
+name: Timeseries P2C only in_out ff_layer
 method: grid
 metric:
   goal: maximize
@@ -42,9 +42,12 @@ parameters:
 
       filter_masks:
         values: 
-          - [{keys: ["value", "x_layers_0"], op: "all"},]
-          - [{keys: ["value", "w"], op: "all"},]
+          # - [{keys: ["input_ff_layer",], op: "all"},]
+          # - [{keys: ["input_ff_layer", "horizon_ff_layer"], op: "any"},]
+          # - [{keys: ["horizon_ff_layer",], op: "all"},]
           - [{keys: ["query", "w"], op: "all"},]
+          - [{keys: ["value", "w"], op: "all"},]
+          - [{keys: ["query", "w"], op: "all"}, {keys: ["value", "w"], op: "all"}]
 
       optimizer_conf:
         parameters:
@@ -61,7 +64,7 @@ parameters:
           grad_clip_norm:
             value: 15.0
           freeze_non_curve_params:
-            values: [True, False]
+            values: [True, ]
   rng_seed:
     values: [1,4]
 

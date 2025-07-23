@@ -141,6 +141,7 @@ def main():
     mask = filter_mask(mask, "bias", as_curve=True, BoolschenOperator=all)
     curve_params = s_model.init_params(subkey, dummy_input, mask)
     # s_model.train_mask = mask_true  # Store the full mask for training
+    s_model.set_train_mask(mask)  # Set the train mask for the model
     print(f"Memory Size for params: {np.sum([l.size * l.itemsize for l in jax.tree.leaves(curve_params)])/(1024**2):.4f}MB")
 
     # Memory profile before first training step

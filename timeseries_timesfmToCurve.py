@@ -21,7 +21,7 @@ from numpyro.diagnostics import hpdi
 from copy import deepcopy
 from src.subspace_sampling import setup_inference_chain
 from src.subspace_curve import masked_pytree_to_matrix, vec_to_pytree, bezier_coeff_fn, bezier_curve
-from src.subspace_curve import OrthoSpan, QuantileSubspace, RepulsiveQuantileSubspace, SubspaceBaseModel
+from src.subspace_curve import OrthoSpan, QuantileSubspace, RepulsiveQuantileSubspace, SubspaceBaseModel, LoRAQuantileSubspace, LoRARepulsiveQuantileSubspace
 from src.models import ResNet, ResNetBlock, init_t_lambda_to_phi
 import blackjax
 from numpyro.infer.util import initialize_model
@@ -240,7 +240,7 @@ class timesfmWrapper:
     def init(self, key, x):
         return self.model._model.init(key, self._prepare_data(x))
 
-
+import pprint
 def train(logger, config):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
@@ -263,7 +263,8 @@ def train(logger, config):
                     remove_initial_permutation: bool = False,
                     net_kwargs: dict = None,
                     filter_masks: list = None,
-                    jitter: float = 0.0,):
+                    jitter: float = 0.0,
+                    lora_params: dict = None):
         rng_key, init_key = random.split(rng_key)
 
         print(f"Initialize TimesFM model {batch_size}, {net_kwargs}")
@@ -284,27 +285,6 @@ def train(logger, config):
         model = timesfmWrapper(model_a, frequency=0, autoregressive=net_kwargs['horizon_len'] > 128) # learnd output_patchlen was 128. So larger horizon lengths require autoregressive decoding
         print("Model is initialized")
 
-        perm_spec = False
-        if remove_initial_permutation:
-            raise NotImplementedError("Removing initial permutation is not implemented for this model.")
-            perm_spec = resnet20_permutation_spec2()
-
-        if regularizer:
-            print("Using RepulsiveQuantileSubspace with regularizer")
-            s_model = RepulsiveQuantileSubspace(model=model, k=k, weight_decay=weight_decay,
-                                                quantiles=model_a._model.quantiles, 
-                                                perm_spec=perm_spec,
-                                                natural_parameterization=natural_parameterization,
-                                                mutuable_param_name = False,
-                                                gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-        else:
-            print("Using QuantileSubspace without repulsive force")
-            s_model = QuantileSubspace(model=model, k=k, weight_decay=weight_decay, 
-                                       quantiles=model_a._model.quantiles,
-                                       perm_spec=perm_spec,
-                                       natural_parameterization=natural_parameterization,
-                                       mutuable_param_name = False)
-        
         print("Generate data")
         times = time.time()
         x, y, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(config['rng_seed'], **net_kwargs)  # get fold from seed
@@ -316,23 +296,61 @@ def train(logger, config):
         print(f"Data is generated in {(time.time() - times):.2f} seconds")
         print("Shapes: ", (x.shape, y.shape), (x_val.shape, y_val.shape), (x_test.shape, y_test.shape))
 
+        curve_mask = jax.tree.map(lambda x: False, model_a._train_state.mdl_vars['params'])
+        # only if k > 0, otherwise no curve parameters are used
+        if k > 0:
+            for f in filter_masks:
+                curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+
+        if "freeze_other_params" in optimizer_conf and optimizer_conf["freeze_other_params"]:
+            train_mask = jax.tree.map(lambda x: False, model_a._train_state.mdl_vars['params'])
+            # all curve and lora params are trainable
+            for f in filter_masks:
+                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+            if lora_params['use_lora']:
+                for f in lora_params['filter_masks']:
+                    train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+        else:
+            train_mask = jax.tree.map(lambda x: True, model_a._train_state.mdl_vars['params'])
+        # set LoRA mask for all parameters
+        lora_mask = jax.tree.map(lambda x: False, model_a._train_state.mdl_vars['params'])  # LoRA mask for all parameters
+        if lora_params['use_lora']:
+            for f in lora_params['filter_masks']:
+                lora_mask = filter_mask(lora_mask, *f['keys'], as_curve=np.array(f['dims']), BoolschenOperator=eval(f['op']))
+        pprint.pprint(f"LoRA mask: {lora_mask}")
+        pprint.pprint(f"Curve mask: {curve_mask}")
+        pprint.pprint(f"Train mask: {train_mask}")
+
+        perm_spec = False
+        if remove_initial_permutation:
+            raise NotImplementedError("Removing initial permutation is not implemented for this model.")
+            perm_spec = resnet20_permutation_spec2()
+
+        if regularizer:
+            print("Using LoRARepulsiveQuantileSubspace with regularizer")
+            s_model = LoRARepulsiveQuantileSubspace(lora_mask=lora_mask, r=lora_params['r'],
+                                                    model=model, k=k, weight_decay=weight_decay,
+                                                    quantiles=model_a._model.quantiles, 
+                                                    perm_spec=perm_spec,
+                                                    natural_parameterization=natural_parameterization,
+                                                    mutuable_param_name=False,
+                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
+        else:
+            print("Using QuantileSubspace without repulsive force")
+            s_model = LoRAQuantileSubspace(lora_mask=lora_mask, r=lora_params['r'],
+                                           model=model, k=k, weight_decay=weight_decay, 
+                                           quantiles=model_a._model.quantiles,
+                                           perm_spec=perm_spec,
+                                           natural_parameterization=natural_parameterization,
+                                           mutuable_param_name=False)
+
         # load params from wandb artifact if path is given in config
         if pretrained:
             print("Initialize model with pretrained parameters")
             assert k > 0, "Subspace dimension k must be greater than 0 when training a curve from point."
 
             # initialize curve parameter with pretrained point parameter
-            mask = s_model.init_mask(x_val[:10], all_curves=False)
-            for f in filter_masks:
-                mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-            params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, mask, jitter=jitter)
-
-            if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
-                # train only curve points
-                s_model.set_train_mask(mask)
-            else:
-                # train all parameters
-                s_model.set_train_mask(jax.tree.map(lambda m: True, mask))
+            params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, curve_mask, jitter=jitter)
             
             del model_a._train_state.mdl_vars['params']  # free memory
             
@@ -344,31 +362,18 @@ def train(logger, config):
             logger.summary.update({'init_test_loss': loss, 'init_test_mse': mse})
         else:
             del model_a._train_state.mdl_vars['params']  # free memory
+            assert lora_params['use_lora'] == False, "LoRA only possible for finetuning."
             
-            if k > 0:
-                # initialize curve parameter with random parameters
-                mask = s_model.init_mask(x_val[:2], all_curves=False)
-                for f in filter_masks:
-                    mask = filter_mask(mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-                params = s_model.init_params(init_key, x[:2], mask=mask)
-                
-                if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
-                    # train only curve points
-                    s_model.set_train_mask(mask)
-                else:
-                    # train all parameters
-                    s_model.set_train_mask(jax.tree.map(lambda m: True, mask))
-            else:
-                # initialize model (vanilla training/ no curve points)
-                mask = s_model.init_mask(x_val[:2], all_curves=False)
-                params = s_model.init_params(init_key, x[:2], mask=mask)
-                # train all parameters
-                s_model.set_train_mask(jax.tree.map(lambda m: True, mask))  
+            # initialize curve parameter with random parameters
+            params = s_model.init_params(init_key, x[:2], mask=curve_mask)
         
+        train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA 
+        s_model.set_train_mask(train_mask)
+
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
         logger.summary.update({'n_params': n_params})
-        print(f"Number of parameters: {n_params}")
+        print(f"Number of parameters: {n_params:_}")
 
         jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
@@ -390,10 +395,10 @@ def train(logger, config):
 
         only_train_params = s_model.only_trainable_params(params['params'])
         n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
-        print(f"Number of trainable parameters: {n_params}")
+        print(f"Number of trainable parameters: {n_params:_}")
         opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
 
-        cp_w = masked_pytree_to_matrix(params['params'], mask, k)
+        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
         print(f"Control points shape: {cp_w.shape}")
         # loss, params, opt_state, grad_ = s_model.train_step(
         #             random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
@@ -514,7 +519,7 @@ def train(logger, config):
                 # mean_curv = mean_curvature2(cp_w)
                 # rel_center = rel_center_fn(cp_w)
                 rel_center = 0.
-                grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
+                grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, s_model.curve_mask, k), axis=1).mean()
                 # cos_sim = s_model.summed_cosine_similarity(params['params'])
                 # cos_sim /= ((k+1)*k/2)
                 # grad_norm = 0.
@@ -793,7 +798,7 @@ def train(logger, config):
         return rng_key, params, model, last_params
 
     rng_key, params, model, last_params = train_curve(
-        rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'])
+        rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], lora_params=config.get('lora_params', None))
 
     print("Save artifacts")
     jnp.save(f'tmp_files/{logger.id}_params.npy', params)
@@ -842,7 +847,10 @@ if __name__ == '__main__':
                             'filter_masks': [{'keys': ("value", "x_layers_0"), 'op': 'all'}],
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': 0.0005, 'momentum': 0.9, 'nesterov': True}},
+                                'optimizer_conf': {'name': "sgd", 
+                                                   'kwargs': {'learning_rate': 0.0005, 'momentum': 0.9, 'nesterov': True},
+                                                   'grad_clip_norm': 15.0,
+                                                   'freeze_other_params': True},
                             # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                             # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                             # 'momentum': 0.9, 
@@ -866,7 +874,10 @@ if __name__ == '__main__':
                               'context_len': 8*60*24//10
                               },
                 'eval_every_n_batch': 50,
-                'curve_params': {'k': 10,
+                'lora_params': {'use_lora': True, 'r': 8, 
+                                'filter_masks': 
+                                    [{'keys': ("query", "x_layers_0", "w"), 'op': 'all', 'dims': [0, 2]}]},  # use lora for query projection
+                'curve_params': {'k': 2,
                                 'num_epochs': 2,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
@@ -877,13 +888,15 @@ if __name__ == '__main__':
                                 'remove_initial_permutation': False,
                                 'jitter': 1e-8,
                                 'pretrained': args.pretrained,
-                                'filter_masks': [{'keys': ("value", "x_layers_0"), 'op': 'all'}],
+                                'filter_masks': 
+                                    [{'keys': ("value", "x_layers_0"), 'op': 'all'},
+                                     {'keys': ("query", "x_layers_0"), 'op': 'all'}],  # filter query projection
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                     'optimizer_conf': {'name': "sgd", 
                                                        'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
                                                        'grad_clip_norm': 15.0,
-                                                       'freeze_non_curve_params': False},
+                                                       'freeze_other_params': True},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 

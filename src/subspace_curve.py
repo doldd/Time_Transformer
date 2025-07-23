@@ -826,7 +826,7 @@ class LoRAParams:
         self.A = A
         self.B = B
         self.w0 = w0
-        self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes
+        self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes (First axis is for B second for A)
 
     @property
     def shape(self):
@@ -850,7 +850,8 @@ class LoRAParams:
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         w = jnp.matmul(self.B, self.A)  # Apply LoRA transformation
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
-        return w / self.B.shape[-1] + self.w0  # Add the original parameter w0
+        scale = self.B.shape[-1]  # Rank of the LoRA transformation
+        return w / scale + self.w0  # Add the original parameter w0
 
 class LoRAMixin:
     """
@@ -879,7 +880,7 @@ class LoRAMixin:
             else:
                 # For other parameters, keep the mask as is
                 return mask
-        mask = jax.tree.map(lambda m: adapt_mask(m), mask, is_leaf=lambda x: isinstance(x, LoRAParams))
+        mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoRAParams))
         return mask
     
     def init_params_from_point(self, key, point, mask, jitter):
@@ -927,8 +928,15 @@ class LoRAMixin:
                     assert p.ndim > np.max(m), f"Mask {m} incompatible with param {param_name} and shape {p.shape}"
                     B = jnp.zeros(shape_builder(p.shape, m[1]), dtype=p.dtype)
                     B = jnp.moveaxis(B, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
+                    
+                    # Initialize A matrix with He normal initialization
                     rng_key, subkey = random.split(rng_key)
-                    A = jax.random.normal(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)
+                    init_a = jax.nn.initializers.he_normal(out_axis=m[1].item()) # fan_in are all other dimensions except the m[1] (last dim is output of nn.Dense)
+                    shape_ = shape_builder(p.shape, m[0])
+                    A = init_a(subkey, shape_, dtype=p.dtype)
+                    # shape_[m[1]] = 0
+                    # gain = jnp.sqrt(6 / np.prod(shape_))  # Gain for initialization
+                    # A = jax.random.uniform(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)
                     A = jnp.moveaxis(A, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
                     lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m)))  # Store A and B as a tuple
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
@@ -974,7 +982,25 @@ class LoRAMixin:
         # forward pass per sample
         out, state = self._predict(params, state, x, train=train)
         return out, state
-    
+
+class LoRARegressionSubspace(LoRAMixin, RegressionSubspace):
+    pass
+
+class LoRACategorySubspace(LoRAMixin, CategorySubspace):
+    pass
+
+class LoRAQuantileSubspace(LoRAMixin, QuantileSubspace):
+    pass
+
+class LoRARepulsiveQuantileSubspace(LoRAMixin, RepulsiveMixin, QuantileSubspace):
+    def __init__(self, model, k, quantiles, weight_decay=0, perm_spec = False, natural_parameterization=False, r=1, lora_mask=None, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
+        LoRAMixin.__init__(self, r=r, lora_mask=lora_mask, **kwargs)
+        RepulsiveMixin.__init__(self, gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
+        QuantileSubspace.__init__(self, model=model, k=k, quantiles=quantiles,
+                                  weight_decay=weight_decay,
+                                  perm_spec=perm_spec,
+                                  natural_parameterization=natural_parameterization)
+
 
 #@partial(jit, static_argnums=(1))
 def pytree_to_matrix(pytree, k):

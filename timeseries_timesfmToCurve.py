@@ -35,6 +35,8 @@ import timesfm
 import pandas as pd
 from einshape import jax_einshape as es
 from src.subspace_curve import filter_mask
+from scipy.interpolate import PchipInterpolator
+import pprint
 
 
 
@@ -44,7 +46,7 @@ from src.subspace_curve import filter_mask
 
 
 # Generate data by using the model itself
-def gen_data(rng_seed, context_len, horizon_len, **kwargs):
+def gen_data(rng_seed, context_len, horizon_len, max_time_diff, **kwargs):
     path = "datasets/SDWPF/SDWPF_dataset/sdwpf_full/sdwpf_2001_2112_full.parquet"
     df = pd.read_parquet(path)
     df.dropna(inplace=True)
@@ -67,30 +69,79 @@ def gen_data(rng_seed, context_len, horizon_len, **kwargs):
 
     splits = df_sub['Tmstamp'].quantile([0.75, 0.85, 1.]).values
     # split train test data
-    df_train = df_sub[df_sub["Tmstamp"] < splits[0]]
-    df_val = df_sub[(df_sub["Tmstamp"] >= splits[0]) & (df_sub["Tmstamp"] < splits[1])]
-    df_test = df_sub[df_sub["Tmstamp"] >= splits[1]]
+    df_train = df_sub[df_sub["Tmstamp"] < splits[0]].copy(deep=True)
+    df_val = df_sub[(df_sub["Tmstamp"] >= splits[0]) & (df_sub["Tmstamp"] < splits[1])].copy(deep=True)
+    df_test = df_sub[df_sub["Tmstamp"] >= splits[1]].copy(deep=True)
 
-    all_turb_ids = df['TurbID'].unique()
-    
     def get_batched_data_fn(df):
         inputs = []
         outputs = []
-
         num_examples = 0
-        for tub_id in all_turb_ids:
-            sub_df = df[df["TurbID"] == tub_id]
-            for start in range(0, len(sub_df) - (context_len + horizon_len), horizon_len):
-                num_examples += 1
-                inputs.append(sub_df["Patv"][start:(context_end := start + context_len)].tolist())
-                outputs.append(sub_df["Patv"][context_end:(context_end + horizon_len)].tolist())
-        return jnp.array(np.array(inputs)), jnp.array(np.array(outputs)), num_examples
-    x_train, y_train, _ = get_batched_data_fn(df_train)
-    x_val, y_val, _ = get_batched_data_fn(df_val)
-    x_test, y_test, _ = get_batched_data_fn(df_test)
-    x_ood, y_ood, _ = get_batched_data_fn(df_ood)
-    return x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std)
+        num_skipped = 0
 
+        dfg = df.groupby('TurbID')
+        time_diff = dfg['Tmstamp'].diff().dt.total_seconds() / 60  # Convert to minutes
+        time_diff = time_diff.fillna(0)  # Fill NaN values with 0
+        df.loc[:, 'Tmstamp_diff'] = time_diff 
+
+        # loop over each TurbID
+        for t_id, df_ in df.groupby('TurbID'):
+            # split df into frames where continous time difference is < 30 (each frame has a time difference smaller 30 minutes)
+            dfg = df_.groupby((df_['Tmstamp_diff'] > max_time_diff).cumsum())
+            # loop over continous time group
+            for g_id, group in dfg:
+                if len(group) < (context_len + horizon_len):
+                    num_skipped += len(group)
+                    continue
+                # interploate in each group the get time difference = 10
+                interp = PchipInterpolator(group['Tmstamp'], group['Patv'], extrapolate=True)
+                # create new time stamps with 10 minutes difference
+                new_time = pd.date_range(start=group['Tmstamp'].min(), end=group['Tmstamp'].max(), freq='10min')
+                # interpolate the Patv values for the new time stamps
+                new_patv = interp(new_time)
+
+                for start in range(0, len(new_patv) - (context_len + horizon_len), horizon_len):
+                    num_examples += 1
+                    inputs.append(new_patv[start:(context_end := start + context_len)])
+                    outputs.append(new_patv[context_end:(context_end + horizon_len)])
+
+        return jnp.array(inputs), jnp.array(outputs), num_examples, num_skipped
+
+    num_skipped_all = 0
+    x_train, y_train, _, num_skipped = get_batched_data_fn(df_train)
+    num_skipped_all += num_skipped
+    x_val, y_val, _, num_skipped = get_batched_data_fn(df_val)
+    num_skipped_all += num_skipped
+    x_test, y_test, _, num_skipped = get_batched_data_fn(df_test)
+    num_skipped_all += num_skipped
+    x_ood, y_ood, _, num_skipped = get_batched_data_fn(df_ood)
+    num_skipped_all += num_skipped
+    print(f"Number of skipped examples: {num_skipped_all}")
+    return x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean['Patv'], data_std['Patv'])
+
+def load_or_generate_data(rng_key, context_len, horizon_len, max_time_diff=30, **kwargs):
+    if os.path.exists(f"datasets/SDWPF/SDWPF_dataset/sdwpf_full/prepared_data_{context_len}.npz"):
+        print(f"Data already exists for context length {context_len}. Loading from file.")
+        with np.load(f"datasets/SDWPF/SDWPF_dataset/sdwpf_full/prepared_data_{context_len}.npz") as data:
+            x_train = data['x_train']
+            y_train = data['y_train']
+            x_val = data['x_val']
+            y_val = data['y_val']
+            x_test = data['x_test']
+            y_test = data['y_test']
+            x_ood = data['x_ood']
+            y_ood = data['y_ood']
+            data_mean = data['data_mean']
+            data_std = data['data_std']
+    else:
+        print(f"Generating data for context length {context_len}.")
+        x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(rng_key, context_len, horizon_len=horizon_len, max_time_diff=max_time_diff)
+        print(f"x_train shape: {x_train.shape}, y_train shape: {y_train.shape}")
+        np.savez(f"datasets/SDWPF/SDWPF_dataset/sdwpf_full/prepared_data_{context_len}.npz", 
+                x_train=x_train,
+                y_train=y_train, x_val=x_val, y_val=y_val, x_test=x_test, y_test=y_test,
+                x_ood=x_ood, y_ood=y_ood, data_mean=data_mean, data_std=data_std)
+    return x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std)
 
 
 def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, average=True, rescale_fn=lambda x: x):
@@ -240,7 +291,7 @@ class timesfmWrapper:
     def init(self, key, x):
         return self.model._model.init(key, self._prepare_data(x))
 
-import pprint
+
 def train(logger, config):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
@@ -287,9 +338,9 @@ def train(logger, config):
 
         print("Generate data")
         times = time.time()
-        x, y, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(config['rng_seed'], **net_kwargs)  # get fold from seed
+        x, y, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = load_or_generate_data(config['rng_seed'], **net_kwargs, max_time_diff=30)  # get fold from seed
         del x_ood, y_ood  # remove ood data for now
-        rescale_fn = lambda x: (x * data_std['Patv']) + data_mean['Patv']  # rescale function for predictions
+        rescale_fn = lambda x: (x * data_std) + data_mean  # rescale function for predictions
         # drop non matching batch size
         x = x[:(x.shape[0]// batch_size) * batch_size]
         y = y[:(x.shape[0]// batch_size) * batch_size]
@@ -317,9 +368,9 @@ def train(logger, config):
         if lora_params['use_lora']:
             for f in lora_params['filter_masks']:
                 lora_mask = filter_mask(lora_mask, *f['keys'], as_curve=np.array(f['dims']), BoolschenOperator=eval(f['op']))
-        pprint.pprint(f"LoRA mask: {lora_mask}")
-        pprint.pprint(f"Curve mask: {curve_mask}")
-        pprint.pprint(f"Train mask: {train_mask}")
+        # pprint.pprint(f"LoRA mask: {lora_mask}")
+        # pprint.pprint(f"Curve mask: {curve_mask}")
+        # pprint.pprint(f"Train mask: {train_mask}")
 
         perm_spec = False
         if remove_initial_permutation:

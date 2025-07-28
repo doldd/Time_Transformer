@@ -123,16 +123,16 @@ def load_or_generate_data(rng_key, context_len, horizon_len, max_time_diff=30, *
     if os.path.exists(f"datasets/SDWPF/SDWPF_dataset/sdwpf_full/prepared_data_{context_len}.npz"):
         print(f"Data already exists for context length {context_len}. Loading from file.")
         with np.load(f"datasets/SDWPF/SDWPF_dataset/sdwpf_full/prepared_data_{context_len}.npz") as data:
-            x_train = data['x_train']
-            y_train = data['y_train']
-            x_val = data['x_val']
-            y_val = data['y_val']
-            x_test = data['x_test']
-            y_test = data['y_test']
-            x_ood = data['x_ood']
-            y_ood = data['y_ood']
-            data_mean = data['data_mean']
-            data_std = data['data_std']
+            x_train = jnp.array(data['x_train'])
+            y_train = jnp.array(data['y_train'])
+            x_val = jnp.array(data['x_val'])
+            y_val = jnp.array(data['y_val'])
+            x_test = jnp.array(data['x_test'])
+            y_test = jnp.array(data['y_test'])
+            x_ood = jnp.array(data['x_ood'])
+            y_ood = jnp.array(data['y_ood'])
+            data_mean = jnp.array(data['data_mean'])
+            data_std = jnp.array(data['data_std'])
     else:
         print(f"Generating data for context length {context_len}.")
         x_train, y_train, x_val, y_val, x_test, y_test, x_ood, y_ood, (data_mean, data_std) = gen_data(rng_key, context_len, horizon_len=horizon_len, max_time_diff=max_time_diff)

@@ -12,7 +12,7 @@ parameters:
       use_positional_embedding:
         value: True
       context_len:
-        value: 1152
+        value: 3200
   eval_every_n_batch:
     value: 50
   lora_params:
@@ -32,7 +32,7 @@ parameters:
       k:
         value: 2
       batch_size:
-        value: 128
+        value: 512
       natural_parameterization:
         value: False
       gravity:
@@ -46,9 +46,9 @@ parameters:
       remove_initial_permutation:
         value: False
       jitter:
-        value: 1e-8
+        value: 1e-2
       num_epochs:
-        value: 10
+        value: 5
       pretrained:
         value: True
 
@@ -68,7 +68,7 @@ parameters:
           kwargs:
             parameters:
               learning_rate:
-                value: 0.0002
+                value: 0.0001
               momentum:
                 value: 0.9
               nesterov:

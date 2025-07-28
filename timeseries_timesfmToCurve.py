@@ -163,9 +163,9 @@ def setup_metrics(model, batch_size, x, target, n_samples, use_linspace=False, a
             key, param = key_param
 
             def eval(t):
-                loss, _, out = model.nll(param, {}, t, x_batch, y_batch, train=False)  # params, batch_stats, t, x
-                mse = jnp.sum(jnp.square(rescale_fn(out[0][:len(y_batch)]) - rescale_fn(y_batch)))
-                return jnp.sum(loss), mse  # mean over batch
+                loss, _, out = model.nll(param, {}, t, x_batch, y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
+                mse = jnp.sum(jnp.mean(jnp.square(rescale_fn(out[0]) - rescale_fn(y_batch)), axis=-1))
+                return loss*batch_size, mse  # mean over horizon length but not over batch size
             
             key, subkey = random.split(key)
 
@@ -250,11 +250,11 @@ class timesfmWrapper:
             input_padding.append(padding)
             inp_freq.append(freq[i])
 
-        # Padding the remainder batch.
-        for _ in range(pmap_pad):
-            input_ts.append(input_ts[-1])
-            input_padding.append(input_padding[-1])
-            inp_freq.append(inp_freq[-1])
+        # # Padding the remainder batch.
+        # for _ in range(pmap_pad):
+        #     input_ts.append(input_ts[-1])
+        #     input_padding.append(input_padding[-1])
+        #     inp_freq.append(inp_freq[-1])
 
         return (
             jnp.stack(input_ts, axis=0),
@@ -894,7 +894,7 @@ if __name__ == '__main__':
                             'regularizer': False,
                             'weight_decay': 0.,
                             'remove_initial_permutation': False,
-                            'jitter': 1e-8,
+                            'jitter': 1e-2,
                             'pretrained': args.pretrained,
                             'filter_masks': [{'keys': ("value", "x_layers_0"), 'op': 'all'}],
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
@@ -938,7 +938,7 @@ if __name__ == '__main__':
                                 'regularizer': False,
                                 'weight_decay': 0.,
                                 'remove_initial_permutation': False,
-                                'jitter': 1e-8,
+                                'jitter': 1e-2,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                                 'pretrained': args.pretrained,
                                 'filter_masks': 
                                     [{'keys': ("value", "x_layers_0"), 'op': 'all'},

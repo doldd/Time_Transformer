@@ -734,7 +734,7 @@ class QuantileSubspace(SubspaceBaseModel):
 
         """
         out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
-        out_quantile = out[1][:len(y)] # len(y) because timesfm increses size to batch size
+        out_quantile = out[1]
 
         loss = jnp.square(out_quantile[:,:,0] - y) 
         def body_fun(loss, pred_and_quantile):

@@ -377,6 +377,11 @@ def train(logger, config):
             raise NotImplementedError("Removing initial permutation is not implemented for this model.")
             perm_spec = resnet20_permutation_spec2()
 
+
+        # add weight decay to optimizer if adamw is specified
+        if (weight_decay > 0.0) and (optimizer_conf['name'] == 'adamw'):
+            optimizer_conf['kwargs']['weight_decay'] = weight_decay
+            weight_decay = 0.0  # set to 0.0 to avoid double weight decay in model
         if regularizer:
             print("Using LoRARepulsiveQuantileSubspace with regularizer")
             s_model = LoRARepulsiveQuantileSubspace(lora_mask=lora_mask, r=lora_params['r'],

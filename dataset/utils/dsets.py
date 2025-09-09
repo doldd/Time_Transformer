@@ -149,7 +149,7 @@ class ClassificationDataset:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         prompts = self.tokenizer(
             prompts,
-            padding=True,
+            padding="max_length",  # changed from True to max_length to enable to store the whole batch in a single array
             truncation=True,
             return_tensors="pt",
             max_length=self.max_seq_len,
@@ -1107,7 +1107,7 @@ class LMDataset:
     def _tokenize_prompts_batch(self, prompts):
         prompts = self.tokenizer(
             prompts,
-            padding=True,
+            padding="max_length",  # changed from True to max_length to enable to strore in fixed size array
             return_tensors="pt",
             truncation=True,
             max_length=self.max_seq_len,

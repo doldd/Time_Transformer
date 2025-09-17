@@ -82,16 +82,22 @@ class QwenTextClassificationWrapper:
 
         return last_token_logits # Return probabilities for target classes only
 
-def load_text_classification_data(dataset_path: str):
+def load_text_classification_data(dataset_path: str, run=None, test=False):
     """
     Load text classification dataset
     
     Args:
         dataset_path: Path to the dataset .npz file
-        
+        run: wandb run object for logging to load artifacts
+
     Returns:
         Tuple of (input_ids, attention_mask, labels, target_ids)
     """
+    if run:
+        artifact = run.use_artifact(dataset_path, type='dataset')
+        artifact_dir = artifact.download()
+        dataset_path = os.path.join(artifact_dir, "test_data.npz" if test else "train_data.npz")
+
     with np.load(dataset_path) as data:
         input_ids = jnp.array(data['input_ids'])
         attention_mask = jnp.array(data['attention_mask']) 
@@ -178,7 +184,7 @@ def train(logger, config):
     """
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
-    BATCH_SIZE_EVAL = config['curve_params']['batch_size']
+    BATCH_SIZE_EVAL = config['curve_params']['batch_size']*2
 
     # Create artifact for storing parameters
     artifact = wandb.Artifact(name="params", type="pytree")
@@ -198,16 +204,19 @@ def train(logger, config):
                          net_kwargs: dict = None,
                          weight_decay: float = 0.0,
                          jitter: float = 0.0,
+                         smoke_test: bool = False,
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
         
         # Load dataset
-        input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path)
+        input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path, run=logger)
         print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
         print(f"Target token IDs: {unique_target_ids}")
         
         # Load Qwen model
+        model_artifact = logger.use_artifact(net_kwargs['model_path'], type='model')
+        net_kwargs['model_path'] = model_artifact.download()
         model = QwenTextClassificationWrapper(**net_kwargs, target_token_ids=unique_target_ids)
         params = unfreeze(model.init(None, None))
         dtype = jax.tree.leaves(params)[0].dtype
@@ -478,6 +487,16 @@ def train(logger, config):
             x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
             x_atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
             y_ = es('(ib)...->ib...', train_labels[shuffel], b=batch_size)
+            
+            # Limit number of batches for smoke test
+            if smoke_test:
+                smoke_batch_limit = 3
+                n_batches = min(smoke_batch_limit, x_.shape[0])
+                x_ = x_[:n_batches]
+                x_atten_mask = x_atten_mask[:n_batches]
+                y_ = y_[:n_batches]
+                jax.debug.print(f"Smoke test: Limited to {n_batches} batches per epoch")
+                
             # train on batches
             carry, metrics = jax.lax.scan(
                 train_batch, carry, (x_, x_atten_mask, y_, jnp.arange(x_.shape[0])))
@@ -551,7 +570,7 @@ def train(logger, config):
 
         
         # log all metrics
-        _ = [logger.log((dict(zip(metrics.keys(), m))) for m in zip(*metrics.values()))]
+        _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
 
         # print memory stats
         memory_stats = jax.devices()[0].memory_stats()
@@ -579,9 +598,11 @@ def train(logger, config):
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 25)
-        valid_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=25, use_linspace=True, average=False, key_prefix='final_')
-        train_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, train_input_ids, train_attention_mask, train_labels, n_samples=25, use_linspace=True, average=False, key_prefix='final_')
-        # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=25, use_linspace=True, average=False, rescale_fn=rescale_fn)
+        if smoke_test:
+            t_space = jnp.linspace(0, 1, 3)
+        valid_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        train_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=len(t_space), use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # # plot best params
         # # valid
@@ -668,7 +689,9 @@ def train(logger, config):
         return rng_key, params, model, last_params
 
     rng_key, params, model, last_params = train_curve_inner(
-        rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'])
+        rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
+        lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
+        smoke_test=config.get('smoke_test', False))
 
     print("Save artifacts")
     jnp.save(f'tmp_files/{logger.id}_params.npy', params)
@@ -691,18 +714,24 @@ if __name__ == '__main__':
     parser.add_argument("--train", choices=["single", "curve"], required=True, help="Specify the training mode: 'single' for single model training, 'curve' for curve model training.")
     parser.add_argument("--use-sweep", action="store_true", help="Use sweep configuration.")
     parser.add_argument("--batch-size", type=int, default=16, help="batch size for training. Default is 16.")
+    parser.add_argument("--smoke-test", action="store_true", help="Run a quick smoke test with reduced epochs (2) and batch iterations (3).")
 
     args = parser.parse_args()
 
     if args.train == "single":
         print("Single model training")
+        
+        # Apply smoke test settings if enabled
+        num_epochs = 2 if args.smoke_test else 2  # Keep original value of 2
+        
         config = {
             'rng_seed': 5,
-            'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-            'net_kwargs':{'model_path': "datasets/model_exports/qwen2.5_0.5B_float16",},
+            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_float16:v0",},
             'eval_every_n_batch': 10,
+            'smoke_test': args.smoke_test,
             'curve_params': {'k': 0,
-                            'num_epochs': 2,
+                            'num_epochs': num_epochs,
                             'batch_size': args.batch_size,
                             'natural_parameterization': False,
                             'gravity': 0.0,
@@ -722,7 +751,7 @@ if __name__ == '__main__':
                                                                             # 'momentum': 0.9, 
                                                                             # 'nesterov': True},},
                         }}
-        logger = wandb.init(project="qwem_PtoC", name="qwem_single", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="qwen_single", entity="ddold", config=config)
         train(logger, config)
     elif args.train == "curve":
         print("Curve training")
@@ -733,16 +762,21 @@ if __name__ == '__main__':
             train(logger, config)
         else:
             print("Using perdefined config")
+            
+            # Apply smoke test settings if enabled
+            num_epochs = 2 if args.smoke_test else 2  # Keep original value of 2
+            
             config = {
                 'rng_seed': 5,
                 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
                 'net_kwargs':{'model_path': "datasets/model_exports/qwen2.5_0.5B_float16",},
                 'eval_every_n_batch': 50,
+                'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'filter_masks': 
                                     [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
                 'curve_params': {'k': 2,
-                                'num_epochs': 2,
+                                'num_epochs': num_epochs,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,

@@ -185,9 +185,11 @@ def train(logger, config):
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
     BATCH_SIZE_EVAL = config['curve_params']['batch_size']*2
+    SAVE_PARAMS = config.get('save_params', False)
 
     # Create artifact for storing parameters
-    artifact = wandb.Artifact(name="params", type="pytree")
+    if SAVE_PARAMS:
+        artifact = wandb.Artifact(name="params", type="pytree")
 
     def train_curve_inner(rng_key,
                          k: int,
@@ -312,8 +314,9 @@ def train(logger, config):
         logger.summary.update({'n_params': n_params})
         print(f"Number of parameters: {n_params:_}")
 
-        jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
-        artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
+        if SAVE_PARAMS:
+            jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
+            artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
 
         # Define optimizer
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
@@ -693,14 +696,15 @@ def train(logger, config):
         lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
         smoke_test=config.get('smoke_test', False))
 
-    print("Save artifacts")
-    jnp.save(f'tmp_files/{logger.id}_params.npy', params)
-    jnp.save(f'tmp_files/{logger.id}_last_params.npy', last_params)
-    print("add files to artifact")
-    artifact.add_file(f'tmp_files/{logger.id}_params.npy')
-    artifact.add_file(f'tmp_files/{logger.id}_last_params.npy')
-    print("Log artifact")
-    logger.log_artifact(artifact)
+    if SAVE_PARAMS:
+        print("Save artifacts")
+        jnp.save(f'tmp_files/{logger.id}_params.npy', params)
+        jnp.save(f'tmp_files/{logger.id}_last_params.npy', last_params)
+        print("add files to artifact")
+        artifact.add_file(f'tmp_files/{logger.id}_params.npy')
+        artifact.add_file(f'tmp_files/{logger.id}_last_params.npy')
+        print("Log artifact")
+        logger.log_artifact(artifact)
 
     logger.finish()
 
@@ -727,6 +731,7 @@ if __name__ == '__main__':
         config = {
             'rng_seed': 5,
             'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            'save_params': False,
             'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_float16:v0",},
             'eval_every_n_batch': 10,
             'smoke_test': args.smoke_test,

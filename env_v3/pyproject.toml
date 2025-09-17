@@ -30,6 +30,7 @@ datasets = "^4.0.0"
 graphviz = "^0.21"
 hvplot = "^0.12.1"
 datashader = "^0.18.2"
+jupyter-bokeh = "^4.0.5"
 
 
 [[tool.poetry.source]]

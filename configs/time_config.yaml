@@ -12,7 +12,7 @@ parameters:
       use_positional_embedding:
         value: True
       context_len:
-        value: 2880
+        values: [960, 1600, 2240, 2880, 3200]
   eval_every_n_batch:
     value: 50
   lora_params:
@@ -62,10 +62,8 @@ parameters:
           # - [{keys: ["query"], op: "all"}, {keys: ["value"], op: "all"}]
 
       optimizer_conf:
-
-        parameters:
           values:
-            - {name: "adamw", kwargs: {learning_rate: 0.0001, weight_decay: 1e-3, betas: [0.9, 0.95], eps: 1e-8}, grad_clip_norm: 15.0, freeze_non_curve_params: True}
+            - {name: "adamw", kwargs: {learning_rate: 0.0001, weight_decay: 1e-3}, grad_clip_norm: 15.0, freeze_non_curve_params: True}
             - {name: "sgd", kwargs: {learning_rate: 0.0001, momentum: 0.9, nesterov: True}, grad_clip_norm: 15.0, freeze_non_curve_params: True}
             - {name: "sgd", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 3_000, peak_value: 0.0003, pct_start: 0.30, pct_final: 0.8, div_factor: 10.0, final_div_factor: 0.2}}, momentum: 0.9, nesterov: True}, grad_clip_norm: 15.0, freeze_non_curve_params: True}
         # parameters:

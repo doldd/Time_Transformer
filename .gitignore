@@ -173,3 +173,7 @@ cython_debug/
 wandb/
 artifacts/
 tmp_files/
+jax_cache/
+memory_profile/
+meta-llama/
+model_exports/

@@ -61,8 +61,8 @@ def get_all_datasets():
     return datasets
 
 
-def save_dataset_as_numpy(dataset_name, model_name="Qwen/Qwen2.5-0.5B", 
-                         max_seq_len=300, batch_size=4, output_dir="datasets"):
+def save_dataset_as_numpy(dataset_name, max_seq_len, model_name="Qwen/Qwen2.5-0.5B", 
+                          batch_size=100, output_dir="datasets"):
     """
     Save a single dataset as numpy arrays.
     
@@ -138,7 +138,7 @@ def save_dataset_as_numpy(dataset_name, model_name="Qwen/Qwen2.5-0.5B",
                         target_id_batch.detach().cpu().numpy()
                     ), axis=0)
             
-            np.savez_compressed(f'{output_path}train_data.npz', **train_tokens)
+            np.savez_compressed(f'{output_path}train_data.npz', target_ids=dataset.target_ids, **train_tokens)
         
         # Process test data
         print(f"Processing test data...")
@@ -170,11 +170,9 @@ def save_dataset_as_numpy(dataset_name, model_name="Qwen/Qwen2.5-0.5B",
                     target_id_batch.detach().cpu().numpy()
                 ), axis=0)
         
-
-        
         # Save files
         print(f"Saving to {output_path}...")
-        np.savez_compressed(f'{output_path}test_data.npz', **test_tokens)
+        np.savez_compressed(f'{output_path}test_data.npz', target_ids=dataset.target_ids, **test_tokens)
         
         # Print summary
         print(f"✅ Successfully saved {dataset_name}")
@@ -194,7 +192,7 @@ def save_dataset_as_numpy(dataset_name, model_name="Qwen/Qwen2.5-0.5B",
         return False
 
 
-def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_exports"):
+def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_exports", dtype: str = "float16"):
     """
     Convert Qwen2.5 PyTorch model to JAX parameters and save them.
     
@@ -222,9 +220,11 @@ def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_e
         print(f"Using device: {device}")
         
         # Model loading configuration
+        # Allow choosing conversion dtype (float16 or float32)
+        torch_dtype = torch.float16 if dtype == "float16" else torch.float32
         model_config = {
             "device_map": "auto",
-            "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+            "torch_dtype": torch_dtype,
             "trust_remote_code": False,
         }
         
@@ -263,27 +263,29 @@ def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_e
         print(f"JAX model parameters: {jax_param_count:,}")
         print(f"Parameter count match: {param_count == jax_param_count}")
         
-        # Create output directory
+        # Create output directory and build save path
         model_size = model_name.split("/")[-1].replace("Qwen2.5-", "")
-        save_path = f"{output_dir}/qwen2.5_{model_size}"
+        # include dtype in saved path to distinguish parameter precision
+        save_path = f"{output_dir}/qwen2.5_{model_size}_{dtype}"
+        os.makedirs(save_path, exist_ok=True)
 
         # Save JAX parameters and config
         save_params_and_config(jax_params, jax_config, save_path)
-        
-        # # Verify with a simple forward pass
+
+        # # Verify with a simple forward pass (optional)
         # print("Verifying model with forward pass...")
         # test_input = jnp.array([[1, 2, 3, 4, 5]])
         # jax_output = jax_model.apply(jax_params, test_input, train=False)
         # print(f"Test output shape: {jax_output.shape}")
         # print(f"Expected shape: (1, 5, {jax_config['vocab_size']})")
-        
+
         # Clean up PyTorch model to free memory
         del pytorch_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         print(f"✅ Successfully converted and saved {model_name} to {save_path}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error converting {model_name}: {e}")
         import traceback
@@ -354,6 +356,8 @@ def main():
                        help="Output directory for datasets")
     parser.add_argument("--model-output-dir", default="datasets/model_exports",
                        help="Output directory for Qwen models")
+    parser.add_argument("--dtype", choices=["float16", "float32"], default="float16",
+                       help="Data type for model conversion (float16 or float32)")
     
     args = parser.parse_args()
     
@@ -363,39 +367,49 @@ def main():
             'boolq': {
                 'name': 'boolq',
                 'description': 'Boolean Questions (True/False)',
+                'max_seq_len': 525,
             },
             'winogrande_s': {
                 'name': 'winogrande_s', 
                 'description': 'Winogrande Small (pronoun resolution)',
+                'max_seq_len': 64,
             },
             'winogrande_m': {
                 'name': 'winogrande_m',
                 'description': 'Winogrande Medium (pronoun resolution)', 
+                'max_seq_len': 69,
             },
             'ARC-Easy': {
                 'name': 'ARC-Easy',
                 'description': 'AI2 Reasoning Challenge Easy (science questions)',
+                'max_seq_len': 194,
             },
             'ARC-Challenge': {
                 'name': 'ARC-Challenge', 
                 'description': 'AI2 Reasoning Challenge Challenge (science questions)',
+                'max_seq_len': 201,
             },
             'obqa': {
                 'name': 'obqa',
                 'description': 'OpenBookQA (elementary science)',
+                'max_seq_len': 127,
             },
             'MMLU_chem': {
                 'name': 'MMLU_chem',
                 'description': 'MMLU Chemistry (multiple choice)',
+                'max_seq_len': 239,
             },
             'MMLU_phy': {
                 'name': 'MMLU_phy',
                 'description': 'MMLU Physics (multiple choice)',
+                'max_seq_len': 153,
             }
         }
         
         print("🚀 Starting dataset processing for Time Transformer framework")
         print(f"Total datasets to process: {len(datasets_config)}")
+        
+          # Force JAX to use CPU for dataset processing
         
         # Process each dataset
         success_count = 0
@@ -404,8 +418,8 @@ def main():
             success = save_dataset_as_numpy(
                 dataset_name=config['name'],
                 model_name="Qwen/Qwen2.5-0.5B",
-                max_seq_len=300,
-                batch_size=4,
+                max_seq_len=config['max_seq_len'],
+                batch_size=100,
                 output_dir=args.dataset_output_dir
             )
             if success:
@@ -426,7 +440,7 @@ def main():
                 if os.path.isdir(item_path):
                     train_file = os.path.join(item_path, "train_data.npz")
                     test_file = os.path.join(item_path, "test_data.npz")
-                    if os.path.exists(train_file) if "MMLU" in item_path else True and os.path.exists(test_file):
+                    if (True if "MMLU" in item_path else os.path.exists(train_file)) and os.path.exists(test_file):
                         print(f"   ✅ {item}/")
                     else:
                         print(f"   ⚠️  {item}/ (incomplete)")
@@ -440,7 +454,7 @@ def main():
         qwen_success_count = 0
         for model_name in args.qwen_models:
             print(f"\n🔄 Converting: {model_name}")
-            success = save_qwen_jax_parameters(model_name, args.model_output_dir)
+            success = save_qwen_jax_parameters(model_name, args.model_output_dir, dtype=args.dtype)
             if success:
                 qwen_success_count += 1
         
@@ -457,7 +471,7 @@ def main():
             for item in sorted(os.listdir(model_exports_path)):
                 item_path = os.path.join(model_exports_path, item)
                 if os.path.isdir(item_path) and item.startswith("qwen"):
-                    params_file = os.path.join(item_path, "jax_params.npz")
+                    params_file = os.path.join(item_path, "jax_params.npy")
                     config_file = os.path.join(item_path, "jax_config.json")
                     if os.path.exists(params_file) and os.path.exists(config_file):
                         print(f"   ✅ {item}/")

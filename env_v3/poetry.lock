@@ -2216,6 +2216,27 @@ files = [
 referencing = ">=0.31.0"
 
 [[package]]
+name = "jupyter-bokeh"
+version = "4.0.5"
+description = "A Jupyter extension for rendering Bokeh content."
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "jupyter_bokeh-4.0.5-py3-none-any.whl", hash = "sha256:1110076c14c779071cf492646a1a871aefa8a477261e4721327a666e65df1a2c"},
+    {file = "jupyter_bokeh-4.0.5.tar.gz", hash = "sha256:a33d6ab85588f13640b30765fa15d1111b055cbe44f67a65ca57d3593af8245d"},
+]
+
+[package.dependencies]
+bokeh = "==3.*"
+ipywidgets = "==8.*"
+
+[package.extras]
+all = ["jupyter-bokeh[build]", "jupyter-bokeh[tests]"]
+build = ["jupyterlab (>=4.0,<5.0)", "setuptools (>=40.8.0)"]
+tests = ["flake8", "pytest"]
+
+[[package]]
 name = "jupyter-client"
 version = "8.6.3"
 description = "Jupyter protocol implementation and client libraries"
@@ -6523,4 +6544,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10,<3.12"
-content-hash = "7739478ac8b395a06dcd03ce41413d746167170571f6fb7e4e01d39e7341f184"
+content-hash = "3ad3faf8de300b6604c274e4778b050524886bc6e220b376c757fcf96fd56941"

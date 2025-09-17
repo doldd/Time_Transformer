@@ -209,12 +209,12 @@ class QwenAttention(nn.Module):
             # attention_mask: [batch, seq_len], 1 for valid, 0 for masked
             # Expand mask for broadcasting to attn_weights: [batch, 1, 1, seq_len]
             attn_weights = jnp.where(attention_mask[:, None, None, :], attn_weights, -jnp.inf)
-            self.sow('intermediates', 'attn_weights_masked', attn_weights)
+            # self.sow('intermediates', 'attn_weights_masked', attn_weights)
 
         # Softmax
         attn_weights = nn.softmax(attn_weights, axis=-1)
         attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
-        self.sow('intermediates', 'attn_weights_prob', attn_weights)
+        # self.sow('intermediates', 'attn_weights_prob', attn_weights)
 
         # Apply dropout
         if train and self.attention_dropout > 0.0:

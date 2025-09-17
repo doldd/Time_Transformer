@@ -403,22 +403,23 @@ class SubspaceBaseModel:
 
     @partial(jit, static_argnums=(0,))
     def _predict(self, params, state, inputs, train) -> Tuple[jnp.ndarray, dict]:
+        if not isinstance(inputs, tuple):
+            inputs = (inputs,)
         # Predict out from inputs and parameters
         if self.mutable_name:
             all_params = {'params': params, self.mutable_name: state}
             def train_fn(inputs):
                 out, net_state = self.model.apply(
-                    all_params, inputs, train=True, mutable=self.mutable_name)
+                    all_params, *inputs, train=True, mutable=self.mutable_name)
                 return out, net_state[self.mutable_name]
         else:
             all_params = {'params': params}
             def train_fn(inputs):
-                out = self.model.apply(all_params, inputs, train=True, mutable=False)
+                out = self.model.apply(all_params, *inputs, train=True, mutable=False)
                 return out, {}
 
         def eval_fn(inputs):
-            out = self.model.apply(all_params, inputs,
-                                   train=False, mutable=False)
+            out = self.model.apply(all_params, *inputs, train=False, mutable=False)
             return out, state
 
         out, net_state = jax.lax.cond(
@@ -988,6 +989,15 @@ class LoRARegressionSubspace(LoRAMixin, RegressionSubspace):
 
 class LoRACategorySubspace(LoRAMixin, CategorySubspace):
     pass
+
+class LoRARepulsiveCategorySubspace(LoRAMixin, RepulsiveMixin, CategorySubspace):
+    def __init__(self, model, k, weight_decay=0, perm_spec = False, natural_parameterization=False, r=1, lora_mask=None, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
+        LoRAMixin.__init__(self, r=r, lora_mask=lora_mask, **kwargs)
+        RepulsiveMixin.__init__(self, gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
+        CategorySubspace.__init__(self, model=model, k=k,
+                                  weight_decay=weight_decay,
+                                  perm_spec=perm_spec,
+                                  natural_parameterization=natural_parameterization)
 
 class LoRAQuantileSubspace(LoRAMixin, QuantileSubspace):
     pass

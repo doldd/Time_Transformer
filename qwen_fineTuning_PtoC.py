@@ -465,10 +465,12 @@ def train(logger, config):
         else:
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
+                jax.debug.print("Batch idx: {}", batch_idx)
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                jax.debug.print("Training loss: {}", loss)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -478,6 +480,7 @@ def train(logger, config):
                 best_params = jax.lax.cond(
                     metrics['val_loss'] < best_loss, lambda x: params, lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
+                jax.debug.print("Current acc: {}", valid_metrics_fn(valid_key, params))
 
                 return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics}
 
@@ -503,6 +506,8 @@ def train(logger, config):
             # train on batches
             carry, metrics = jax.lax.scan(
                 train_batch, carry, (x_, x_atten_mask, y_, jnp.arange(x_.shape[0])))
+            # jax.debug.print(f"Epoch {epoch+1}/{num_epochs}, Loss: {metrics['loss'][-1].item()}{metrics['loss'].shape}, Val Loss: {metrics['val_loss'][-1]}, Val Acc: {metrics['val_acc'][-1]}")
+            jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], metrics['val_loss'][-1], metrics['val_acc'][-1])
             return carry, metrics
 
         # # print memory stats
@@ -726,13 +731,13 @@ if __name__ == '__main__':
         print("Single model training")
         
         # Apply smoke test settings if enabled
-        num_epochs = 2 if args.smoke_test else 2  # Keep original value of 2
+        num_epochs = 2 if args.smoke_test else 10  # Keep original value of 2
         
         config = {
             'rng_seed': 5,
             'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             'save_params': False,
-            'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_float16:v0",},
+            'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0",},
             'eval_every_n_batch': 10,
             'smoke_test': args.smoke_test,
             'curve_params': {'k': 0,
@@ -744,12 +749,13 @@ if __name__ == '__main__':
                             'regularizer': False,
                             'weight_decay': 0.,
                             'jitter': 1e-2,
-                            'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}],  # use lora for query projection
+                            'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
+                                             {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                 'optimizer_conf': {'name': "sgd", 
-                                                   'kwargs': {'learning_rate': 0.0005, 'momentum': 0.9, 'nesterov': True},
-                                                   'grad_clip_norm': 15.0,
+                                                   'kwargs': {'learning_rate': 1e-10, 'momentum': 0.9, 'nesterov': True},
+                                                #    'grad_clip_norm': 1.0,
                                                    'freeze_other_params': True},
                             # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                             # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},

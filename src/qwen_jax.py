@@ -280,48 +280,48 @@ class QwenDecoderLayer(nn.Module):
         return hidden_states
 
 
-class QwenModel(nn.Module):
-    """Qwen transformer model (JAX version)"""
-    vocab_size: int
-    hidden_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    intermediate_size: int
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 32768
-    rms_norm_eps: float = 1e-6
-    attention_dropout: float = 0.0
-    rope_theta: float = 10000.0
+# class QwenModel(nn.Module):
+#     """Qwen transformer model (JAX version)"""
+#     vocab_size: int
+#     hidden_size: int
+#     num_hidden_layers: int
+#     num_attention_heads: int
+#     num_key_value_heads: int
+#     intermediate_size: int
+#     hidden_act: str = "silu"
+#     max_position_embeddings: int = 32768
+#     rms_norm_eps: float = 1e-6
+#     attention_dropout: float = 0.0
+#     rope_theta: float = 10000.0
 
-    @nn.compact
-    def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True):
-        # Token embeddings
-        hidden_states = nn.Embed(
-            num_embeddings=self.vocab_size,
-            features=self.hidden_size,
-            name='embed_tokens'
-        )(input_ids)
+#     @nn.compact
+#     def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True):
+#         # Token embeddings
+#         hidden_states = nn.Embed(
+#             num_embeddings=self.vocab_size,
+#             features=self.hidden_size,
+#             name='embed_tokens'
+#         )(input_ids)
 
-        # Apply transformer layers
-        for i in range(self.num_hidden_layers):
-            hidden_states = QwenDecoderLayer(
-                hidden_size=self.hidden_size,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                intermediate_size=self.intermediate_size,
-                hidden_act=self.hidden_act,
-                rms_norm_eps=self.rms_norm_eps,
-                attention_dropout=self.attention_dropout,
-                rope_theta=self.rope_theta,
-                name=f'layers_{i}'
-            )(hidden_states, attention_mask, position_ids, train)
+#         # Apply transformer layers
+#         for i in range(self.num_hidden_layers):
+#             hidden_states = QwenDecoderLayer(
+#                 hidden_size=self.hidden_size,
+#                 num_attention_heads=self.num_attention_heads,
+#                 num_key_value_heads=self.num_key_value_heads,
+#                 intermediate_size=self.intermediate_size,
+#                 hidden_act=self.hidden_act,
+#                 rms_norm_eps=self.rms_norm_eps,
+#                 attention_dropout=self.attention_dropout,
+#                 rope_theta=self.rope_theta,
+#                 name=f'layers_{i}'
+#             )(hidden_states, attention_mask, position_ids, train)
 
-        # Final layer norm
-        hidden_states = RMSNorm(eps=self.rms_norm_eps,
-                                name='norm')(hidden_states)
+#         # Final layer norm
+#         hidden_states = RMSNorm(eps=self.rms_norm_eps,
+#                                 name='norm')(hidden_states)
 
-        return hidden_states
+#         return hidden_states
 
 
 class QwenForCausalLM(nn.Module):
@@ -376,21 +376,33 @@ class QwenForCausalLM(nn.Module):
             # -> (batch, seq, vocab)
             logits = jnp.dot(hidden_states, embed_weights.T)
         else:
-            # Use separate model and lm_head
-            hidden_states = QwenModel(
-                vocab_size=self.vocab_size,
-                hidden_size=self.hidden_size,
-                num_hidden_layers=self.num_hidden_layers,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                intermediate_size=self.intermediate_size,
-                hidden_act=self.hidden_act,
-                max_position_embeddings=self.max_position_embeddings,
-                rms_norm_eps=self.rms_norm_eps,
-                attention_dropout=self.attention_dropout,
-                rope_theta=self.rope_theta,
-                name='model'
-            )(input_ids, attention_mask, position_ids, train)
+            # Create shared embedding layer
+            embed_layer = nn.Embed(
+                num_embeddings=self.vocab_size,
+                features=self.hidden_size,
+                name='embed_tokens'
+            )
+
+            # Get embeddings for input tokens
+            hidden_states = embed_layer(input_ids)
+
+            # Apply transformer layers
+            for i in range(self.num_hidden_layers):
+                hidden_states = QwenDecoderLayer(
+                    hidden_size=self.hidden_size,
+                    num_attention_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    intermediate_size=self.intermediate_size,
+                    hidden_act=self.hidden_act,
+                    rms_norm_eps=self.rms_norm_eps,
+                    attention_dropout=self.attention_dropout,
+                    rope_theta=self.rope_theta,
+                    name=f'layers_{i}'
+                )(hidden_states, attention_mask, position_ids, train)
+
+            # Final layer norm
+            hidden_states = RMSNorm(
+                eps=self.rms_norm_eps, name='norm')(hidden_states)
 
             # Separate lm_head weights
             logits = nn.Dense(self.vocab_size, use_bias=False,
@@ -475,7 +487,7 @@ def create_parameter_mapping(config):
     # Language model head (if using tied embeddings, this might not exist)
     # if hasattr(model, 'lm_head') and model.lm_head is not None:
     if config['tie_word_embeddings'] is False:
-        mapping["params/lm_head/kernel"] = ("lm_head.weight", (0, 1))
+        mapping["params/lm_head/kernel"] = ("lm_head.weight", (1, 0))
 
     return mapping
 
@@ -493,7 +505,7 @@ def get_dtype_from_tensor(torch_tensor):
         raise ValueError(f"Unsupported torch dtype: {torch_tensor.dtype}")
 
 
-def convert_pytorch_weights_to_jax(jax_params, model, config):
+def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
     """
     Loads PyTorch model weights into a JAX/Flax parameter pytree.
 
@@ -538,7 +550,9 @@ def convert_pytorch_weights_to_jax(jax_params, model, config):
             print(
                 f"WARNING: Shape mismatch for {pytorch_name}: JAX {p.shape} vs PyTorch {pp.shape}")
             continue
-
+        if jax_dtype:
+            if jnp.issubdtype(dtype, jnp.floating): # convert only floating point types
+                dtype = jax_dtype
         new_jax_params.append(jnp.array(pp, dtype=dtype))
 
     del jax_params

@@ -334,10 +334,9 @@ def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_e
         
         # Model loading configuration
         # Allow choosing conversion dtype (float16 or float32)
-        torch_dtype = torch.float16 if dtype == "float16" else torch.float32
         model_config = {
-            "device_map": "auto",
-            "torch_dtype": torch_dtype,
+            "device_map": "cpu",
+            "torch_dtype": torch.float32,
             "trust_remote_code": False,
         }
         
@@ -353,6 +352,14 @@ def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_e
         # Create JAX model configuration from PyTorch config
         print("Creating JAX model configuration...")
         jax_config = create_qwen_config_from_pytorch(pytorch_model.config)
+        if dtype == "float16":
+            jax_dtype = jnp.float16
+        elif dtype == "float32":
+            jax_dtype = jnp.float32
+        elif dtype == "bfloat16":
+            jax_dtype = jnp.bfloat16
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}. Choose from 'float16', 'float32', or 'bfloat16'.")
         
         print("JAX model configuration:")
         for key, value in jax_config.items():
@@ -369,13 +376,15 @@ def save_qwen_jax_parameters(model_name="Qwen/Qwen2.5-0.5B", output_dir="model_e
         
         # Convert and transfer weights from PyTorch to JAX
         print("Converting PyTorch weights to JAX format...")
-        jax_params = convert_pytorch_weights_to_jax(jax_params, pytorch_model, jax_config)
+        jax_params = convert_pytorch_weights_to_jax(jax_params, pytorch_model, jax_config, jax_dtype)
         
         # Count JAX parameters
         jax_param_count = sum(p.size for p in jax.tree.leaves(jax_params))
+        jax_memory_bytes = sum(p.nbytes for p in jax.tree.leaves(jax_params))
         print(f"JAX model parameters: {jax_param_count:,}")
         print(f"Parameter count match: {param_count == jax_param_count}")
-        
+        print(f"Parameter memory: {jax_memory_bytes / (1024**3):.2f} GB ({dtype})")
+
         # Save JAX parameters and config
         save_params_and_config(jax_params, jax_config, save_path)
 
@@ -492,7 +501,7 @@ def main():
                        help="Output directory for datasets")
     parser.add_argument("--model-output-dir", default="datasets/model_exports",
                        help="Output directory for Qwen models")
-    parser.add_argument("--dtype", choices=["float16", "float32"], default="float16",
+    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16",
                        help="Data type for model conversion (float16 or float32)")
     parser.add_argument("--upload-to-wandb", action="store_true",
                        help="Save datasets and models as wandb artifacts")

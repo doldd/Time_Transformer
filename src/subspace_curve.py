@@ -340,7 +340,7 @@ class SubspaceBaseModel:
         # param, struct = jax.tree.flatten(curve_params)
         # keys = random.split(key, len(param))
         def apply_noise(p, key, jitter):
-            return p+jitter*jax.random.normal(key, p.shape)
+            return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)
         # noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
         # curve_params = jax.tree.unflatten(struct, noise_params)
         
@@ -445,7 +445,7 @@ class SubspaceBaseModel:
         bezier_coeff = self.bezier(t)
         # Compute one parameter set per sample
         params = jax.tree.map(lambda p, m: jnp.einsum(
-            'k,k...->...', bezier_coeff, p) if m else p, params, self.curve_mask)
+            'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
 
         # forward pass per sample
         out, state = self._predict(params, state, x, train=train)

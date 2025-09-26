@@ -465,12 +465,12 @@ def train(logger, config):
         else:
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
-                jax.debug.print("Batch idx: {}", batch_idx)
+                # jax.debug.print("Batch idx: {}", batch_idx)
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-                jax.debug.print("Training loss: {}", loss)
+                # jax.debug.print("Training loss: {}", loss)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -480,7 +480,7 @@ def train(logger, config):
                 best_params = jax.lax.cond(
                     metrics['val_loss'] < best_loss, lambda x: params, lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
-                jax.debug.print("Current acc: {}", valid_metrics_fn(valid_key, params))
+                # jax.debug.print("Current acc: {}", valid_metrics_fn(valid_key, params))
 
                 return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics}
 
@@ -754,7 +754,7 @@ if __name__ == '__main__':
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                 'optimizer_conf': {'name': "sgd", 
-                                                   'kwargs': {'learning_rate': 1e-10, 'momentum': 0.9, 'nesterov': True},
+                                                   'kwargs': {'learning_rate': 1e-4, 'momentum': 0.9, 'nesterov': True},
                                                 #    'grad_clip_norm': 1.0,
                                                    'freeze_other_params': True},
                             # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 

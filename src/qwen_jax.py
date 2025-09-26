@@ -145,7 +145,7 @@ class QwenAttention(nn.Module):
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
-    max_position_embeddings: int = 32768
+    # max_position_embeddings: int = 32768
     attention_dropout: float = 0.0
     rope_theta: float = 10000.0
 
@@ -199,22 +199,16 @@ class QwenAttention(nn.Module):
             key_states, (0, 1, 3, 2))) * self.scaling
 
         # Always apply causal mask
-        causal_mask = jnp.triu(
-            jnp.ones((seq_len, seq_len), dtype=hidden_states.dtype) * -jnp.inf, k=1)
+        causal_mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=bool), k=1)
+        causal_mask = jnp.logical_not(causal_mask[None, None, :, :])
+        
         # Broadcast causal_mask to match attn_weights shape: [1, 1, seq_len, seq_len]
-        attn_weights = attn_weights + causal_mask[None, None, :, :]
-
-        # Apply masking
         if attention_mask is not None:
-            # attention_mask: [batch, seq_len], 1 for valid, 0 for masked
-            # Expand mask for broadcasting to attn_weights: [batch, 1, 1, seq_len]
-            attn_weights = jnp.where(attention_mask[:, None, None, :], attn_weights, -jnp.inf)
-            # self.sow('intermediates', 'attn_weights_masked', attn_weights)
+            attention_mask = attention_mask[:, None, None, :].astype(bool)
+            causal_mask = jnp.logical_and(attention_mask, causal_mask)
 
-        # Softmax
-        attn_weights = nn.softmax(attn_weights, axis=-1)
-        attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
-        # self.sow('intermediates', 'attn_weights_prob', attn_weights)
+        ## with where argument to avoid NaNs from -inf of all-masked rows in softmax
+        attn_weights = nn.softmax(attn_weights, axis=-1, where=causal_mask)
 
         # Apply dropout
         if train and self.attention_dropout > 0.0:

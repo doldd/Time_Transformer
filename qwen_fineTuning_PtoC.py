@@ -302,6 +302,7 @@ def train(logger, config):
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, 1, use_linspace=True, average=True, key_prefix='init_')
         init_metrics = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
+        jax.debug.print("Initial metrics: {}", init_metrics)
 
         # set train mask according to config
         # Only update mask for LoRA-capable subspaces
@@ -441,6 +442,10 @@ def train(logger, config):
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
+
+                jax.debug.print("Training loss: {}", loss)
+                jax.debug.print("dtype {}", dtype)
+                jax.debug.print("valid acc/loss: {}", valid_metrics_fn(valid_key, params))
 
                 # mse, val_loss = valid_metrics_fn(valid_key, params)
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
@@ -775,12 +780,13 @@ if __name__ == '__main__':
             print("Using perdefined config")
             
             # Apply smoke test settings if enabled
-            num_epochs = 2 if args.smoke_test else 2  # Keep original value of 2
+            num_epochs = 2 if args.smoke_test else 5  # Keep original value of 2
             
             config = {
                 'rng_seed': 5,
-                'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-                'net_kwargs':{'model_path': "datasets/model_exports/qwen2.5_0.5B_float16",},
+                # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
+                'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+                'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0",},
                 'eval_every_n_batch': 50,
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
@@ -795,20 +801,19 @@ if __name__ == '__main__':
                                 'regularizer': False,
                                 'weight_decay': 0.,
                                 'jitter': 1e-2,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
-                                'filter_masks': 
-                                    [{'keys': ("value", "x_layers_0"), 'op': 'all'},
-                                     {'keys': ("query", "x_layers_0"), 'op': 'all'}],  # filter query projection
+                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
+                                                {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                    'optimizer_conf': {'name': "sgd", 
-                                                       'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
-                                                       'grad_clip_norm': 15.0,
-                                                       'freeze_other_params': True},
+                                'optimizer_conf': {'name': "sgd", 
+                                                    'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
+                                                    'grad_clip_norm': 100.0,
+                                                    'freeze_other_params': True},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                                                                                 # 'momentum': 0.9, 
                                                                                 # 'nesterov': True},},
                             }}
-            logger = wandb.init(project="qwen_PtoC", name="qwen_curve", entity="ddold", config=config)
+            logger = wandb.init(project="qwen_PtoC", name="test_qwen_curve", entity="ddold", config=config)
             train(logger, config)
 

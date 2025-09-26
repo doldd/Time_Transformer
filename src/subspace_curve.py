@@ -975,7 +975,7 @@ class LoRAMixin:
         bezier_coeff = self.bezier(t)
         # Compute one parameter set per sample
         params = jax.tree.map(lambda p, m: jnp.einsum(
-            'k,k...->...', bezier_coeff, p) if m else p, params, self.curve_mask)
+            'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
         
         # Apply LoRA to the parameters
         params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoRAParams) else lp, params, is_leaf=lambda x: isinstance(x, LoRAParams))

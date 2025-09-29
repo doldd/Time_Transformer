@@ -619,12 +619,10 @@ def train(logger, config):
         logger.log({k+'_best_mean':v.mean() for k,v in curve_metric.items()})
         logger.log({k+'_best_max':v.max() for k,v in curve_metric.items()})
         logger.log({k+'_best_min':v.min() for k,v in curve_metric.items()})
-        ax[1].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
-        ax2 = ax[1].twinx()
+        ax[0].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
+        ax2 = ax[0].twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
-        logger.log(
-            {'Curve Predictive Best Params': wandb.Image(fig)})
         # nll, mse = valid_metrics_fn_final(rng_key, best_params)
         # logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
         # ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
@@ -647,7 +645,6 @@ def train(logger, config):
         # ax[0].set_title("Best params")
         
         # plot last params
-        fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         # valid
         curve_metric = valid_metrics_fn_final(rng_key, last_params)
         logger.log({k+'_last_mean':v.mean() for k,v in curve_metric.items()})
@@ -657,8 +654,6 @@ def train(logger, config):
         ax2 = ax[1].twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
-        logger.log(
-            {'Curve Predictive Last Params': wandb.Image(fig)})
         # # train
         # nll, mse = train_metrics_fn_final(rng_key, last_params)
         # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
@@ -703,6 +698,20 @@ def train(logger, config):
         # functional_diff["Sample Std last"] = out.std(axis=0).mean()  # std over samples
         # logger.log(functional_diff)
 
+        # plt.tight_layout()
+        # finalize plot: labels, legend and layout
+        ax[0].set_xlabel("t")
+        ax[1].set_xlabel("t")
+        ax[1].set_ylabel("mean log likelihood")
+        ax2.set_ylabel("Accuracy")
+        ax[0].set_title("Best params (validation)")
+        ax[1].set_title("Last params (validation)")
+        # combine legends from primary and twin axes
+        lines, labels = ax[1].get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax[1].legend(lines + lines2, labels + labels2, loc='best', fontsize='small')
+        logger.log(
+            {'Curve Predictive': wandb.Image(fig)})
         # plt.tight_layout()
         # logger.log(
         #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})

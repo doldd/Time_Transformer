@@ -443,10 +443,6 @@ def train(logger, config):
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
-                jax.debug.print("Training loss: {}", loss)
-                jax.debug.print("dtype {}", dtype)
-                jax.debug.print("valid acc/loss: {}", valid_metrics_fn(valid_key, params))
-
                 # mse, val_loss = valid_metrics_fn(valid_key, params)
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
                     valid_key, params), lambda x: {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}, None)
@@ -613,12 +609,22 @@ def train(logger, config):
         t_space = jnp.linspace(0, 1, 25)
         if smoke_test:
             t_space = jnp.linspace(0, 1, 3)
-        valid_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
-        train_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL//10, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        train_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL//10, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=len(t_space), use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # # plot best params
         # # valid
+        curve_metric = valid_metrics_fn_final(rng_key, best_params)
+        logger.log({k+'_best_mean':v.mean() for k,v in curve_metric.items()})
+        logger.log({k+'_best_max':v.max() for k,v in curve_metric.items()})
+        logger.log({k+'_best_min':v.min() for k,v in curve_metric.items()})
+        ax[1].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
+        ax2 = ax[1].twinx()
+        ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
+                 c=plt.get_cmap('tab10')(1), linestyle="--")
+        logger.log(
+            {'Curve Predictive Best Params': wandb.Image(fig)})
         # nll, mse = valid_metrics_fn_final(rng_key, best_params)
         # logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
         # ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
@@ -641,15 +647,18 @@ def train(logger, config):
         # ax[0].set_title("Best params")
         
         # plot last params
+        fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         # valid
         curve_metric = valid_metrics_fn_final(rng_key, last_params)
-        logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
-        logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
-        logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
+        logger.log({k+'_last_mean':v.mean() for k,v in curve_metric.items()})
+        logger.log({k+'_last_max':v.max() for k,v in curve_metric.items()})
+        logger.log({k+'_last_min':v.min() for k,v in curve_metric.items()})
         ax[1].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax[1].twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
+        logger.log(
+            {'Curve Predictive Last Params': wandb.Image(fig)})
         # # train
         # nll, mse = train_metrics_fn_final(rng_key, last_params)
         # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
@@ -694,9 +703,9 @@ def train(logger, config):
         # functional_diff["Sample Std last"] = out.std(axis=0).mean()  # std over samples
         # logger.log(functional_diff)
 
-        plt.tight_layout()
-        logger.log(
-            {'Curve Predictive for x_val[0]': wandb.Image(fig)})
+        # plt.tight_layout()
+        # logger.log(
+        #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})
 
 
         return rng_key, params, model, last_params

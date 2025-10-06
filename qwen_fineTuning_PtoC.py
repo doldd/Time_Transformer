@@ -207,15 +207,22 @@ def train(logger, config):
                          weight_decay: float = 0.0,
                          jitter: float = 0.0,
                          smoke_test: bool = False,
+                         num_steps: int = -1,
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
-        
+
         # Load dataset
         input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path, run=logger)
         test_input_ids, test_attention_mask, test_labels, _, _ = load_text_classification_data(dataset_path, run=logger, test=True)
         print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
         print(f"Target token IDs: {unique_target_ids}")
+
+        # compute num_epochs if num_steps is given
+        assert (num_epochs > 0) ^ (num_steps > 0), "Only one of num_epochs or num_steps should be > 0"
+        if num_steps > 0:
+            num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
+            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
         
         # Load Qwen model
         if net_kwargs['model_path'].startswith('ddold/'):
@@ -802,7 +809,9 @@ if __name__ == '__main__':
                             'filter_masks': 
                                 [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
             'curve_params': {'k': 0,
-                            'num_epochs': num_epochs,
+                            # 'num_epochs': num_epochs,
+                            'num_epochs': -1,
+                            'num_steps': 10,
                             'batch_size': args.batch_size,
                             'natural_parameterization': False,
                             'gravity': 0.0,

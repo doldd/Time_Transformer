@@ -401,6 +401,7 @@ class SubspaceBaseModel:
         return all_params
     
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def _predict(self, params, state, inputs, train) -> Tuple[jnp.ndarray, dict]:
         if not isinstance(inputs, tuple):
@@ -427,6 +428,7 @@ class SubspaceBaseModel:
         )
         return out, net_state
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
         """
@@ -541,7 +543,8 @@ class SubspaceBaseModel:
         return weighted_loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                  for w in jax.tree.leaves(params['params'])), state
 
-    @partial(jit, static_argnums=(0, 6))
+    # @partial(jit, static_argnums=(0, 6))
+    @partial(jit, static_argnums=(0, 6), donate_argnums=(2,5))
     # @profile
     def train_step(self, key, params, x, y, opt_state, optimizer):
         """
@@ -576,6 +579,7 @@ class SubspaceBaseModel:
 
 class CategorySubspace(SubspaceBaseModel):
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
@@ -614,6 +618,7 @@ class RegressionSubspace(SubspaceBaseModel):
         super().__init__(**kwargs)
         self.log_scale = out_dist_log_scale
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
@@ -677,6 +682,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         self.curve_mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
         return params
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
@@ -719,6 +725,7 @@ class QuantileSubspace(SubspaceBaseModel):
         loss_second = -dev * (1.0 - quantile)
         return 2 * jnp.where(loss_first >= 0, loss_first, loss_second)
 
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
@@ -800,6 +807,7 @@ class RepulsiveMixin:
     def summed_cosine_similarity_square(self, params):
         return self.summed_cosine_similarity(params) ** 2
     
+    # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, params, state, x, y):
         # Sample t param of Bezier curve
@@ -957,6 +965,7 @@ class LoRAMixin:
     def init_params(self, key, x, mask):
         raise NotImplementedError("init_params not possible for LoRA.")
     
+    # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     @partial(jit, static_argnums=(0,))
     def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
         """

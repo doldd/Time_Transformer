@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
+from tqdm import tqdm
 
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
@@ -127,15 +128,14 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
         y_last = target[matching_limit:]
         y_ = es('(ib)...->ib...', y_, b=batch_size)
 
-        def pred(key_param, data):
+        def pred(key, data):
             x_batch, atten_batch, y_batch = data
             # # turn off leading padding tokens in batch for faster evaluation
             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
             # atten_batch = atten_batch[:, max_seqlen:]
-            key, param = key_param
 
             def eval(t):
-                loss, _, out = model.nll(param, {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
+                loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
                 return loss*batch_size, acc  # sum over batch
             
@@ -143,16 +143,16 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
 
             # draw samples to approximate curve performance
             t = get_t(subkey)
-            loss, acc = jax.vmap(eval)(t)
+            loss, acc = jax.lax.map(eval, t)
 
             if average:
                 # mean over samples
-                return (key, param), (jnp.sum(loss), jnp.sum(acc))
+                return key, (jnp.sum(loss), jnp.sum(acc))
             else:
-                return (key, param), (loss, acc)  # no mean over samples
+                return key, (loss, acc)  # no mean over samples
 
         # shape (n_data, draws, output_dim)
-        rng_key, (loss, acc) = jax.lax.scan(pred, (rng_key, params['params']), (x_, att_m_, y_))
+        rng_key, (loss, acc) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_))
         # compute loss of last irregular batch
         if len(x_last) > 0:
             rng_key, (loss_last, acc_last) = pred(rng_key, (x_last, att_last, y_last))
@@ -184,7 +184,7 @@ def train(logger, config):
     """
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
-    BATCH_SIZE_EVAL = config['curve_params']['batch_size']*2
+    BATCH_SIZE_EVAL = config['curve_params']['batch_size']
     SAVE_PARAMS = config.get('save_params', False)
 
     # Create artifact for storing parameters
@@ -213,17 +213,19 @@ def train(logger, config):
         
         # Load dataset
         input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path, run=logger)
+        test_input_ids, test_attention_mask, test_labels, _, _ = load_text_classification_data(dataset_path, run=logger, test=True)
         print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
         print(f"Target token IDs: {unique_target_ids}")
         
         # Load Qwen model
-        model_artifact = logger.use_artifact(net_kwargs['model_path'], type='model')
-        net_kwargs['model_path'] = model_artifact.download()
+        if net_kwargs['model_path'].startswith('ddold/'):
+            model_artifact = logger.use_artifact(net_kwargs['model_path'], type='model')
+            net_kwargs['model_path'] = model_artifact.download()
         model = QwenTextClassificationWrapper(**net_kwargs, target_token_ids=unique_target_ids)
         params = unfreeze(model.init(None, None))
         dtype = jax.tree.leaves(params)[0].dtype
-        # Split data (simple train/val split)
-        n_train = int(np.ceil(0.8*len(input_ids) / batch_size) * batch_size)
+        # Split data (simple train/val split) # we dont use validate data
+        n_train = int(np.ceil(1.*len(input_ids) / batch_size) * batch_size)
         train_input_ids = input_ids[:n_train]
         train_attention_mask = attention_mask[:n_train]
         train_labels = labels[:n_train]
@@ -231,6 +233,10 @@ def train(logger, config):
         val_input_ids = input_ids[n_train:]
         val_attention_mask = attention_mask[n_train:]
         val_labels = labels[n_train:]
+        val = True
+        if len(val_input_ids) == 0:
+            print("No validation data are used")
+            val = False
         
         curve_mask = jax.tree.map(lambda x: False, params['params'])
         # only if k > 0, otherwise no curve parameters are used
@@ -298,7 +304,8 @@ def train(logger, config):
 
         # initialize curve parameter with pretrained point parameter
         params = s_model.init_params_from_point(init_key, params, curve_mask, jitter=jitter)
-            
+        
+
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, 1, use_linspace=True, average=True, key_prefix='init_')
         init_metrics = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
@@ -323,7 +330,9 @@ def train(logger, config):
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
             lr_schedule = getattr(optax, optimizer_conf['kwargs']['learning_rate']['name'])(
                 **optimizer_conf['kwargs']['learning_rate']['kwargs'])
-            optimizer_conf['kwargs']['learning_rate'] = lr_schedule
+        else:
+            lr_schedule = optax.constant_schedule(optimizer_conf['kwargs']['learning_rate'])
+        optimizer_conf['kwargs']['learning_rate'] = lr_schedule
         optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
         # Add gradient clipping to the optimizer using optax.chain
         opt_chain_list = []
@@ -342,14 +351,29 @@ def train(logger, config):
 
         cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
         print(f"Control points shape: {cp_w.shape}")
+        del cp_w
         # loss, params, opt_state, grad_ = s_model.train_step(
         #             random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
         # print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
 
         best_loss = np.inf
-        best_params = params
-
-        valid_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10, key_prefix='val_')
+        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
+        if val:
+            print("Put best parameters to cpu device")
+            # best_params = jax.device_get(params)  # best params on cpu to save memory
+            best_params = params  # best params on cpu to save memory
+            # best_params = jax.device_put(params, jax.devices('cpu')[0])  # best params on cpu to save memory
+            print("best parameters to cpu device")
+            valid_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10 if k > 0 else 1, key_prefix='val_')
+            def get_best_params(params):
+                # return jax.device_get(params)
+                return params
+        else:
+            best_params = None
+            valid_metrics_fn = lambda rng, params: empty_metric
+            def get_best_params(params):
+                return None
+            
 
         # Bezier curve length
         # define function to compute bezier curve length
@@ -430,6 +454,7 @@ def train(logger, config):
         # rel_center_fn = init_rel_center(cp_w)
 
         if k > 0:
+            @partial(jit, donate_argnums=(0,))
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
                 # # skip leading padding tokens in batch for faster training
@@ -440,14 +465,18 @@ def train(logger, config):
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+                current_lr = lr_schedule(opt_state[-1][-1].count)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
+
+                # metrics = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
                 # mse, val_loss = valid_metrics_fn(valid_key, params)
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params), lambda x: {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}, None)
+                    valid_key, params), lambda x: empty_metric, None)
                 best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: params, lambda x: best_params, None)
+                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
 
                 # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
@@ -461,9 +490,11 @@ def train(logger, config):
                 # cos_sim = s_model.summed_cosine_similarity(params['params'])
                 # cos_sim /= ((k+1)*k/2)
                 # grad_norm = 0.
-                grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, s_model.curve_mask, k), axis=1).mean()
-                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics, 'grad_norm': grad_norm}
+                # grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, s_model.curve_mask, k), axis=1).mean()
+                # return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics, 'grad_norm': grad_norm}
+                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, 'current_lr': current_lr, **metrics}
         else:
+            @partial(jit, donate_argnums=(0,))
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
                 # jax.debug.print("Batch idx: {}", batch_idx)
@@ -471,20 +502,20 @@ def train(logger, config):
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+                current_lr = lr_schedule(opt_state[-1][-1].count)  
+                
                 # jax.debug.print("Training loss: {}", loss)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
-                # mse, val_loss = valid_metrics_fn(valid_key, params)
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params), lambda x: {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}, None)
+                    valid_key, params), lambda x: empty_metric, None)
                 best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: params, lambda x: best_params, None)
+                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
-                # jax.debug.print("Current acc: {}", valid_metrics_fn(valid_key, params))
 
-                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics}
-
+                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, 'current_lr': current_lr, **metrics}
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -511,34 +542,39 @@ def train(logger, config):
             jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], metrics['val_loss'][-1], metrics['val_acc'][-1])
             return carry, metrics
 
-        # # print memory stats
-        # memory_stats = jax.devices()[0].memory_stats()
-        # for stats_name, v in memory_stats.items():
-        #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+        # print memory stats
+        memory_stats = jax.devices()[0].memory_stats()
+        for stats_name, v in memory_stats.items():
+            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
 
-        # # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
+        # # # # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
         # for e in tqdm(range(num_epochs)):
         #     print(f"Epoch {e+1}/{num_epochs}")
         #     rng_key, subkey = random.split(rng_key)
-        #     shuffel = jax.random.permutation(subkey, jnp.arange(y.shape[0]))
-        #     x_ = es('(ib)...->ib...', x[shuffel], b=batch_size)
-        #     y_ = es('(ib)...->ib...', y[shuffel], b=batch_size)
+        #     shuffel = jax.random.permutation(subkey, jnp.arange(train_labels.shape[0]))
+        #     x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
+        #     atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
+        #     y_ = es('(ib)...->ib...', train_labels[shuffel], b=batch_size)
 
         #     # train on batches
-        #     batch_loop = tqdm(enumerate(zip(x_, y_)), leave=False)
-        #     for b, (xb_, yb_) in batch_loop:
+        #     batch_loop = tqdm(enumerate(zip(x_,atten_mask, y_)), leave=False)
+        #     for b, (xb_, amb_, yb_) in batch_loop:
+        #         # skip leading padding tokens in batch for faster training
+        #         xb_ = xb_[:, (max_seqlen:=jnp.argmax(amb_, axis=1).min()):]
+        #         amb_ = amb_[:, max_seqlen:]
+
         #         rng_key, subkey = random.split(rng_key)
         #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
         #         loss, params, opt_state, grad_ = s_model.train_step(
-        #             subkey, params, xb_, yb_, opt_state, optimizer)
-        #         grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
+        #             subkey, params, (xb_, amb_), yb_, opt_state, optimizer)
+        #         # grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, curve_mask, k), axis=1).mean()
 
         #         batch_loop.set_postfix({"Loss": loss})
         #         logs = {
         #             'epoch': e+1, 'batch': b+1, 'stepp': e*x_.shape[0]+b+1,
         #             'train_loss': loss,
-        #             'grad_norm': grad_norm
+        #             # 'grad_mean': grad_norm
         #         }
         #         if jnp.isnan(loss):
         #             print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
@@ -546,18 +582,17 @@ def train(logger, config):
                 
         #         # validate
         #         rng_key, valid_key = random.split(rng_key)
-        #         if b % EVAL_EVERY_N_BATCH == 0:
-        #             val_loss, mse = valid_metrics_fn(valid_key, params)
-        #             logs = {**logs, 'valid_loss': val_loss, 'valid_mse': mse}
-        #             if val_loss < best_loss:
-        #                 best_params = params
-        #                 best_loss = val_loss
+        #         # if b % EVAL_EVERY_N_BATCH == 0:
+        #         #     logs =  {**logs, **valid_metrics_fn(valid_key, params)}
+        #         #     if logs['val_loss'] < best_loss:
+        #         #         best_params = jax.device_put(params, jax.devices('cpu')[0])
+        #         #         best_loss = logs['val_loss']
         #         logger.log(logs)
                 
         #     batch_loop.close()
         #     if jnp.isnan(loss):
+        #         print(f"ERROR: Stopping training at epoch {e+1} due to NaN loss.")
         #         break
-        # last_params = params  
 
         # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
 
@@ -592,70 +627,70 @@ def train(logger, config):
         art.add_file(f'tmp_files/{logger.id}_metrics.npz')
         logger.log_artifact(art)
 
-        params = carry[4]  # select best parameters
-        last_params = carry[1]
+        if val:
+            params = jax.device_put(carry[4])  # best params on cpu
+        else:
+            params = carry[1]  # last params on device
         rng_key = carry[0]
 
         if k > 0:
             # Bezier curve length        
-            cp = masked_pytree_to_matrix(best_params['params'], s_model.curve_mask, k)
-            length_best = bezier_length(cp)
-            cp = masked_pytree_to_matrix(last_params['params'], s_model.curve_mask, k)
-            length_last = bezier_length(cp)
-            logger.log({'Curve length best': length_best, 'Curve length last': length_last})
+            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            length = bezier_length(cp)
+            logger.log({'Curve length': length})
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 25)
         if smoke_test:
             t_space = jnp.linspace(0, 1, 3)
-        valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL//10, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
-        train_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL//10, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=len(t_space), use_linspace=True, average=False, rescale_fn=rescale_fn)
     
-        # # plot best params
-        # # valid
-        curve_metric = valid_metrics_fn_final(rng_key, best_params)
-        logger.log({k+'_best_mean':v.mean() for k,v in curve_metric.items()})
-        logger.log({k+'_best_max':v.max() for k,v in curve_metric.items()})
-        logger.log({k+'_best_min':v.min() for k,v in curve_metric.items()})
-        ax[0].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
-        ax2 = ax[0].twinx()
-        ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
-                 c=plt.get_cmap('tab10')(1), linestyle="--")
-        # nll, mse = valid_metrics_fn_final(rng_key, best_params)
-        # logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
-        # ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
+        # # # plot best params
+        # # # valid
+        # curve_metric = test_metrics_fn_final(rng_key, best_params)
+        # logger.log({k+'_best_mean':v.mean() for k,v in curve_metric.items()})
+        # logger.log({k+'_best_max':v.max() for k,v in curve_metric.items()})
+        # logger.log({k+'_best_min':v.min() for k,v in curve_metric.items()})
+        # ax[0].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
         # ax2 = ax[0].twinx()
-        # ax2.plot(t_space, mse, label="valid mse",
+        # ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
         #          c=plt.get_cmap('tab10')(1), linestyle="--")
-        # # train
-        # nll, mse = train_metrics_fn_final(rng_key, best_params)
-        # ax[0].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
-        # ax2.plot(t_space, mse, label="train mse",
-        #          c=plt.get_cmap('tab10')(0), linestyle="--")
-        # # test
-        # nll, mse = test_metrics_fn_final(rng_key, best_params)
-        # logger.log({'mse_test_curve': mse.mean(), 'nll_test_curve': nll.mean(), 'mse_test_curve_min': mse.min(), 'nll_test_curve_min': nll.min()})
-        # ax[0].plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
-        # ax2.plot(t_space, mse, label="test mse",
-        #          c=plt.get_cmap('tab10')(2), linestyle="--")
-        # ax[0].set_xlabel("t")
-        # ax[0].set_ylabel("mean log likelihood")
-        # ax[0].set_title("Best params")
+        # # nll, mse = valid_metrics_fn_final(rng_key, best_params)
+        # # logger.log({'mse_val_curve': mse.mean(), 'nll_val_curve': nll.mean(), 'mse_val_curve_min': mse.min(), 'nll_val_curve_min': nll.min()})
+        # # ax[0].plot(t_space, -nll, label="valid ll", c=plt.get_cmap('tab10')(1))
+        # # ax2 = ax[0].twinx()
+        # # ax2.plot(t_space, mse, label="valid mse",
+        # #          c=plt.get_cmap('tab10')(1), linestyle="--")
+        # # # train
+        # # nll, mse = train_metrics_fn_final(rng_key, best_params)
+        # # ax[0].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
+        # # ax2.plot(t_space, mse, label="train mse",
+        # #          c=plt.get_cmap('tab10')(0), linestyle="--")
+        # # # test
+        # # nll, mse = test_metrics_fn_final(rng_key, best_params)
+        # # logger.log({'mse_test_curve': mse.mean(), 'nll_test_curve': nll.mean(), 'mse_test_curve_min': mse.min(), 'nll_test_curve_min': nll.min()})
+        # # ax[0].plot(t_space, -nll, label="test", c=plt.get_cmap('tab10')(2))
+        # # ax2.plot(t_space, mse, label="test mse",
+        # #          c=plt.get_cmap('tab10')(2), linestyle="--")
+        # # ax[0].set_xlabel("t")
+        # # ax[0].set_ylabel("mean log likelihood")
+        # # ax[0].set_title("Best params")
         
         # plot last params
         # valid
-        curve_metric = valid_metrics_fn_final(rng_key, last_params)
-        logger.log({k+'_last_mean':v.mean() for k,v in curve_metric.items()})
-        logger.log({k+'_last_max':v.max() for k,v in curve_metric.items()})
-        logger.log({k+'_last_min':v.min() for k,v in curve_metric.items()})
-        ax[1].plot(t_space, -curve_metric['final_loss'], label="valid_ll", c=plt.get_cmap('tab10')(1))
+        curve_metric = test_metrics_fn_final(rng_key, params)
+        logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
+        logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
+        logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
+        ax[1].plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(1))
         ax2 = ax[1].twinx()
-        ax2.plot(t_space, curve_metric['final_acc'], label="valid acc",
+        ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         # # train
-        # nll, mse = train_metrics_fn_final(rng_key, last_params)
+        # nll, mse = train_metrics_fn_final(rng_key, params)
         # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
         # ax2.plot(t_space, mse, label="train mse",
         #          c=plt.get_cmap('tab10')(0), linestyle="--")
@@ -682,7 +717,7 @@ def train(logger, config):
         # functional_diff = {"Sample Std best":out.std(axis=0).mean()}  # std over samples
         
         # # with last params
-        # out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(last_params['params'], {}, t_space, x_val[:2], False)
+        # out, _ = jax.vmap(s_model, in_axes=(None,None,0,None,None))(params['params'], {}, t_space, x_val[:2], False)
         # out = out[0][:, 0]  # shape (n_samples, n_data)
         # ax[1].plot(x, y, 'o', label='train')
         # # plt.fill_between(x.squeeze(), out.mean(axis=0) - out.std(axis=0), out.mean(axis=0) + out.std(axis=0), alpha=0.5)
@@ -704,8 +739,8 @@ def train(logger, config):
         ax[1].set_xlabel("t")
         ax[1].set_ylabel("mean log likelihood")
         ax2.set_ylabel("Accuracy")
-        ax[0].set_title("Best params (validation)")
-        ax[1].set_title("Last params (validation)")
+        # ax[0].set_title("Best params (validation)")
+        ax[1].set_title("Final testset")
         # combine legends from primary and twin axes
         lines, labels = ax[1].get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
@@ -717,19 +752,19 @@ def train(logger, config):
         #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})
 
 
-        return rng_key, params, model, last_params
+        return rng_key, best_params, model, params
 
-    rng_key, params, model, last_params = train_curve_inner(
+    rng_key, best_params, model, params = train_curve_inner(
         rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
         lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
         smoke_test=config.get('smoke_test', False))
 
     if SAVE_PARAMS:
         print("Save artifacts")
-        jnp.save(f'tmp_files/{logger.id}_params.npy', params)
-        jnp.save(f'tmp_files/{logger.id}_last_params.npy', last_params)
+        jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
+        jnp.save(f'tmp_files/{logger.id}_last_params.npy', params)
         print("add files to artifact")
-        artifact.add_file(f'tmp_files/{logger.id}_params.npy')
+        artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
         artifact.add_file(f'tmp_files/{logger.id}_last_params.npy')
         print("Log artifact")
         logger.log_artifact(artifact)
@@ -754,15 +789,18 @@ if __name__ == '__main__':
         print("Single model training")
         
         # Apply smoke test settings if enabled
-        num_epochs = 2 if args.smoke_test else 10  # Keep original value of 2
+        num_epochs = 2 if args.smoke_test else 5  # Keep original value of 2
         
         config = {
             'rng_seed': 5,
             'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             'save_params': False,
-            'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0",},
-            'eval_every_n_batch': 10,
+            'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
+            'eval_every_n_batch': 20,
             'smoke_test': args.smoke_test,
+            'lora_params': {'use_lora': True, 'r': 8, 
+                            'filter_masks': 
+                                [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
             'curve_params': {'k': 0,
                             'num_epochs': num_epochs,
                             'batch_size': args.batch_size,
@@ -772,8 +810,7 @@ if __name__ == '__main__':
                             'regularizer': False,
                             'weight_decay': 0.,
                             'jitter': 1e-2,
-                            'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
-                                             {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],  # use lora for query projection
+                            'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                 'optimizer_conf': {'name': "sgd", 
@@ -804,13 +841,14 @@ if __name__ == '__main__':
                 'rng_seed': 5,
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
                 'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
-                'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0",},
-                'eval_every_n_batch': 50,
+                # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
+                'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
+                'eval_every_n_batch': 20,
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'filter_masks': 
                                     [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
-                'curve_params': {'k': 2,
+                'curve_params': {'k': 1,
                                 'num_epochs': num_epochs,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
@@ -819,8 +857,9 @@ if __name__ == '__main__':
                                 'regularizer': False,
                                 'weight_decay': 0.,
                                 'jitter': 1e-2,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
-                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
-                                                {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
+                                # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
+                                #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
+                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
                                 'optimizer_conf': {'name': "sgd", 

@@ -205,7 +205,7 @@ def train(logger, config):
                          lora_params: dict = None,
                          net_kwargs: dict = None,
                          weight_decay: float = 0.0,
-                         jitter: float = 0.0,
+                         jitter_multiplier: float = 0.0,
                          smoke_test: bool = False,
                          num_steps: int = -1,
                          ):
@@ -310,7 +310,7 @@ def train(logger, config):
 
 
         # initialize curve parameter with pretrained point parameter
-        params = s_model.init_params_from_point(init_key, params, curve_mask, jitter=jitter)
+        params = s_model.init_params_from_point(init_key, params, curve_mask, jitter=jitter_multiplier)
         
 
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, 1, use_linspace=True, average=True, key_prefix='init_')
@@ -818,7 +818,7 @@ if __name__ == '__main__':
                             'energy_weakening': 1., 
                             'regularizer': False,
                             'weight_decay': 0.,
-                            'jitter': 1e-2,
+                            'jitter_multiplier': 1.,
                             'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
@@ -865,7 +865,7 @@ if __name__ == '__main__':
                                 'energy_weakening': 1., 
                                 'regularizer': False,
                                 'weight_decay': 0.,
-                                'jitter': 1e-2,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
+                                'jitter_multiplier': 1.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                                 # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                                 #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
                                 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],

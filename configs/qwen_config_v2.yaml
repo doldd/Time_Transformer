@@ -26,10 +26,14 @@ parameters:
         value: True
       r:
         value: 8
+      lora_dtype:
+        # value: ["original", "float16", "bfloat16", "float32"]
+        value: ["float32"]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [0, 1]}, 
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [0, 1]}]          
+             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [0, 1]},
+             {keys: ["lm_head", "kernel"], op: "all", dims: [0, 1]}]
           # - [{keys: ["value", "w"], op: "all", dims: [0, 2]},]          
           # - [{keys: ["value", "w"], op: "all", dims: [2, 0]},]          
           # - [{keys: ["value", "w"], op: "all", dims: [0, 2]}, {keys: ["query", "w"], op: "all", dims: [0, 2]}]          
@@ -50,7 +54,7 @@ parameters:
       weight_decay:
         value: 0.0
       jitter:
-        value: 1e-2
+        value: 0.0236 # np.sqrt(2/3584) np.sqrt(2./fan_in, dtype=np.float32) fan_in= 3584 for q_proj
       num_epochs:
         value: -1
       num_steps:
@@ -62,7 +66,8 @@ parameters:
           # - [{keys: ["input_ff_layer", "horizon_ff_layer"], op: "any"},]
           # - [{keys: ["horizon_ff_layer",], op: "all"},]
           - [{keys: ["self_attn", "q_proj"], op: "all"},
-             {keys: ["self_attn", "v_proj"], op: "all"}]
+             {keys: ["self_attn", "v_proj"], op: "all"},
+             {keys: ["lm_head",], op: "all"}]
           # - [{keys: ["self_attn", "q_proj"], op: "all"}]
           # - [{keys: ["value"], op: "all"},]
           # - [{keys: ["query"], op: "all"}, {keys: ["value"], op: "all"}]

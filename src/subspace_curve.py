@@ -325,7 +325,7 @@ class SubspaceBaseModel:
             key: A JAX PRNGKey used for random number generation.
             point (dict): A dictionary containing at least a 'params' key with the base parameters to initialize from.
             mask: A tree-like structure of booleans indicating which parameters should be handled by the curve.
-            jitter (float): The standard deviation of the Gaussian noise to add to the parameters.
+            jitter (float): The standard deviation multiplier of the Gaussian noise to add to the parameters.
         Returns:
             dict: A copy of the input `point` dictionary, with the 'params' key replaced by the initialized curve parameters.
         Notes:
@@ -340,7 +340,8 @@ class SubspaceBaseModel:
         # param, struct = jax.tree.flatten(curve_params)
         # keys = random.split(key, len(param))
         def apply_noise(p, key, jitter):
-            return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)
+            # Flax kernel has shape [inC, outC]. Scale noise with sqrt(2/fan_in)
+            return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)*jnp.sqrt(jnp.array(2/p.shape[0], dtype=p.dtype))
         # noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
         # curve_params = jax.tree.unflatten(struct, noise_params)
         
@@ -860,19 +861,38 @@ class LoRAParams:
         w = jnp.matmul(self.B, self.A)  # Apply LoRA transformation
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
         scale = self.B.shape[-1]  # Rank of the LoRA transformation
-        return w / scale + self.w0  # Add the original parameter w0
+        return (w / scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
 
 class LoRAMixin:
     """
     Mixin class for LoRA (Low-Rank Adaptation) functionality.
     This class provides methods to convert a pytree of parameters into a matrix and vice versa.
+    Parameters:
+    - r (int): The rank for the LoRA adaptation.
+    - lora_mask (dict): A mask indicating which parameters should be adapted using LoRA.
+    - lora_dtype (str): The data type for LoRA parameters. Options are "original", "float16", "bfloat16", "float32".
+    - kwargs: Additional keyword arguments for the parent class.
     """
 
-    def __init__(self, r, lora_mask, **kwargs):
+    def __init__(self, r, lora_mask, lora_dtype:str, **kwargs):
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
         self.w0_params = None  # Placeholder for non-LoRA parameters
+        self.lora_dtype = lora_dtype
+    
+    def get_dtype(self, param):
+        if self.lora_dtype == "original":
+            return param.dtype
+        else:
+            if self.lora_dtype == "float16":
+                return jnp.float16
+            elif self.lora_dtype == "bfloat16":
+                return jnp.bfloat16
+            elif self.lora_dtype == "float32":
+                return jnp.float32
+            else:
+                raise ValueError(f"Unknown lora_dtype: {self.lora_dtype}")
 
     @staticmethod
     def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True):
@@ -935,14 +955,15 @@ class LoRAMixin:
                 if (type(m) != bool):
                     assert p.ndim > 1, f"Param {param_name} cannot be used for LoRA. Too few dimensions for parameter with shape {p.shape}"
                     assert p.ndim > np.max(m), f"Mask {m} incompatible with param {param_name} and shape {p.shape}"
-                    B = jnp.zeros(shape_builder(p.shape, m[1]), dtype=p.dtype)
+                    dtype = self.get_dtype(p)
+                    B = jnp.zeros(shape_builder(p.shape, m[1]), dtype=dtype)
                     B = jnp.moveaxis(B, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
                     
                     # Initialize A matrix with He normal initialization
                     rng_key, subkey = random.split(rng_key)
                     init_a = jax.nn.initializers.he_normal(out_axis=m[1].item()) # fan_in are all other dimensions except the m[1] (last dim is output of nn.Dense)
                     shape_ = shape_builder(p.shape, m[0])
-                    A = init_a(subkey, shape_, dtype=p.dtype)
+                    A = init_a(subkey, shape_, dtype=dtype)
                     # shape_[m[1]] = 0
                     # gain = jnp.sqrt(6 / np.prod(shape_))  # Gain for initialization
                     # A = jax.random.uniform(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)

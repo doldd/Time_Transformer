@@ -280,7 +280,7 @@ def train(logger, config):
             print("Using LoRA with parameters:", lora_params)
             if regularizer:
                 print("Using LoRARepulsiveCategorySubspace with regularizer")
-                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'],
+                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'],
                                                         model=model, k=k, weight_decay=weight_decay,
                                                         perm_spec=perm_spec,
                                                         natural_parameterization=natural_parameterization,
@@ -288,7 +288,7 @@ def train(logger, config):
                                                         gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using QuantileSubspace without repulsive force")
-                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'],
+                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'],
                                             model=model, k=k, weight_decay=weight_decay, 
                                             perm_spec=perm_spec,
                                             natural_parameterization=natural_parameterization,

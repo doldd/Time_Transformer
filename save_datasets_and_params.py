@@ -568,7 +568,7 @@ def main():
                 dataset_name=config['name'],
                 model_name="Qwen/Qwen2.5-0.5B",
                 max_seq_len=config['max_seq_len'],
-                batch_size=100,
+                batch_size=4,
                 output_dir=args.dataset_output_dir,
                 save_wandb_artifact=args.upload_to_wandb,
                 wandb_project=args.wandb_project

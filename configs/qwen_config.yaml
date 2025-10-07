@@ -12,7 +12,7 @@ parameters:
   net_kwargs:
     parameters:
       model_path:
-        value: "ddold/qwen_PtoC/qwen2.5_0.5B_float16:v0"
+        value: "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0"
   eval_every_n_batch:
     value: 25
   lora_params:
@@ -33,7 +33,7 @@ parameters:
       k:
         values: [0,2]
       batch_size:
-        values: [16, 32, 64]
+        values: [16, 64]
       natural_parameterization:
         value: False
       gravity:
@@ -44,14 +44,10 @@ parameters:
         value: False
       weight_decay:
         value: 0.0
-      remove_initial_permutation:
-        value: False
       jitter:
         value: 1e-2
       num_epochs:
-        value: 10
-      pretrained:
-        value: True
+        value: 50
 
       filter_masks:
         values: 

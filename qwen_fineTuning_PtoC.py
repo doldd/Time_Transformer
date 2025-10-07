@@ -326,8 +326,9 @@ def train(logger, config):
 
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
-        logger.summary.update({'n_params': n_params})
-        print(f"Number of parameters: {n_params:_}")
+        param_memory = sum(p.size*p.dtype.itemsize for p in jax.tree.flatten(params)[0])
+        logger.summary.update({'n_params': n_params, 'memory_params': param_memory})
+        print(f"Number of parameters: {n_params:_}\nMemory of parameters: {param_memory/(1024**2):_}MB")
 
         if SAVE_PARAMS:
             jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)

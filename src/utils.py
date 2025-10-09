@@ -4,10 +4,10 @@ from scipy.integrate import quad
 from scipy.special import binom
 import matplotlib.pyplot as plt
 from jax import numpy as jnp
-from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
-from src.subspace_curve import OrthoSpan, pytree_to_matrix
 import jax
-import arviz as az
+# from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
+# from src.subspace_curve import OrthoSpan, pytree_to_matrix
+# import arviz as az
 
 __all__ = ['bezier_length', 'lower_bound', 'upper_bound',
            'plot_subspace', 'get_cp_w', 'get_data']
@@ -240,6 +240,7 @@ def get_data(run, from_path_optim_sweep=True, get_file_name=lambda c: f"{c['rng_
 
 
 def get_samples_from_run(run):
+    import arviz as az
     for art in run.logged_artifacts():
         if art.type == "xarray":
             file = art.get_entry(f"{run.id}_samples.nc").download(
@@ -249,6 +250,9 @@ def get_samples_from_run(run):
 
 
 def get_model_from_run_path(run, from_path_optim_sweep=False):
+    from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
+    from src.subspace_curve import OrthoSpan, pytree_to_matrix
+
     config = run.config
     k = config['curve_params']['k']
     if (config['dataset'] == 'generate') or (config['dataset'] == 'default'):
@@ -315,3 +319,30 @@ def get_params_from_run(run, file_name_without_id="params.npy"):
                 root="./art_tmp")
             params_loaded = jnp.load(file, allow_pickle=True).item()
             return params_loaded
+
+
+def calibration_error(logits, labels, num_bins):
+    probs = jax.nn.softmax(logits, axis=-1)
+    confidences = jnp.max(probs, axis=-1)
+    predictions = jnp.argmax(probs, axis=-1)
+    accuracies = (predictions == labels).astype(jnp.float32)
+
+    bin_boundaries = jnp.linspace(0, 1, num_bins + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
+
+    def body_fun(ece, bins):
+        bin_lower, bin_upper = bins
+        # get mask for samples with confidence in (bin_lower, bin_upper]
+        in_bin = jnp.logical_and(confidences > bin_lower, confidences <= bin_upper)
+
+        prop_in_bin = jnp.mean(in_bin.astype(jnp.float32))
+        # same as jnp.mean(accuracies[in_bin]) but jit friendly
+        accuracy_in_bin = jnp.where(prop_in_bin > 0, jnp.sum(jnp.where(in_bin == True, accuracies, 0.0))/jnp.sum(in_bin), 0.0)
+        # same as jnp.mean(confidences[in_bin]) but jit friendly
+        avg_confidence_in_bin = jnp.where(prop_in_bin > 0, jnp.sum(jnp.where(in_bin == True, confidences, 0.0))/jnp.sum(in_bin), 0.0)
+        ece += jnp.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+        return ece, None
+
+    ece, _ = jax.lax.scan(body_fun, 0.0, (bin_lowers, bin_uppers))
+    return ece

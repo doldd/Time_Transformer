@@ -18,6 +18,7 @@ from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
 from tqdm import tqdm
+from src.utils import calibration_error as ece_fn
 
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
@@ -109,12 +110,12 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
 
-def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix=''):
+def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15):
     if use_linspace:
         get_t = lambda key: jnp.linspace(0, 1., n_samples)
     else:
         get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
-
+    
     def acc_fn(rng_key, params):
         x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
         x_last = x[matching_limit:]
@@ -124,9 +125,9 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
         att_last = attention_mask[matching_limit:]
         att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
 
-        y_ = target[:matching_limit]  # drop non matching batch size
+        y_all = target[:matching_limit]  # drop non matching batch size
         y_last = target[matching_limit:]
-        y_ = es('(ib)...->ib...', y_, b=batch_size)
+        y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
         def pred(key, data):
             x_batch, atten_batch, y_batch = data
@@ -134,37 +135,48 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
             # atten_batch = atten_batch[:, max_seqlen:]
 
+            # @jax.jit
             def eval(t):
                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-                return loss*batch_size, acc  # sum over batch
+                return loss*batch_size, acc, out  # sum over batch
+                # return loss*batch_size, acc  # sum over batch
             
             key, subkey = random.split(key)
 
             # draw samples to approximate curve performance
             t = get_t(subkey)
-            loss, acc = jax.lax.map(eval, t)
+            loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
+            # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
 
             if average:
                 # mean over samples
-                return key, (jnp.sum(loss), jnp.sum(acc))
+                return key, (jnp.sum(loss), jnp.sum(acc), out)
             else:
-                return key, (loss, acc)  # no mean over samples
+                return key, (loss, acc, out)  # no mean over samples
 
         # shape (n_data, draws, output_dim)
-        rng_key, (loss, acc) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_))
+        rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
         # compute loss of last irregular batch
         if len(x_last) > 0:
-            rng_key, (loss_last, acc_last) = pred(rng_key, (x_last, att_last, y_last))
+            rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
+            out = jnp.concatenate([out, out_last[jnp.newaxis, ...]], axis=0)
+
+        # # compute the expected calibration error (ECE)
+        out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
+        ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, y_all, num_bins_ece)  # mean over samples
+
         if average:
+            ece = jnp.mean(ece)
             loss = loss.sum() / (n_samples * x.shape[0])
             acc = acc.sum() / (n_samples * x.shape[0])
         else:
             loss = jnp.sum(loss, axis=0) / x.shape[0]
             acc = jnp.sum(acc, axis=0) / x.shape[0]
-        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc}  # mean over epochs
+
+        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}  # mean over epochs
     return acc_fn
 
 
@@ -311,18 +323,17 @@ def train(logger, config):
 
         # initialize curve parameter with pretrained point parameter
         params = s_model.init_params_from_point(init_key, params, curve_mask, jitter=jitter_multiplier)
-        
-
-        init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, 1, use_linspace=True, average=True, key_prefix='init_')
-        init_metrics = init_metrics_fn(init_key, params) # returns a dict
-        logger.summary.update(init_metrics)
-        jax.debug.print("Initial metrics: {}", init_metrics)
 
         # set train mask according to config
         # Only update mask for LoRA-capable subspaces
         if lora_params and lora_params['use_lora']:
             train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA
         s_model.set_train_mask(train_mask)
+
+        init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
+        init_metrics = init_metrics_fn(init_key, params) # returns a dict
+        logger.summary.update(init_metrics)
+        jax.debug.print("Initial metrics: {}", init_metrics)
 
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
@@ -546,6 +557,7 @@ def train(logger, config):
             # train on batches
             carry, metrics = jax.lax.scan(
                 train_batch, carry, (x_, x_atten_mask, y_, jnp.arange(x_.shape[0])))
+            jax.clear_caches()
             # jax.debug.print(f"Epoch {epoch+1}/{num_epochs}, Loss: {metrics['loss'][-1].item()}{metrics['loss'].shape}, Val Loss: {metrics['val_loss'][-1]}, Val Acc: {metrics['val_acc'][-1]}")
             jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], metrics['val_loss'][-1], metrics['val_acc'][-1])
             return carry, metrics
@@ -697,6 +709,13 @@ def train(logger, config):
         ax2 = ax[1].twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
+        
+        ax3 = ax[1].twinx()
+        ax3.spines["right"].set_position(("outward", 60))
+        ax3.set_frame_on(True)
+        ax3.patch.set_visible(False)
+        ax3.plot(t_space, curve_metric['final_ece'], label="test ece",
+                 c=plt.get_cmap('tab10')(1), linestyle=":")
         # # train
         # nll, mse = train_metrics_fn_final(rng_key, params)
         # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))
@@ -747,12 +766,14 @@ def train(logger, config):
         ax[1].set_xlabel("t")
         ax[1].set_ylabel("mean log likelihood")
         ax2.set_ylabel("Accuracy")
+        ax3.set_ylabel("ECE")
         # ax[0].set_title("Best params (validation)")
         ax[1].set_title("Final testset")
         # combine legends from primary and twin axes
         lines, labels = ax[1].get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax[1].legend(lines + lines2, labels + labels2, loc='best', fontsize='small')
+        lines3, labels3 = ax3.get_legend_handles_labels()
+        ax[1].legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best', fontsize='small')
         logger.log(
             {'Curve Predictive': wandb.Image(fig)})
         # plt.tight_layout()
@@ -807,12 +828,15 @@ if __name__ == '__main__':
             'eval_every_n_batch': 20,
             'smoke_test': args.smoke_test,
             'lora_params': {'use_lora': True, 'r': 8, 
+                            'lora_dtype': 'float32',
                             'filter_masks': 
-                                [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
+                                [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                 {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
             'curve_params': {'k': 0,
                             # 'num_epochs': num_epochs,
                             'num_epochs': -1,
-                            'num_steps': 10,
+                            'num_steps': 5000,
                             'batch_size': args.batch_size,
                             'natural_parameterization': False,
                             'gravity': 0.0,
@@ -856,10 +880,15 @@ if __name__ == '__main__':
                 'eval_every_n_batch': 20,
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
+                                'lora_dtype': 'float32',
                                 'filter_masks': 
-                                    [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
-                'curve_params': {'k': 1,
-                                'num_epochs': num_epochs,
+                                    [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                     {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                     {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                    ]},  # use lora for query projection
+                'curve_params': {'k': 2,
+                                'num_epochs': -1,
+                                'num_steps': 100 if args.smoke_test else 5000,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,
@@ -869,18 +898,27 @@ if __name__ == '__main__':
                                 'jitter_multiplier': 1.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                                 # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                                 #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
-                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],
+                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
+                                                {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'},
+                                                {'keys': ("lm_head", "kernel"), 'op': 'all'},
+                                                ],
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                'optimizer_conf': {'name': "sgd", 
-                                                    'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
-                                                    'grad_clip_norm': 100.0,
-                                                    'freeze_other_params': True},
+                                # 'optimizer_conf': {'name': "sgd", 
+                                #                     'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
+                                #                     'grad_clip_norm': 100.0,
+                                # #                     'freeze_other_params': True},
                                 # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                                # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
-                                                                                # 'momentum': 0.9, 
-                                                                                # 'nesterov': True},},
+                                #                                                                 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
+                                #                                                 'momentum': 0.9, 
+                                #                                                 'nesterov': True},},
+                                'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                                                                                                'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                                                                                'weight_decay': 0.01,
+                                                                               },
+                                                                     'freeze_other_params': True,
+                                                  },
                             }}
-            logger = wandb.init(project="qwen_PtoC", name="test_qwen_curve", entity="ddold", config=config)
+            logger = wandb.init(project="qwen_PtoC", name="test_qwen_curve_j1._01", entity="ddold", config=config)
             train(logger, config)
 

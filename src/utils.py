@@ -17,9 +17,10 @@ __all__ = ['bezier_length', 'lower_bound', 'upper_bound',
 tex_fonts = {
     # Use LaTeX to write all text
     # for the align enivironment
-    "text.latex.preamble": r"\usepackage[T1]{fontenc}\usepackage{amsfonts}\usepackage{amsmath}\usepackage{amssymb}",
-    "text.usetex": True,  # use inline math for ticks
-    "font.family": "serif",
+    #"text.latex.preamble": r"\usepackage[T1]{fontenc}\usepackage{amsfonts}\usepackage{amsmath}\usepackage{amssymb}",
+    #"text.usetex": True,  # use inline math for ticks
+    #"font.family": "serif",
+    "text.usetex": False,  # use inline math for ticks
     "pgf.rcfonts": False,  # don't setup fonts from rc parameters
     "savefig.transparent": True,
     # Use 10pt font in plots, to match 10pt font in document

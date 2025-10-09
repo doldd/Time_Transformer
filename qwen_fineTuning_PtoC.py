@@ -131,9 +131,9 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
 
         def pred(key, data):
             x_batch, atten_batch, y_batch = data
-            # turn off leading padding tokens in batch for faster evaluation
-            x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-            atten_batch = atten_batch[:, max_seqlen:]
+            # # turn off leading padding tokens in batch for faster evaluation
+            # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
+            # atten_batch = atten_batch[:, max_seqlen:]
 
             # @jax.jit
             def eval(t):
@@ -477,8 +477,8 @@ def train(logger, config):
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
                 # # skip leading padding tokens in batch for faster training
-                x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-                atten_batch = atten_batch[:, max_seqlen:]
+                # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
+                # atten_batch = atten_batch[:, max_seqlen:]
 
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
@@ -516,10 +516,6 @@ def train(logger, config):
             @partial(jit, donate_argnums=(0,))
             def train_batch(carry, batch):
                 x_batch, atten_batch, y_, batch_idx = batch
-                # # skip leading padding tokens in batch for faster training
-                x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-                atten_batch = atten_batch[:, max_seqlen:]
-
                 # jax.debug.print("Batch idx: {}", batch_idx)
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)

@@ -14,6 +14,7 @@ from flax import traverse_util
 from copy import deepcopy
 from flax.core import freeze, unfreeze
 from jax.tree_util import register_pytree_node_class
+import math
 
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
@@ -962,6 +963,10 @@ class LoRAMixin:
                     # Initialize A matrix with He normal initialization
                     rng_key, subkey = random.split(rng_key)
                     init_a = jax.nn.initializers.he_normal(out_axis=m[1].item()) # fan_in are all other dimensions except the m[1] (last dim is output of nn.Dense)
+                    # from PEFT
+                    #     nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                    gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
+                    init_a = jax.nn.initializers.variance_scaling(out_axis=m[1].item(), distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
                     shape_ = shape_builder(p.shape, m[0])
                     A = init_a(subkey, shape_, dtype=dtype)
                     # shape_[m[1]] = 0

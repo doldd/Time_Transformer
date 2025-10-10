@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "${file}",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "2",
+                "CUDA_VISIBLE_DEVICES": "3",
                 "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
             },
             "console": "integratedTerminal",

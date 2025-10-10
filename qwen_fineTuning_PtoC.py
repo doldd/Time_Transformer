@@ -292,7 +292,7 @@ def train(logger, config):
             print("Using LoRA with parameters:", lora_params)
             if regularizer:
                 print("Using LoRARepulsiveCategorySubspace with regularizer")
-                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'],
+                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'],
                                                         model=model, k=k, weight_decay=weight_decay,
                                                         perm_spec=perm_spec,
                                                         natural_parameterization=natural_parameterization,
@@ -300,11 +300,11 @@ def train(logger, config):
                                                         gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using QuantileSubspace without repulsive force")
-                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'],
-                                            model=model, k=k, weight_decay=weight_decay, 
-                                            perm_spec=perm_spec,
-                                            natural_parameterization=natural_parameterization,
-                                            mutuable_param_name=False)
+                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'],
+                                               model=model, k=k, weight_decay=weight_decay, 
+                                               perm_spec=perm_spec,
+                                               natural_parameterization=natural_parameterization,
+                                               mutuable_param_name=False)
         else:
             if regularizer:
                 print("Using RepulsiveCategorySubspace with regularizer")
@@ -662,7 +662,7 @@ def train(logger, config):
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 25)
-        if smoke_test:
+        if smoke_test or k == 0:
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
@@ -829,6 +829,7 @@ if __name__ == '__main__':
             'smoke_test': args.smoke_test,
             'lora_params': {'use_lora': True, 'r': 8, 
                             'lora_dtype': 'float32',
+                            'lora_alpha': 16.0,
                             'filter_masks': 
                                 [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
                                  {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
@@ -881,6 +882,7 @@ if __name__ == '__main__':
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
+                                'lora_alpha': 16.0,
                                 'filter_masks': 
                                     [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
                                      {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},

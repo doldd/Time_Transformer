@@ -598,11 +598,9 @@ class CategorySubspace(SubspaceBaseModel):
         """
         out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
 
-        nll = jnp.mean(
-            optax.losses.softmax_cross_entropy_with_integer_labels(
+        nll = optax.losses.softmax_cross_entropy_with_integer_labels(
                 logits=out, labels=y)
-        )
-        return nll, state, out
+        return jnp.mean(nll), state, out
     
 class RegressionSubspace(SubspaceBaseModel):
     def __init__(self, out_dist_log_scale=jnp.log(1.0), **kwargs):
@@ -832,11 +830,12 @@ class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
 
 @register_pytree_node_class
 class LoRAParams:
-    def __init__(self, A, B, w0, dims: tuple):
+    def __init__(self, A, B, w0, dims: tuple, lora_alpha: float):
         self.A = A
         self.B = B
         self.w0 = w0
         self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes (First axis is for B second for A)
+        self.lora_alpha = lora_alpha  # Scaling factor for LoRA, can be adjusted as needed
 
     @property
     def shape(self):
@@ -844,24 +843,24 @@ class LoRAParams:
 
     def __repr__(self):
         # return f"LoRAParams(A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape})"
-        return f"LoRAParams(A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims})"
+        return f"LoRAParams(A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
     
     def tree_flatten(self):
         children = (self.A, self.B, self.w0)
-        aux_data = self.dims
+        aux_data = (self.dims, self.lora_alpha)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         A, B, w0 = children
-        return cls(A, B, w0, aux_data)
-    
+        return cls(A, B, w0, *aux_data)
+
     def apply(self):
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         w = jnp.matmul(self.B, self.A)  # Apply LoRA transformation
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
-        scale = self.B.shape[-1]  # Rank of the LoRA transformation
-        return (w / scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+        scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
+        return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
 
 class LoRAMixin:
     """
@@ -874,12 +873,13 @@ class LoRAMixin:
     - kwargs: Additional keyword arguments for the parent class.
     """
 
-    def __init__(self, r, lora_mask, lora_dtype:str, **kwargs):
+    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, **kwargs):
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
         self.w0_params = None  # Placeholder for non-LoRA parameters
         self.lora_dtype = lora_dtype
+        self.lora_alpha = lora_alpha
     
     def get_dtype(self, param):
         if self.lora_dtype == "original":
@@ -968,7 +968,7 @@ class LoRAMixin:
                     # gain = jnp.sqrt(6 / np.prod(shape_))  # Gain for initialization
                     # A = jax.random.uniform(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)
                     A = jnp.moveaxis(A, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
-                    lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m)))  # Store A and B as a tuple
+                    lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A and B as a tuple
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
                 else:
                     lora_params.append(p)

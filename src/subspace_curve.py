@@ -319,7 +319,7 @@ class SubspaceBaseModel:
         self.curve_mask = mask
         return mask
     
-    def init_params_from_point(self, key, point, mask, jitter):
+    def init_params_from_point(self, key, point, mask, noise_fn):
         """
         Initializes curve parameters from a given parameter point, optionally adding noise and handling permutation invariance.
         Args:
@@ -340,9 +340,9 @@ class SubspaceBaseModel:
         # # add noise to the parameters
         # param, struct = jax.tree.flatten(curve_params)
         # keys = random.split(key, len(param))
-        def apply_noise(p, key, jitter):
-            # Flax kernel has shape [inC, outC]. Scale noise with sqrt(2/fan_in)
-            return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)*jnp.sqrt(jnp.array(2/p.shape[0], dtype=p.dtype))
+        # def apply_noise(p, key, jitter):
+        #     # Flax kernel has shape [inC, outC]. Scale noise with sqrt(2/fan_in)
+        #     return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)*jnp.sqrt(jnp.array(2/p.shape[0], dtype=p.dtype))
         # noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
         # curve_params = jax.tree.unflatten(struct, noise_params)
         
@@ -360,7 +360,7 @@ class SubspaceBaseModel:
         def make_curve(m, p, key):
             if m:
                 curve_param = jnp.stack([p] * (self.k + 1))
-                curve_param = apply_noise(curve_param, key, jitter)
+                curve_param = noise_fn(curve_param, key)
                 return curve_param
             else:
                 return p
@@ -656,10 +656,10 @@ class DistRegressionSubspace(SubspaceBaseModel):
         super().__init__(**kwargs)
         self.init_log_scale = jnp.array(init_outDist_log_scale, dtype=jnp.float32)
 
-    def init_params_from_point(self, key, point, mask, jitter):
+    def init_params_from_point(self, key, point, mask, noise_fn):
         raise ValueError("need some adjustements for lora, train and curve mask.")
         mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
-        return super().init_params_from_point(key, point, mask, jitter)
+        return super().init_params_from_point(key, point, mask, noise_fn)
 
     def init_params(self, key, x, mask):
         """
@@ -913,7 +913,7 @@ class LoRAMixin:
         mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoRAParams))
         return mask
     
-    def init_params_from_point(self, key, point, mask, jitter):
+    def init_params_from_point(self, key, point, mask, noise_fn):
         """Initialize parameters from a point in the latent space.
 
         Args:
@@ -990,7 +990,7 @@ class LoRAMixin:
         mask = self.update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True)
         
         # initialize curve parameters according mask
-        return super().init_params_from_point(key, {'params': lora_params}, mask, jitter)
+        return super().init_params_from_point(key, {'params': lora_params}, mask, noise_fn)
     
     def init_params(self, key, x, mask):
         raise NotImplementedError("init_params not possible for LoRA.")

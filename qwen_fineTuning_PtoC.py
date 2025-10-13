@@ -322,7 +322,7 @@ def train(logger, config):
 
 
         # initialize curve parameter with pretrained point parameter
-        params = s_model.init_params_from_point(init_key, params, curve_mask, jitter=jitter_multiplier)
+        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*jax.random.normal(key, p.shape, dtype=p.dtype))
 
         # set train mask according to config
         # Only update mask for LoRA-capable subspaces

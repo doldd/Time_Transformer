@@ -822,7 +822,7 @@ if __name__ == '__main__':
         
         config = {
             'rng_seed': 5,
-            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             'save_params': False,
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             'eval_every_n_batch': 20,
@@ -831,9 +831,9 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             'filter_masks': 
-                                [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
-                                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
-                                 {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [0, 1]}]},  # use lora for query projection
+                                [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
+                                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
+                                 {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [1, 0]}]},  # use lora for query projection
             'curve_params': {'k': 0,
                             # 'num_epochs': num_epochs,
                             'num_epochs': -1,
@@ -848,14 +848,16 @@ if __name__ == '__main__':
                             'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                                'optimizer_conf': {'name': "sgd", 
-                                                   'kwargs': {'learning_rate': 1e-4, 'momentum': 0.9, 'nesterov': True},
-                                                #    'grad_clip_norm': 1.0,
-                                                   'freeze_other_params': True},
-                            # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                            # 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
-                                                                            # 'momentum': 0.9, 
-                                                                            # 'nesterov': True},},
+                                # 'optimizer_conf': {'name': "sgd", 
+                                #                    'kwargs': {'learning_rate': 1e-4, 'momentum': 0.9, 'nesterov': True},
+                                #                    'grad_clip_norm': 10.0,
+                                #                    'freeze_other_params': True},
+                            'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                                                                                                'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                                                                                'weight_decay': 0.0,
+                                                                               },
+                                                                     'freeze_other_params': True,
+                                                  },
                         }}
         logger = wandb.init(project="qwen_PtoC", name="qwen_single", entity="ddold", config=config)
         train(logger, config)
@@ -875,7 +877,7 @@ if __name__ == '__main__':
             config = {
                 'rng_seed': 5,
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-                'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+                'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 'eval_every_n_batch': 20,
@@ -884,9 +886,9 @@ if __name__ == '__main__':
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,
                                 'filter_masks': 
-                                    [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
-                                     {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [0, 1]},
-                                     {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [0, 1]},
+                                    [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
+                                     {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
+                                     {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [1, 0]},
                                     ]},  # use lora for query projection
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,

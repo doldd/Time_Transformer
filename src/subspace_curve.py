@@ -930,11 +930,15 @@ class LoRAMixin:
         def initialize_lora_params(rng_key, params, lora_mask, rank):
             """
             Initialize LoRA parameters based on the base model and the provided LoRA mask.
-            lora_masl of the form:
+            lora_mask of the form:
                 'Dense_0': {
                     'kernel': [1, 0],  # Apply Low Rank for kernel on dimension 1 and 0
+                        lora_mask must be always a list of two integers indicating the dimensions to apply LoRA
+                        ==> first mask dimension is for A matrix (determines low rank dimension), second for B matrix
+                        e.g kernel of shape (inC, outC) with mask [0, 1] will have A of shape (rank, outC) and B of shape (inC, rank)
+                        e.g kernel of shape (inC, c, outC) with mask [2, 0] will have A of shape (c, rank, inC) and B of shape (c, outC, rank)
                     'bias': False,  # Do not use LoRA for bias
-                    }
+                    },
             returns:
                 w0_params: Parameters of the model used as w0 by LoRA.
                 lora_params: Parameters of the model. LoRA marked parameters are tuples of (A, B) where:
@@ -966,7 +970,7 @@ class LoRAMixin:
                     # from PEFT
                     #     nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
                     gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
-                    init_a = jax.nn.initializers.variance_scaling(out_axis=m[1].item(), distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
+                    init_a = jax.nn.initializers.variance_scaling(out_axis=m[0].item(), distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
                     shape_ = shape_builder(p.shape, m[0])
                     A = init_a(subkey, shape_, dtype=dtype)
                     # shape_[m[1]] = 0

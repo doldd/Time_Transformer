@@ -406,7 +406,7 @@ def train(logger, config):
             assert k > 0, "Subspace dimension k must be greater than 0 when training a curve from point."
 
             # initialize curve parameter with pretrained point parameter
-            params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, curve_mask, jitter=jitter)
+            params = s_model.init_params_from_point(init_key, model_a._train_state.mdl_vars, curve_mask, noise_fn=lambda p, key: p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype))
             
             del model_a._train_state.mdl_vars['params']  # free memory
             

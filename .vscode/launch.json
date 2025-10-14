@@ -15,7 +15,7 @@
                 "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
             },
             "console": "integratedTerminal",
-            "args": ["--train=single", "--batch-size=4", "--smoke-test"]
+            "args": ["--train=curve", "--batch-size=4", "--smoke-test"]
         },
         {
             "name": "Python Debugger: Current File with Arguments (Interactive)",

@@ -913,19 +913,19 @@ class LoRAMixin:
         mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoRAParams))
         return mask
     
-    def init_params_from_point(self, key, point, mask, noise_fn):
+    def init_params_from_point(self, key, params, mask, noise_fn):
         """Initialize parameters from a point in the latent space.
 
         Args:
             key (jax.random.PRNGKey): Random key for initialization.
-            point (dict): Point in the latent space. {params: ...}
+            params (dict): params in the latent space. {params: ...}
             mask (dict): Mask indicating which parameters to be handled by the curve. {...: bool}
             jitter (float): Jitter to add to the initialization for the curve params. As A matrix of LoRA is initialized with N(0,1) this could probably be set to 1.
 
         Returns:
             _type_: _description_
         """
-        assert ('params' in point) and len(point.keys())==1, "Point must contain 'params' key and no other keys."
+        assert ('params' in params) and len(params.keys())==1, "Point must contain 'params' key and no other keys."
 
         def initialize_lora_params(rng_key, params, lora_mask, rank):
             """
@@ -966,7 +966,7 @@ class LoRAMixin:
                     
                     # Initialize A matrix with He normal initialization
                     rng_key, subkey = random.split(rng_key)
-                    init_a = jax.nn.initializers.he_normal(out_axis=m[1].item()) # fan_in are all other dimensions except the m[1] (last dim is output of nn.Dense)
+                    # init_a = jax.nn.initializers.he_normal(out_axis=m[1].item()) # fan_in are all other dimensions except the m[1] (last dim is output of nn.Dense)
                     # from PEFT
                     #     nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
                     gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
@@ -984,13 +984,39 @@ class LoRAMixin:
 
             lora_params = jax.tree_util.tree_unflatten(structure, lora_params)
             return lora_params
-        lora_params = initialize_lora_params(key, point['params'], self.lora_mask, rank=self.r)
+        params = initialize_lora_params(key, params['params'], self.lora_mask, rank=self.r)
 
-        # update the original curve mask to include LoRA parameter A into curve approach if the parameter was originally selected by the mask
-        mask = self.update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True)
-        
-        # initialize curve parameters according mask
-        return super().init_params_from_point(key, {'params': lora_params}, mask, noise_fn)
+
+        # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
+        def make_curve(m, p, key):
+            if m:
+                if isinstance(p, LoRAParams):
+                    gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
+                    shape_ = (self.k+1,) + p.A.shape
+                    init_a = jax.nn.initializers.variance_scaling(in_axis=-1, out_axis=range(len(shape_))[:-1], distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
+                    # keys = random.split(key, self.k + 1)
+                    p.A = init_a(key, shape_, dtype=p.A.dtype)
+                    return p
+                else:
+                    curve_param = jnp.stack([p] * (self.k + 1))
+                    curve_param = noise_fn(curve_param, key)
+                    return curve_param
+            else:
+                return p
+
+        mf, struct = jax.tree.flatten(mask)
+        rng_keys = random.split(key, len(mf))
+        rng_keys = jax.tree.unflatten(struct, rng_keys)
+        params = jax.tree.map(make_curve, mask, params, rng_keys, is_leaf=lambda x: isinstance(x, LoRAParams))
+
+        mask_update = self.update_mask_for_lora(mask, params, b_off=True, w0_off=True)
+        self.curve_mask = mask_update
+        return {'params': params}
+    
+        # # update the original curve mask to include LoRA parameter A into curve approach if the parameter was originally selected by the mask
+        # params = super().init_params_from_point(key, {'params': lora_params}, mask_update, noise_fn)
+        # # initialize curve parameters according mask
+        # return params
     
     def init_params(self, key, x, mask):
         raise NotImplementedError("init_params not possible for LoRA.")

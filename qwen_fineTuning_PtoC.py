@@ -196,7 +196,7 @@ def train(logger, config):
     """
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
-    BATCH_SIZE_EVAL = config['curve_params']['batch_size']
+    BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
     SAVE_PARAMS = config.get('save_params', False)
 
     # Create artifact for storing parameters
@@ -705,17 +705,17 @@ def train(logger, config):
         logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
         logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
         logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
-        ax[1].plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(1))
+        ax[1].plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
         ax2 = ax[1].twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         
         ax3 = ax[1].twinx()
-        ax3.spines["right"].set_position(("outward", 60))
+        ax3.spines["right"].set_position(("outward", 30))
         ax3.set_frame_on(True)
         ax3.patch.set_visible(False)
         ax3.plot(t_space, curve_metric['final_ece'], label="test ece",
-                 c=plt.get_cmap('tab10')(1), linestyle=":")
+                 c=plt.get_cmap('tab10')(2), linestyle=":")
         # # train
         # nll, mse = train_metrics_fn_final(rng_key, params)
         # ax[1].plot(t_space, -nll, label="train", c=plt.get_cmap('tab10')(0))

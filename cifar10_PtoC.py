@@ -237,7 +237,7 @@ def single_run(logger, config, n_samples_nuts=None):
             
             # initialize curve parameter with pretrained point parameter
             mask = s_model.init_mask(x_val[:10], all_curves=True)
-            params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
+            params = s_model.init_params_from_point(init_key, init_params, mask, noise_fn=lambda p, key: p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype))
 
             def setup_init_metrics(batch_size, x, target, prefix='valid'):
                 def acc_fn(params):

@@ -168,7 +168,7 @@ def train_curve(logger, config):
 
             # initialize curve parameter with pretrained point parameter
             mask = s_model.init_mask(x_val[:10], all_curves=True)
-            params = s_model.init_params_from_point(init_key, init_params, mask, jitter=jitter)
+            params = s_model.init_params_from_point(init_key, init_params, mask, noise_fn=lambda p, key: p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype))
             
             init_metrics_fn = setup_metrics(s_model, 18, x_val, y_val, 1, use_linspace=True, average=True)
             loss, mse = init_metrics_fn(init_key, params)

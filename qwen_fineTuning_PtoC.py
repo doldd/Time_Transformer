@@ -167,7 +167,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
         # # compute the expected calibration error (ECE)
-        ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, y_all, num_bins_ece)  # mean over samples
+        ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
 
         if average:
             ece = jnp.mean(ece)

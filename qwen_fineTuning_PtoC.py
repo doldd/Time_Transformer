@@ -162,10 +162,11 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
-            out = jnp.concatenate([out, out_last[jnp.newaxis, ...]], axis=0)
+            out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
+        else:
+            out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
         # # compute the expected calibration error (ECE)
-        out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, y_all, num_bins_ece)  # mean over samples
 
         if average:
@@ -877,7 +878,8 @@ if __name__ == '__main__':
             config = {
                 'rng_seed': 5,
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-                'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
+                'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 'eval_every_n_batch': 20,

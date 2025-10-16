@@ -572,8 +572,8 @@ class SubspaceBaseModel:
         updates, opt_state = optimizer.update(
             grads, opt_state, trainable_params)
         trainable_params = optax.apply_updates(trainable_params, updates)
-        joind_param = jax.tree.map(lambda x, y, m: x if m else y, trainable_params, unfreeze(freezed_params), self.train_mask)
-        params = {'params': joind_param}
+        params = jax.tree.map(lambda x, y, m: x if m else y, trainable_params, unfreeze(freezed_params), self.train_mask)
+        params = {'params': params}
         if self.mutable_name:
             params[self.mutable_name] = stats_params
         return loss, params, opt_state, grads

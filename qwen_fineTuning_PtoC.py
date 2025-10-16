@@ -199,6 +199,7 @@ def train(logger, config):
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
     BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
     SAVE_PARAMS = config.get('save_params', False)
+    PARAM_LOAD_PATH = config.get('load_params_path', False)
 
     # Create artifact for storing parameters
     if SAVE_PARAMS:
@@ -232,7 +233,7 @@ def train(logger, config):
         print(f"Target token IDs: {unique_target_ids}")
 
         # compute num_epochs if num_steps is given
-        assert (num_epochs > 0) ^ (num_steps > 0), "Only one of num_epochs or num_steps should be > 0"
+        assert not ((num_epochs > 0) and (num_steps > 0)), "Only one of num_epochs or num_steps should be > 0"
         if num_steps > 0:
             num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
             print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
@@ -331,6 +332,23 @@ def train(logger, config):
             train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA
         s_model.set_train_mask(train_mask)
 
+        if PARAM_LOAD_PATH:
+            print(f"Load parameters from {PARAM_LOAD_PATH}")
+            artifact_use = logger.use_artifact(PARAM_LOAD_PATH, type='pytree')
+            trainable_params = None
+            for f in artifact_use.files():
+                if 'trainable_params' in f.name:
+                    trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
+                    print(f"Loaded trainable_params from {f.name}")
+                    assert len(set(trainable_params.keys()) - set(params['params'].keys())) == 0, "Loaded trainable_params do not match model params"
+            def load_fn(m, p, pl):
+                if m:
+                    assert p.shape == pl.shape, f"Shape mismatch for parameter with shape {p.shape} and loaded shape {pl.shape}"
+                    return pl
+                else:
+                    return p
+            params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
+
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
         init_metrics = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
@@ -342,9 +360,9 @@ def train(logger, config):
         logger.summary.update({'n_params': n_params, 'memory_params': param_memory})
         print(f"Number of parameters: {n_params:_}\nMemory of parameters: {param_memory/(1024**2):_}MB")
 
-        if SAVE_PARAMS:
-            jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
-            artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
+        # if SAVE_PARAMS:
+        #     jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
+        #     artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
 
         # Define optimizer
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
@@ -522,7 +540,7 @@ def train(logger, config):
                 rng_key, subkey = random.split(rng_key)
                 loss, params, opt_state, grad_ = s_model.train_step(
                     subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-                # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+                # because of optax.chain[-1] gets state of optimizer and  [-1][-1] gets state of learning rate scheduler
                 current_lr = lr_schedule(opt_state[-1][-1].count)  
                 
                 # jax.debug.print("Training loss: {}", loss)
@@ -617,48 +635,50 @@ def train(logger, config):
 
         # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
 
-        carry = (rng_key, params, opt_state, best_loss, best_params)
-        carry, metrics = jax.lax.scan(
-            train_epoch, carry, jnp.arange(num_epochs))
+        if num_epochs > 0 or num_steps > 0:
+            print(f"Start training for {num_epochs} epochs")
+            carry = (rng_key, params, opt_state, best_loss, best_params)
+            carry, metrics = jax.lax.scan(
+                train_epoch, carry, jnp.arange(num_epochs))
 
-        # log losses for wandb
-        n_batches = np.array(metrics['loss']).shape[-1]
-        epochs = np.repeat(np.arange(num_epochs), n_batches)
+            # log losses for wandb
+            n_batches = np.array(metrics['loss']).shape[-1]
+            epochs = np.repeat(np.arange(num_epochs), n_batches)
 
-        # clean up inf values because of lazy validation
-        for key, value in metrics.items():
-            if key.startswith('val_'):
-                metrics[key] = jnp.array(value)[:, ::EVAL_EVERY_N_BATCH].repeat(
-                    EVAL_EVERY_N_BATCH, axis=1)[:,:value.shape[1]].flatten()
+            # clean up inf values because of lazy validation
+            for key, value in metrics.items():
+                if key.startswith('val_'):
+                    metrics[key] = jnp.array(value)[:, ::EVAL_EVERY_N_BATCH].repeat(
+                        EVAL_EVERY_N_BATCH, axis=1)[:,:value.shape[1]].flatten()
+                else:
+                    metrics[key] = jnp.array(value).flatten()
+
+            
+            # log all metrics
+            _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
+
+            # print memory stats
+            memory_stats = jax.devices()[0].memory_stats()
+            for stats_name, v in memory_stats.items():
+                print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
+
+            # log metrics as artifact
+            jnp.savez(f'tmp_files/{logger.id}_metrics.npz', **metrics, epochs=epochs)
+            art = wandb.Artifact(name="metrics", type="npz")
+            art.add_file(f'tmp_files/{logger.id}_metrics.npz')
+            logger.log_artifact(art)
+
+            if val:
+                params = jax.device_put(carry[4])  # best params on cpu
             else:
-                metrics[key] = jnp.array(value).flatten()
+                params = carry[1]  # last params on device
+            rng_key = carry[0]
 
-        
-        # log all metrics
-        _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
-
-        # print memory stats
-        memory_stats = jax.devices()[0].memory_stats()
-        for stats_name, v in memory_stats.items():
-            print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
-
-        # log metrics as artifact
-        jnp.savez(f'tmp_files/{logger.id}_metrics.npz', **metrics, epochs=epochs)
-        art = wandb.Artifact(name="metrics", type="npz")
-        art.add_file(f'tmp_files/{logger.id}_metrics.npz')
-        logger.log_artifact(art)
-
-        if val:
-            params = jax.device_put(carry[4])  # best params on cpu
-        else:
-            params = carry[1]  # last params on device
-        rng_key = carry[0]
-
-        if k > 0:
-            # Bezier curve length        
-            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-            length = bezier_length(cp)
-            logger.log({'Curve length': length})
+            if k > 0:
+                # Bezier curve length        
+                cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+                length = bezier_length(cp)
+                logger.log({'Curve length': length})
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
@@ -712,7 +732,7 @@ def train(logger, config):
                  c=plt.get_cmap('tab10')(1), linestyle="--")
         
         ax3 = ax[1].twinx()
-        ax3.spines["right"].set_position(("outward", 30))
+        ax3.spines["right"].set_position(("outward", 40))
         ax3.set_frame_on(True)
         ax3.patch.set_visible(False)
         ax3.plot(t_space, curve_metric['final_ece'], label="test ece",
@@ -780,7 +800,16 @@ def train(logger, config):
         # plt.tight_layout()
         # logger.log(
         #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})
-
+        if SAVE_PARAMS:
+            print("Save artifacts")
+            # jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
+            trainable_params = s_model.only_trainable_params(params['params'])
+            jnp.save(f'tmp_files/{logger.id}_trainable_params.npy', trainable_params)
+            print("add files to artifact")
+            # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
+            artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
+            print("Log artifact")
+            logger.log_artifact(artifact)
 
         return rng_key, best_params, model, params
 
@@ -788,16 +817,6 @@ def train(logger, config):
         rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
         lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
         smoke_test=config.get('smoke_test', False))
-
-    if SAVE_PARAMS:
-        print("Save artifacts")
-        jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
-        jnp.save(f'tmp_files/{logger.id}_last_params.npy', params)
-        print("add files to artifact")
-        artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
-        artifact.add_file(f'tmp_files/{logger.id}_last_params.npy')
-        print("Log artifact")
-        logger.log_artifact(artifact)
 
     logger.finish()
 
@@ -823,9 +842,10 @@ if __name__ == '__main__':
         
         config = {
             'rng_seed': 5,
-            'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
-            'save_params': False,
+            'dataset_path': "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
+            'load_params_path': 'ddold/qwen_PtoC/params:v26', # path to pretrained trainable parameters
+            'save_params': True,
             'eval_every_n_batch': 20,
             'smoke_test': args.smoke_test,
             'lora_params': {'use_lora': True, 'r': 8, 
@@ -880,8 +900,10 @@ if __name__ == '__main__':
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
                 # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
                 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
-                # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
+                # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
+                'load_params_path': "ddold/qwen_PtoC/params:v26", # path to pretrained trainable parameters
+                'save_params': True,
                 'eval_every_n_batch': 20,
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
@@ -894,7 +916,8 @@ if __name__ == '__main__':
                                     ]},  # use lora for query projection
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
-                                'num_steps': 100 if args.smoke_test else 5000,
+                                # 'num_steps': 100 if args.smoke_test else 5000,
+                                'num_steps': -1,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,

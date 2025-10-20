@@ -1,12 +1,13 @@
 program: qwen_fineTuning_PtoC.py
-name: Qwen LoRA subspace
+name: Qwen LoRA MLE
+description: "to save_params with all fixes"
 method: grid
 metric:
   goal: maximize
   name: acc_val_curve
 parameters:
   save_params:
-    value: False
+    value: True
   dataset_path:
     values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
              "ddold/qwen_PtoC/winogrande_s_dataset:v0",
@@ -14,6 +15,8 @@ parameters:
              "ddold/qwen_PtoC/obqa_dataset:v0",
              "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
              "ddold/qwen_PtoC/ARC-Easy_dataset:v0"]
+  load_params_path:
+    value: False
   net_kwargs:
     parameters:
       model_path:
@@ -27,20 +30,21 @@ parameters:
       r:
         value: 8
       lora_dtype:
-        # value: ["original", "float16", "bfloat16", "float32"]
-        value: "float32"
+        value: "float32"  # ["original", "float16", "bfloat16", "float32"]
+      lora_alpha:
+        value: 16.0
       filter_masks:
         values:
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [0, 1]}, 
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [0, 1]},
-             {keys: ["lm_head", "kernel"], op: "all", dims: [0, 1]}]
+          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
+             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [1, 0]},
+             {keys: ["lm_head", "kernel"], op: "all", dims: [1, 0]}]
           # - [{keys: ["value", "w"], op: "all", dims: [0, 2]},]          
           # - [{keys: ["value", "w"], op: "all", dims: [2, 0]},]          
           # - [{keys: ["value", "w"], op: "all", dims: [0, 2]}, {keys: ["query", "w"], op: "all", dims: [0, 2]}]          
   curve_params:
     parameters:
       k:
-        values: [2,]
+        values: [0, 2, 5]
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -54,13 +58,13 @@ parameters:
       weight_decay:
         value: 0.0
       jitter_multiplier:
-        value: 1. 
+        values: [0.,] 
         # fan_in is internal to apply_noise, so we set jitter to 1.
         # np.sqrt(2/3584) np.sqrt(2./fan_in, dtype=np.float32) fan_in= 3584 for q_proj
       num_epochs:
         value: -1
       num_steps:
-        value: 5000
+        value: 5_000
 
       filter_masks:
         values: 
@@ -82,7 +86,8 @@ parameters:
             # - {name: "sgd", kwargs: {learning_rate: 0.0001, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
             # - {name: "sgd", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, momentum: 0.9, nesterov: True}, grad_clip_norm: 100.0, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 1e-4}, grad_clip_norm: 100.0, freeze_other_params: True}
-            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
+            # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
+            # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
             - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
         # parameters:
         #   name:
@@ -100,7 +105,7 @@ parameters:
         #   freeze_non_curve_params:
         #     value: True
   rng_seed:
-    values: [1,4,8,16]
+    values: [1, 2, 4, 8]
 
 command:
 - ${env}

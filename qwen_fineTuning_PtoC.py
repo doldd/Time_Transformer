@@ -19,6 +19,7 @@ from flax.core import freeze, unfreeze
 from jax_tqdm import scan_tqdm
 from tqdm import tqdm
 from src.utils import calibration_error as ece_fn
+from copy import deepcopy
 
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
@@ -29,6 +30,8 @@ from src.subspace_curve import (
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
+# import sys
+# sys.setrecursionlimit(200)
 
 class QwenTextClassificationWrapper:
     """
@@ -199,7 +202,7 @@ def train(logger, config):
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
     BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
     SAVE_PARAMS = config.get('save_params', False)
-    PARAM_LOAD_PATH = config.get('load_params_path', False)
+    SWEEP_PARAM_PATH = config.get('load_params_path', False)
 
     # Create artifact for storing parameters
     if SAVE_PARAMS:
@@ -227,17 +230,33 @@ def train(logger, config):
         rng_key, init_key = random.split(rng_key)
 
         # Load dataset
-        input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path, run=logger)
-        test_input_ids, test_attention_mask, test_labels, _, _ = load_text_classification_data(dataset_path, run=logger, test=True)
-        print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
+        assert not ((num_epochs > 0) and (num_steps > 0)), "Only one of num_epochs or num_steps should be > 0"
+        val = False
+        if num_epochs > 0 or num_steps > 0:
+            input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(dataset_path, run=logger)
+            print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
+
+            # compute num_epochs if num_steps is given
+            if num_steps > 0:
+                num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
+                print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
+
+            # Split data (simple train/val split) # we dont use validate data
+            n_train = int(np.ceil(1.*len(input_ids) / batch_size) * batch_size)
+            train_input_ids = input_ids[:n_train]
+            train_attention_mask = attention_mask[:n_train]
+            train_labels = labels[:n_train]
+            
+            val_input_ids = input_ids[n_train:]
+            val_attention_mask = attention_mask[n_train:]
+            val_labels = labels[n_train:]
+            if len(val_input_ids) > 0:
+                print("Validation data are used")
+                val = True
+
+        test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = load_text_classification_data(dataset_path, run=logger, test=True)
         print(f"Target token IDs: {unique_target_ids}")
 
-        # compute num_epochs if num_steps is given
-        assert not ((num_epochs > 0) and (num_steps > 0)), "Only one of num_epochs or num_steps should be > 0"
-        if num_steps > 0:
-            num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
-            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
-        
         # Load Qwen model
         if net_kwargs['model_path'].startswith('ddold/'):
             model_artifact = logger.use_artifact(net_kwargs['model_path'], type='model')
@@ -245,19 +264,6 @@ def train(logger, config):
         model = QwenTextClassificationWrapper(**net_kwargs, target_token_ids=unique_target_ids)
         params = unfreeze(model.init(None, None))
         dtype = jax.tree.leaves(params)[0].dtype
-        # Split data (simple train/val split) # we dont use validate data
-        n_train = int(np.ceil(1.*len(input_ids) / batch_size) * batch_size)
-        train_input_ids = input_ids[:n_train]
-        train_attention_mask = attention_mask[:n_train]
-        train_labels = labels[:n_train]
-        
-        val_input_ids = input_ids[n_train:]
-        val_attention_mask = attention_mask[n_train:]
-        val_labels = labels[n_train:]
-        val = True
-        if len(val_input_ids) == 0:
-            print("No validation data are used")
-            val = False
         
         curve_mask = jax.tree.map(lambda x: False, params['params'])
         # only if k > 0, otherwise no curve parameters are used
@@ -332,15 +338,53 @@ def train(logger, config):
             train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA
         s_model.set_train_mask(train_mask)
 
-        if PARAM_LOAD_PATH:
-            print(f"Load parameters from {PARAM_LOAD_PATH}")
-            artifact_use = logger.use_artifact(PARAM_LOAD_PATH, type='pytree')
-            trainable_params = None
+        if SWEEP_PARAM_PATH:
+            print(f"Load parameters from sweep {SWEEP_PARAM_PATH}")
+            def prepare_config(cfg, with_dataset=True):
+                # cfg_copy = json.loads(json.dumps(cfg))
+                cfg_copy = deepcopy(dict(cfg))
+                if with_dataset:
+                    cfg_copy['dataset_path'] = "ddold/qwen_PtoC/obqa_dataset:v0"
+                cfg_copy['curve_params'].pop('num_steps', None) 
+                cfg_copy['curve_params'].pop('num_epochs', None)
+                cfg_copy.pop('save_params', None)
+                cfg_copy.pop('smoke_test', None)
+                cfg_copy.pop('eval_every_n_batch', None)
+                cfg_copy.pop('load_params_path', None)
+                cfg_copy['net_kwargs']['model_path'] = cfg_copy['net_kwargs']['model_path'].split('/')[-1]
+                return cfg_copy
+            print("config:", config)
+            config_copy = prepare_config(config, with_dataset=True)
+            print("config prepared:", config_copy)
+            artifact_use = False
+            trainable_params = False
+            api = wandb.Api()
+
+            # search for matching run in sweep
+            for run in api.sweep(SWEEP_PARAM_PATH).runs:
+                # check if config matches
+                matching_config = prepare_config(run.config, with_dataset=False)
+                if matching_config == config_copy:
+                    if run.state != "finished":
+                        print(f"Found Run {run.name} but is not finished, skipping...")
+                        continue
+                    print("Found config with obqa dataset")
+                    print(run.name, run.state)
+                    for art_l in run.logged_artifacts():
+                        if art_l.type == "pytree" and art_l.name.startswith("params"):
+                            print(f"Downloading params from {art_l.name}")
+                            artifact_use = logger.use_artifact(art_l, type='pytree')
+            assert artifact_use, f"No matching run found in sweep {SWEEP_PARAM_PATH}"
+            
+            # load trainable params
             for f in artifact_use.files():
                 if 'trainable_params' in f.name:
                     trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
                     print(f"Loaded trainable_params from {f.name}")
                     assert len(set(trainable_params.keys()) - set(params['params'].keys())) == 0, "Loaded trainable_params do not match model params"
+            assert trainable_params, f"trainable_params not found in artifact {artifact_use.name}"
+
+            # merge loaded trainable params with current params
             def load_fn(m, p, pl):
                 if m:
                     assert p.shape == pl.shape, f"Shape mismatch for parameter with shape {p.shape} and loaded shape {pl.shape}"
@@ -686,7 +730,7 @@ def train(logger, config):
         if smoke_test or k == 0:
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
-        valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
+        # valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # ood_metrics_fn_final = setup_metrics(s_model, BATCH_SIZE_EVAL, x_ood, y_ood, n_samples=len(t_space), use_linspace=True, average=False, rescale_fn=rescale_fn)
     
         # # # plot best params
@@ -844,7 +888,7 @@ if __name__ == '__main__':
             'rng_seed': 5,
             'dataset_path': "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
-            'load_params_path': 'ddold/qwen_PtoC/params:v26', # path to pretrained trainable parameters
+            'load_params_path': 'ddold/qwen_PtoC/47xexal3', # path to pretrained trainable parameters
             'save_params': True,
             'eval_every_n_batch': 20,
             'smoke_test': args.smoke_test,
@@ -865,7 +909,7 @@ if __name__ == '__main__':
                             'energy_weakening': 1., 
                             'regularizer': False,
                             'weight_decay': 0.,
-                            'jitter_multiplier': 1.,
+                            'jitter_multiplier': 0.,
                             'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
@@ -896,23 +940,24 @@ if __name__ == '__main__':
             num_epochs = 2 if args.smoke_test else 5  # Keep original value of 2
             
             config = {
-                'rng_seed': 5,
+                'rng_seed': 1,
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
                 # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
-                'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
+                'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
-                'load_params_path': "ddold/qwen_PtoC/params:v26", # path to pretrained trainable parameters
-                'save_params': True,
-                'eval_every_n_batch': 20,
+                'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
+                'save_params': False,
+                'eval_every_n_batch': 25,
                 'smoke_test': args.smoke_test,
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,
                                 'filter_masks': 
-                                    [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
-                                     {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all', 'dims': [1, 0]},
-                                     {'keys': ("lm_head", "kernel"), 'op': 'all', 'dims': [1, 0]},
+                                    [{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                                     {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                                     {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                     ]},  # use lora for query projection
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
@@ -924,12 +969,12 @@ if __name__ == '__main__':
                                 'energy_weakening': 1., 
                                 'regularizer': False,
                                 'weight_decay': 0.,
-                                'jitter_multiplier': 1.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
+                                'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                                 # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                                 #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
-                                'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
-                                                {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'},
-                                                {'keys': ("lm_head", "kernel"), 'op': 'all'},
+                                'filter_masks':[{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+                                                {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
+                                                {'keys': ["lm_head", "kernel"], 'op': 'all'},
                                                 ],
                                 #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                                 #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
@@ -943,7 +988,7 @@ if __name__ == '__main__':
                                 #                                                 'nesterov': True},},
                                 'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                                 'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                                                                                'weight_decay': 0.01,
+                                                                                'weight_decay': 0.0,
                                                                                },
                                                                      'freeze_other_params': True,
                                                   },

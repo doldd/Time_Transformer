@@ -5,6 +5,10 @@ from scipy.special import binom
 import numpy as np
 import blackjax
 import time
+import numpyro.distributions as dist
+from functools import partial
+from src.subspace_curve import masked_pytree_to_matrix, OrthoSpan, bezier_curve, LoRAParams
+from einshape import jax_einshape as es
 
 __all__ = ['init_curve_frame', 'init_curve_frame_cp',
            'ortho_at_one_t', 'setup_inference_chain']
@@ -347,3 +351,113 @@ def setup_inference_chain(mode, num_chains):
         return time_, rng_key, pmap_states, pmap_infos
     
     return warmup_fn, run_inference
+
+
+def init_sampling_model(model, params, batch_size=16):
+    # get design matrix from curve parameters stored as pytree
+    cp_w = masked_pytree_to_matrix(params['params'], model.curve_mask, model.k)
+    print(f"Control points shape: {cp_w.shape}")
+
+    # define the transformation function between weight space and phi space
+    t_phi_to_weight = OrthoSpan(cp_w)
+
+    # control points in the varphi space
+    cp_phi = t_phi_to_weight.inv(cp_w)
+    print(f"Control points in phi space: {cp_phi.shape}")
+
+    # define t_lambda to phi mapping using bezier curve (get point in varphi space from lambda (t))
+    def init_t_lambda_to_phi(cp_phi, k,):
+        curve, d_bezier = bezier_curve(k+1, cp_phi)
+        def clousure(t):
+            space_point = curve(t)
+            return space_point
+        return jax.jit(clousure), curve, d_bezier
+
+    t_lambda_to_phi, _, _ = init_t_lambda_to_phi(cp_phi, model.k)
+
+    def create_vec_to_pytree_fn(template_params, curve_mask):
+        """Factory function - compute indices once, reuse many times"""
+        
+        # Pre-compute all slice indices
+        leaf_shapes = jax.tree.map(
+            lambda p, m: p.shape[1:] if m else (0,),
+            template_params, curve_mask
+        )
+        flat_shapes, structure = jax.tree.flatten(leaf_shapes, is_leaf=lambda x: isinstance(x, tuple))
+        
+        # Compute cumulative indices (static!)
+        sizes = [np.prod(s) for s in flat_shapes]
+        indices = np.cumsum([0] + sizes)
+
+        # @partial(jax.jit, donate_argnums=1)
+        @partial(jax.jit)
+        def vec_to_pytree(vec):
+            """Fast conversion with pre-computed indices"""
+            
+            new_leaves = [jnp.reshape(vec[indices[i]:indices[i+1]], s) for i, s in enumerate(flat_shapes)]
+            curve_point = jax.tree.unflatten(structure, new_leaves)
+            return curve_point
+
+            # # map curve point with non curve params
+            # params = jax.tree.map(lambda m, cp, p: cp if m else p, curve_mask, curve_point, params)
+            # # apply LoRAParams to get full weight
+            # params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoRAParams) else lp, params, is_leaf=lambda x: isinstance(x, LoRAParams))
+            # return params
+        
+        return vec_to_pytree
+    
+    vec_to_pytree = create_vec_to_pytree_fn(params['params'], model.curve_mask)
+
+    mutable_state = params[model.mutable_name] if model.mutable_name else {}
+
+    @partial(jax.jit)
+    def model_line(t, params, x, attm, y):
+        # t = numpyro.sample("t", dist.Uniform(-0.3, 1.3).expand((1,)).to_event(1))
+        # t = numpyro.sample("t", dist.Uniform(-0.3, 1.3))
+        prior = dist.Uniform(-0.3, 1.3).log_prob(t)
+        varphi = t_lambda_to_phi(t)
+
+        # jacobian = jax.jacrev(transform)(jax.lax.stop_gradient(lambda_)).squeeze()
+        # jacobian = jax.jacrev(t_lambda_to_phi)(t)
+        # # sign, logabsdet = jnp.linalg.slogdet(jacobian)
+        # norm = jnp.linalg.norm(jacobian)
+        # numpyro.factor("norm", norm)
+
+        # varphi = numpyro.deterministic('varphi', varphi)
+        weight_vec = t_phi_to_weight(varphi)
+        weight_pytree = vec_to_pytree(weight_vec)
+        params = jax.tree.map(lambda m, cp, p: cp if m else p, model.curve_mask, weight_pytree, params)
+        # apply LoRAParams to get full weight
+        params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoRAParams) else lp, params, is_leaf=lambda x: isinstance(x, LoRAParams))
+
+        def ll_batch(state, data):
+            x, attm, y = data
+            params, mutable_state = state
+            logits, _ = model._predict(params, mutable_state, (x, attm), train=False)
+            ll = dist.Categorical(logits=logits).log_prob(y).sum()
+            return state, (ll, logits)
+
+        # prepare batch data
+        x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+        x_last = x[matching_limit:]
+        x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+        att_m_ = attm[:matching_limit]  # drop non matching batch size
+        att_last = attm[matching_limit:]
+        att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+
+        y_ = y[:matching_limit]  # drop non matching batch size
+        y_last = y[matching_limit:]
+        y_ = es('(ib)...->ib...', y_, b=batch_size)
+
+        _, (ll, logits) = jax.lax.scan(ll_batch, (params, mutable_state), (x_, att_m_, y_))
+        logits = logits.reshape(-1, logits.shape[-1])
+        ll = jnp.sum(ll)
+        # last batch
+        if x_last.shape[0] > 0:
+            logits_, _ = model._predict(params, mutable_state, (x_last, att_last), train=False)
+            logits = jnp.concatenate([logits, logits_], axis=0)
+            ll += dist.Categorical(logits=logits_).log_prob(y_last).sum()
+
+        return ll, prior, logits, varphi
+    return model_line

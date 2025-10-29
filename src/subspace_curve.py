@@ -1160,7 +1160,7 @@ def vec_to_single_pytree(vec, subspace_params):
 def vec_to_pytree(vec, subspace_params):
     """
     Converts a vector representation of parameters to a pytree structure.
-    With leading dimension.
+    Without leading dimension.
 
     Args:
         vec: A 1-D numpy array or JAX array representing the flattened parameters.

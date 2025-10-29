@@ -83,7 +83,8 @@ class QwenTextClassificationWrapper:
             capture_intermediates=capture_intermediates,
             **kwargs,
         )
-        last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
+        # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
+        last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
 
         return last_token_logits # Return probabilities for target classes only
 

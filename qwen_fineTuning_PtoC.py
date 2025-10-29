@@ -83,6 +83,7 @@ class QwenTextClassificationWrapper:
             capture_intermediates=capture_intermediates,
             **kwargs,
         )
+        # last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
         last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
 
         return last_token_logits # Return probabilities for target classes only
@@ -355,7 +356,6 @@ def train(logger, config):
                 return cfg_copy
             print("config:", config)
             config_copy = prepare_config(config, with_dataset=True)
-            print("config prepared:", config_copy)
             artifact_use = False
             trainable_params = False
             api = wandb.Api()
@@ -725,8 +725,8 @@ def train(logger, config):
                 logger.log({'Curve length': length})
 
         # plot likelihood and acc along curve
-        fig, ax = plt.subplots(1, 2, figsize=(8, 3), sharey=True)
-        t_space = jnp.linspace(0, 1, 25)
+        fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
+        t_space = jnp.linspace(0, 1, 100)
         if smoke_test or k == 0:
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
@@ -770,12 +770,12 @@ def train(logger, config):
         logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
         logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
         logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
-        ax[1].plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
-        ax2 = ax[1].twinx()
+        ax.plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
+        ax2 = ax.twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
                  c=plt.get_cmap('tab10')(1), linestyle="--")
-        
-        ax3 = ax[1].twinx()
+
+        ax3 = ax.twinx()
         ax3.spines["right"].set_position(("outward", 40))
         ax3.set_frame_on(True)
         ax3.patch.set_visible(False)
@@ -827,18 +827,18 @@ def train(logger, config):
 
         # plt.tight_layout()
         # finalize plot: labels, legend and layout
-        ax[0].set_xlabel("t")
-        ax[1].set_xlabel("t")
-        ax[1].set_ylabel("mean log likelihood")
+        ax.set_xlabel("t")
+        # ax[1].set_xlabel("t")
+        ax.set_ylabel("mean log likelihood")
         ax2.set_ylabel("Accuracy")
         ax3.set_ylabel("ECE")
         # ax[0].set_title("Best params (validation)")
-        ax[1].set_title("Final testset")
+        ax.set_title("Final testset")
         # combine legends from primary and twin axes
-        lines, labels = ax[1].get_legend_handles_labels()
+        lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         lines3, labels3 = ax3.get_legend_handles_labels()
-        ax[1].legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best', fontsize='small')
+        ax.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best', fontsize='small')
         logger.log(
             {'Curve Predictive': wandb.Image(fig)})
         # plt.tight_layout()
@@ -944,7 +944,8 @@ if __name__ == '__main__':
                 # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
                 # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
                 # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
-                'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
+                'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
@@ -993,6 +994,6 @@ if __name__ == '__main__':
                                                                      'freeze_other_params': True,
                                                   },
                             }}
-            logger = wandb.init(project="qwen_PtoC", name="test_qwen_curve_j1._01", entity="ddold", config=config)
+            logger = wandb.init(project="qwen_PtoC", name="test_qwen_curve_fine_curve_float32nll", entity="ddold", config=config)
             train(logger, config)
 

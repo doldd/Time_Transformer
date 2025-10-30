@@ -895,15 +895,15 @@ def train(logger, config):
             logger.log({k+'_mean':v.mean() for k,v in train_curve_metric.items()})
             logger.log({k+'_max':v.max() for k,v in train_curve_metric.items()})
             logger.log({k+'_min':v.min() for k,v in train_curve_metric.items()})
-            ax.plot(t_space, -train_curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
+            ax.plot(t_space, -train_curve_metric['f_train_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
             ax2 = ax.twinx()
-            ax2.plot(t_space, train_curve_metric['final_acc'], label="test acc",
+            ax2.plot(t_space, train_curve_metric['f_train_acc'], label="test acc",
                     c=plt.get_cmap('tab10')(1), linestyle="--")
             ax3 = ax.twinx()
             ax3.spines["right"].set_position(("outward", 40))
             ax3.set_frame_on(True)
             ax3.patch.set_visible(False)
-            ax3.plot(t_space, train_curve_metric['final_ece'], label="test ece",
+            ax3.plot(t_space, train_curve_metric['f_train_ece'], label="test ece",
                     c=plt.get_cmap('tab10')(2), linestyle=":")
             ax.set_xlabel("t")
             ax.set_ylabel("mean log likelihood")

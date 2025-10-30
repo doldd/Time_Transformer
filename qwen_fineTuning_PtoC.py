@@ -20,6 +20,7 @@ from jax_tqdm import scan_tqdm
 from tqdm import tqdm
 from src.utils import calibration_error as ece_fn
 from copy import deepcopy
+from numpyro import distributions as dist
 
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
@@ -181,7 +182,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             loss = jnp.sum(loss, axis=0) / x.shape[0]
             acc = jnp.sum(acc, axis=0) / x.shape[0]
 
-        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}  # mean over epochs
+        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
     return acc_fn
 
 
@@ -226,6 +227,7 @@ def train(logger, config):
                          jitter_multiplier: float = 0.0,
                          smoke_test: bool = False,
                          num_steps: int = -1,
+                         temperature: list = [1.0,]
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
@@ -339,6 +341,7 @@ def train(logger, config):
             train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA
         s_model.set_train_mask(train_mask)
 
+        artifact_weights_use = False
         if SWEEP_PARAM_PATH:
             print(f"Load parameters from sweep {SWEEP_PARAM_PATH}")
             def prepare_config(cfg, with_dataset=True):
@@ -348,6 +351,7 @@ def train(logger, config):
                     cfg_copy['dataset_path'] = "ddold/qwen_PtoC/obqa_dataset:v0"
                 cfg_copy['curve_params'].pop('num_steps', None) 
                 cfg_copy['curve_params'].pop('num_epochs', None)
+                cfg_copy['curve_params'].pop('temperature', None)
                 cfg_copy.pop('save_params', None)
                 cfg_copy.pop('smoke_test', None)
                 cfg_copy.pop('eval_every_n_batch', None)
@@ -360,21 +364,46 @@ def train(logger, config):
             trainable_params = False
             api = wandb.Api()
 
-            # search for matching run in sweep
-            for run in api.sweep(SWEEP_PARAM_PATH).runs:
-                # check if config matches
-                matching_config = prepare_config(run.config, with_dataset=False)
-                if matching_config == config_copy:
-                    if run.state != "finished":
-                        print(f"Found Run {run.name} but is not finished, skipping...")
-                        continue
-                    print("Found config with obqa dataset")
-                    print(run.name, run.state)
-                    for art_l in run.logged_artifacts():
-                        if art_l.type == "pytree" and art_l.name.startswith("params"):
-                            print(f"Downloading params from {art_l.name}")
-                            artifact_use = logger.use_artifact(art_l, type='pytree')
+            def load_art(run):
+                artifact_use, artifact_weights_use = False, False
+                print(f"Found config with obqa dataset with name: {run.name}, id: {run.id}")
+                for art_l in run.logged_artifacts():
+                    if art_l.type == "pytree" and art_l.name.startswith("params"):
+                        print(f"Downloading params from {art_l.name}")
+                        artifact_use = logger.use_artifact(art_l, type='pytree')
+                    if art_l.type == "npz" and art_l.name.startswith("bma_weights"):
+                        print(f"Downloading weights from {art_l.name}")
+                        artifact_weights_use = logger.use_artifact(art_l, type='npz')
+                return artifact_use, artifact_weights_use
+            # search for matching run in sweep or in run if run path was given
+            try:
+                print(f"Searching sweep {SWEEP_PARAM_PATH} for matching config")   
+                for run in api.sweep(SWEEP_PARAM_PATH).runs:
+                    # check if config matches
+                    matching_config = prepare_config(run.config, with_dataset=False)
+                    if matching_config == config_copy:
+                        if run.state != "finished":
+                            print(f"Found Run {run.name} but is not finished, skipping...")
+                            continue
+                        artifact_use, artifact_weights_use = load_art(run)
+            except wandb.errors.CommError as e:
+                if e.message.startswith("Could not find sweep"):
+                    try:
+                        print(f"Searching run {SWEEP_PARAM_PATH} for matching config")
+                        run = api.run(SWEEP_PARAM_PATH)
+                        matching_config = prepare_config(run.config, with_dataset=False)
+                        if matching_config == prepare_config(config, with_dataset=False):
+                            if run.state != "finished":
+                                print(f"Found Run {run.name} but is not finished, skipping...")
+                                raise KeyError("Run not finished")
+                            artifact_use, artifact_weights_use = load_art(run)
+                    except Exception as e:
+                        print("No sweep or run found")
+                        raise e
+                else:
+                    raise e
             assert artifact_use, f"No matching run found in sweep {SWEEP_PARAM_PATH}"
+            # assert artifact_weights_use, f"No matching weights found in sweep {SWEEP_PARAM_PATH}"
             
             # load trainable params
             for f in artifact_use.files():
@@ -392,9 +421,12 @@ def train(logger, config):
                 else:
                     return p
             params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
+        
+        if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
+            raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
 
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
-        init_metrics = init_metrics_fn(init_key, params) # returns a dict
+        init_metrics, _ = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
         jax.debug.print("Initial metrics: {}", init_metrics)
 
@@ -439,7 +471,7 @@ def train(logger, config):
         # print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
 
         best_loss = np.inf
-        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
+        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}, None
         if val:
             print("Put best parameters to cpu device")
             # best_params = jax.device_get(params)  # best params on cpu to save memory
@@ -556,7 +588,7 @@ def train(logger, config):
                 # metrics = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
                 # mse, val_loss = valid_metrics_fn(valid_key, params)
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params), lambda x: empty_metric, None)
+                    valid_key, params)[0], lambda x: empty_metric[0], None)
                 best_params = jax.lax.cond(
                     metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
@@ -592,7 +624,7 @@ def train(logger, config):
                 rng_key, valid_key = random.split(rng_key)
 
                 metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params), lambda x: empty_metric, None)
+                    valid_key, params)[0], lambda x: empty_metric[0], None)
                 best_params = jax.lax.cond(
                     metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
@@ -726,7 +758,7 @@ def train(logger, config):
 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
-        t_space = jnp.linspace(0, 1, 100)
+        t_space = jnp.linspace(0, 1, 50)
         if smoke_test or k == 0:
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
@@ -766,7 +798,7 @@ def train(logger, config):
         
         # plot last params
         # valid
-        curve_metric = test_metrics_fn_final(rng_key, params)
+        curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
         logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
         logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
         logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
@@ -844,6 +876,60 @@ def train(logger, config):
         # plt.tight_layout()
         # logger.log(
         #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})
+
+        # compute and log final curve metrics
+        # compute log likelihood for t grid on train data to get posterior weightings
+        weights = False
+        print("Temperature:", temperature)
+        def compute_weights(log_like, t):
+                log_post = log_like / t
+                log_post -= jax.scipy.special.logsumexp(log_post)
+                return jnp.exp(log_post)
+        if num_epochs > 0 or num_steps > 0: # train ds must be defined
+            print("Compute posterior weights on train set")
+            train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
+            train_curve_metric, _ = train_metrics_fn(rng_key, params)
+            
+            # loss is mean and without correct likelihood constant. In addition Uniform prior is dropped to unnormalized log posterior computation
+            weights = jax.vmap(compute_weights, in_axes=(None, 0))(-train_curve_metric['f_train_loss'], jnp.array(temperature))  # shape (#temperature, #samples)
+            art_w = wandb.Artifact(name="bma_weights", type="npz")
+            jnp.savez(f'tmp_files/{logger.id}_weights.npz', weights=weights, t_space=t_space, log_like=-train_curve_metric['f_train_loss'], temperature=temperature)
+            art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
+            logger.log_artifact(art_w)
+            print("Saved posterior weights artifact")
+        else:
+            if artifact_weights_use:
+                for f in artifact_weights_use.files():
+                    if 'bma_weights' in f.name:
+                        weight_file = np.load(artifact_weights_use.get_entry(f.name).download(), allow_pickle=True)
+                        weights = jax.vmap(compute_weights, in_axes=(None, 0))(weight_file['log_like'], jnp.array(temperature))
+                        # weights = weight_file['weights']
+                        t_space = weight_file['t_space']
+                        print("Loaded posterior weights from artifact")
+            assert weights, f"Weights for posterior predictive could be computed or are not saved in {SWEEP_PARAM_PATH}."
+
+        def post_pred_performance(logits, labels, weights, temp):
+            # logits shape (n_samples, n_data, n_classes)
+            post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
+            post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
+            post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
+            logger.log({f'post_predictive_t{temp}': (-curve_metric['final_loss'] * weights).sum(),
+                        f'post_predictive_ll_t{temp}': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
+                        f'post_pred_acc_t{temp}': post_acc,
+                        f'post_pred_ece_t{temp}': post_ece,
+                        })
+        for weight, temp in zip(weights, temperature):
+            post_pred_performance(logits_test, test_labels, weight, temp)
+
+        # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
+        # post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == test_labels)
+        # post_ece = ece_fn(post_predict_logits, test_labels, num_bins=15)
+        # logger.log({'post_predictive': (-curve_metric['final_loss'] * weights).sum(),
+        #             'post_pred_acc': post_acc,
+        #             'post_pred_ece': post_ece,
+        #             })
+
+
         if SAVE_PARAMS:
             print("Save artifacts")
             # jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
@@ -910,6 +996,7 @@ if __name__ == '__main__':
                             'regularizer': False,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,
+                            'temperature': [1.0,],
                             'filter_masks': [{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},],  # use lora for query projection
                             #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
                             #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
@@ -948,7 +1035,9 @@ if __name__ == '__main__':
                 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
-                'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
+                # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
+                # 'load_params_path': False, # path to pretrained trainable parameters
+                'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
                 'save_params': False,
                 'eval_every_n_batch': 25,
                 'smoke_test': args.smoke_test,
@@ -963,6 +1052,7 @@ if __name__ == '__main__':
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
                                 # 'num_steps': 100 if args.smoke_test else 5000,
+                                # 'num_steps': 10,
                                 'num_steps': -1,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
@@ -971,6 +1061,7 @@ if __name__ == '__main__':
                                 'regularizer': False,
                                 'weight_decay': 0.,
                                 'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
+                                'temperature': [1.0, 2.0, 4.0,],
                                 # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                                 #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
                                 'filter_masks':[{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},

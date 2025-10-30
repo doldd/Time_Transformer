@@ -3,7 +3,6 @@ import jax.numpy as jnp
 from jax import jit, grad
 from scipy.special import binom
 import numpy as np
-import blackjax
 import time
 import numpyro.distributions as dist
 from functools import partial

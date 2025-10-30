@@ -871,9 +871,9 @@ def train(logger, config):
         lines2, labels2 = ax2.get_legend_handles_labels()
         lines3, labels3 = ax3.get_legend_handles_labels()
         ax.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best', fontsize='small')
+        plt.tight_layout()
         logger.log(
             {'Curve Predictive': wandb.Image(fig)})
-        # plt.tight_layout()
         # logger.log(
         #     {'Curve Predictive for x_val[0]': wandb.Image(fig)})
 
@@ -889,6 +889,34 @@ def train(logger, config):
             print("Compute posterior weights on train set")
             train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
             train_curve_metric, _ = train_metrics_fn(rng_key, params)
+
+            # plot curve of train log likelihood
+            fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
+            logger.log({k+'_mean':v.mean() for k,v in train_curve_metric.items()})
+            logger.log({k+'_max':v.max() for k,v in train_curve_metric.items()})
+            logger.log({k+'_min':v.min() for k,v in train_curve_metric.items()})
+            ax.plot(t_space, -train_curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
+            ax2 = ax.twinx()
+            ax2.plot(t_space, train_curve_metric['final_acc'], label="test acc",
+                    c=plt.get_cmap('tab10')(1), linestyle="--")
+            ax3 = ax.twinx()
+            ax3.spines["right"].set_position(("outward", 40))
+            ax3.set_frame_on(True)
+            ax3.patch.set_visible(False)
+            ax3.plot(t_space, train_curve_metric['final_ece'], label="test ece",
+                    c=plt.get_cmap('tab10')(2), linestyle=":")
+            ax.set_xlabel("t")
+            ax.set_ylabel("mean log likelihood")
+            ax2.set_ylabel("Accuracy")
+            ax3.set_ylabel("ECE")
+            ax.set_title("Final trainset")
+            lines, labels = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            lines3, labels3 = ax3.get_legend_handles_labels()
+            ax.legend(lines + lines2 + lines3, labels + labels2 + labels3, loc='best', fontsize='small')
+            plt.tight_layout()
+            logger.log(
+                {'Curve Predictive Train': wandb.Image(fig)})
             
             # loss is mean and without correct likelihood constant. In addition Uniform prior is dropped to unnormalized log posterior computation
             weights = jax.vmap(compute_weights, in_axes=(None, 0))(-train_curve_metric['f_train_loss'], jnp.array(temperature))  # shape (#temperature, #samples)

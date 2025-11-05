@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC.py
-name: Qwen LoRA MLE OOD
+name: Qwen LoRA MAP OOD
 description: "OOD from obqa dataset"
 method: grid
 metric:
@@ -15,7 +15,8 @@ parameters:
              "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
              "ddold/qwen_PtoC/ARC-Easy_dataset:v0"]
   load_params_path:
-    value: "ddold/qwen_PtoC/47xexal3"
+    value: "ddold/qwen_PtoC/6w5rrxyg" # MAP
+    # value: "ddold/qwen_PtoC/47xexal3" # MLE
   net_kwargs:
     parameters:
       model_path:
@@ -87,7 +88,7 @@ parameters:
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 1e-4}, grad_clip_norm: 100.0, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
-            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
+            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
         # parameters:
         #   name:
         #     value: "sgd"

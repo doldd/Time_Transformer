@@ -549,8 +549,10 @@ def train(logger, config):
                 x_, y_, batch_idx = batch
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
+
+                t = random.uniform(subkey, (1,), minval=0., maxval=1.)
                 loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, x_, y_, opt_state, optimizer)
+                    subkey, t, params, x_, y_, opt_state, optimizer)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -587,8 +589,10 @@ def train(logger, config):
                 x_, y_, batch_idx = batch
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
+
+                t = random.uniform(subkey, (1,), minval=0., maxval=1.)
                 loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, x_, y_, opt_state, optimizer)
+                    subkey, t, params, x_, y_, opt_state, optimizer)
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
@@ -640,8 +644,9 @@ def train(logger, config):
         #     for b, (xb_, yb_) in batch_loop:
         #         rng_key, subkey = random.split(rng_key)
         #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
+        #         t = random.uniform(subkey, (1,), minval=0., maxval=1.)
         #         loss, params, opt_state, grad_ = s_model.train_step(
-        #             subkey, params, xb_, yb_, opt_state, optimizer)
+        #             subkey, t, params, xb_, yb_, opt_state, optimizer)
         #         grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k), axis=1).mean()
 
         #         batch_loop.set_postfix({"Loss": loss})

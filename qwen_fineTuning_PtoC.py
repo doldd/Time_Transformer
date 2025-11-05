@@ -577,8 +577,9 @@ def train(logger, config):
 
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
+                t = random.uniform(subkey, (1,), minval=0., maxval=1.)
                 loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                    subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
                 current_lr = lr_schedule(opt_state[-1][-1].count)
                 # validate
@@ -614,8 +615,9 @@ def train(logger, config):
                 # jax.debug.print("Batch idx: {}", batch_idx)
                 rng_key, params, opt_state, best_loss, best_params = carry
                 rng_key, subkey = random.split(rng_key)
+                t = random.uniform(subkey, (1,), minval=0., maxval=1.)
                 loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                    subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # because of optax.chain[-1] gets state of optimizer and  [-1][-1] gets state of learning rate scheduler
                 current_lr = lr_schedule(opt_state[-1][-1].count)  
                 
@@ -681,8 +683,9 @@ def train(logger, config):
 
         #         rng_key, subkey = random.split(rng_key)
         #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
+        #         t = random.uniform(subkey, (1,), minval=0., maxval=1.)
         #         loss, params, opt_state, grad_ = s_model.train_step(
-        #             subkey, params, (xb_, amb_), yb_, opt_state, optimizer)
+        #             subkey, t,  params, (xb_, amb_), yb_, opt_state, optimizer)
         #         # grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, curve_mask, k), axis=1).mean()
 
         #         batch_loop.set_postfix({"Loss": loss})
@@ -1064,8 +1067,8 @@ if __name__ == '__main__':
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
-                # 'load_params_path': False, # path to pretrained trainable parameters
-                'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
+                'load_params_path': False, # path to pretrained trainable parameters
+                # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
                 'save_params': False,
                 'eval_every_n_batch': 25,
                 'smoke_test': args.smoke_test,
@@ -1080,8 +1083,8 @@ if __name__ == '__main__':
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
                                 # 'num_steps': 100 if args.smoke_test else 5000,
-                                # 'num_steps': 10,
-                                'num_steps': -1,
+                                'num_steps': 10,
+                                # 'num_steps': -1,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,

@@ -192,10 +192,11 @@ def main():
         for batch_idx in tqdm(range(n_batches), desc=f"Epoch {epoch + 1}", leave=False):
             key, subkey = random.split(key)
             
+            t = random.uniform(subkey, (1,), minval=0., maxval=1.)
             # Training step
             loss, curve_params, opt_state, grad = s_model.train_step(
-                subkey, curve_params, 
-                x_shuffled[batch_idx], y_shuffled[batch_idx], 
+                subkey, t, curve_params,
+                x_shuffled[batch_idx], y_shuffled[batch_idx],
                 opt_state, optimizer
             )
             

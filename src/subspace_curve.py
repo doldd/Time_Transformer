@@ -247,7 +247,7 @@ class SubspaceBaseModel:
     - __call__(params, t, x): Computes the output of the model for given parameters, time, and input.
     - nll(params, t, x, y): Computes the negative log-likelihood loss of the model.
     - compute_loss(key, params, x, y, n_samples=1): Computes the loss of the model.
-    - train_step(key, params, x, y, opt_state, optimizer): Performs a single training step.
+    - train_step(key, t, params, x, y, opt_state, optimizer): Performs a single training step.
 
     """
 
@@ -479,7 +479,7 @@ class SubspaceBaseModel:
         return alpha * (x ** 2).sum()
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         """
         Computes the loss of the model.
 
@@ -495,7 +495,7 @@ class SubspaceBaseModel:
 
         """
         # Sample t param of Bezier curve
-        t = random.uniform(key, (1,), minval=0., maxval=1.)
+        # t = random.uniform(key, (1,), minval=0., maxval=1.)
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         loss, state, out = self.nll(joind_param, state, t, x, y, train=True)
         if self.weight_decay == 0.:
@@ -506,7 +506,7 @@ class SubspaceBaseModel:
             return loss, state
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_natural_t(self, key, params, state, x, y):
+    def compute_loss_natural_t(self, key, t, params, state, x, y):
         """
         Computes the loss of the model.
 
@@ -546,9 +546,9 @@ class SubspaceBaseModel:
                                  for w in jax.tree.leaves(params['params'])), state
 
     # @partial(jit, static_argnums=(0, 6))
-    @partial(jit, static_argnums=(0, 6), donate_argnums=(2,5))
+    @partial(jit, static_argnums=(0, 7), donate_argnums=(3,6))
     # @profile
-    def train_step(self, key, params, x, y, opt_state, optimizer):
+    def train_step(self, key, t, params, x, y, opt_state, optimizer):
         """
         Performs a single training step.
 
@@ -567,7 +567,7 @@ class SubspaceBaseModel:
         trainable_params = self.only_trainable_params(params['params'])
         freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
         (loss, stats_params), grads = jax.value_and_grad(
-            self.compute_loss, argnums=1, has_aux=True)(key, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
+            self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
         # update params
         updates, opt_state = optimizer.update(
             grads, opt_state, trainable_params)
@@ -809,9 +809,9 @@ class RepulsiveMixin:
     
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, params, state, x, y):
+    def compute_loss_t(self, key, t, params, state, x, y):
         # Sample t param of Bezier curve
-        nll, state = super().compute_loss_t(key, params, state, x, y)
+        nll, state = super().compute_loss_t(key, t, params, state, x, y)
         rep_force = self.regularizer(params)
         return nll + self.gravity * rep_force, state
 

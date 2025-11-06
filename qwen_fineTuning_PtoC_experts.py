@@ -240,9 +240,11 @@ def train(logger, config):
             print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
 
             # compute num_epochs if num_steps is given
-            if num_steps > 0:
-                num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
-                print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
+            if num_epochs > 0:
+                num_steps = int(np.ceil(1.*num_epochs * len(input_ids) / batch_size))
+            # if num_steps > 0:
+            #     num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
+            #     print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
 
             # Split data (simple train/val split) # we dont use validate data
             n_train = int(np.ceil(1.*len(input_ids) / batch_size) * batch_size)
@@ -563,99 +565,50 @@ def train(logger, config):
                 return jnp.linalg.norm(cp.mean(axis=0) - mean_center_t0)
             return rel_center
         
-        # init metric
-        # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        # rel_center_fn = init_rel_center(cp_w)
 
-        if k > 0:
-            @partial(jit, donate_argnums=(0,))
-            def train_batch(carry, batch):
-                x_batch, atten_batch, y_, batch_idx = batch
-                # # skip leading padding tokens in batch for faster training
-                # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-                # atten_batch = atten_batch[:, max_seqlen:]
+        # train step
+        window_size = batch_size//2  # half window size for curve training
 
-                rng_key, params, opt_state, best_loss, best_params = carry
-                rng_key, subkey = random.split(rng_key)
-                loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-                # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-                current_lr = lr_schedule(opt_state[-1][-1].count)
-                # validate
-                rng_key, valid_key = random.split(rng_key)
+        @scan_tqdm(num_steps)
+        @partial(jit, donate_argnums=(0,))
+        def train_expert_step(carry, step):
+            # x_all, atten_all, y_all, step = data
+            # # skip leading padding tokens in batch for faster training
+            # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
+            # atten_batch = atten_batch[:, max_seqlen:]
 
-
-                # metrics = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
-                # mse, val_loss = valid_metrics_fn(valid_key, params)
-                metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params)[0], lambda x: empty_metric[0], None)
-                best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
-                best_loss = jnp.minimum(best_loss, metrics['val_loss'])
-
-                # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-                # length = bezier_length(cp_w)
-                # l_bound = lower_bound(cp_w)
-                # u_bound = upper_bound(cp_w)
-                # gyra = gyration(cp_w)
-                # center = mass_center(cp_w)
-                # mean_curv = mean_curvature2(cp_w)
-                # rel_center = rel_center_fn(cp_w)
-                # cos_sim = s_model.summed_cosine_similarity(params['params'])
-                # cos_sim /= ((k+1)*k/2)
-                # grad_norm = 0.
-                # grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, s_model.curve_mask, k), axis=1).mean()
-                # return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, **metrics, 'grad_norm': grad_norm}
-                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, 'current_lr': current_lr, **metrics}
-        else:
-            @partial(jit, donate_argnums=(0,))
-            def train_batch(carry, batch):
-                x_batch, atten_batch, y_, batch_idx = batch
-                # jax.debug.print("Batch idx: {}", batch_idx)
-                rng_key, params, opt_state, best_loss, best_params = carry
-                rng_key, subkey = random.split(rng_key)
-                loss, params, opt_state, grad_ = s_model.train_step(
-                    subkey, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-                # because of optax.chain[-1] gets state of optimizer and  [-1][-1] gets state of learning rate scheduler
-                current_lr = lr_schedule(opt_state[-1][-1].count)  
-                
-                # jax.debug.print("Training loss: {}", loss)
-                # validate
-                rng_key, valid_key = random.split(rng_key)
-
-                metrics = jax.lax.cond((batch_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params)[0], lambda x: empty_metric[0], None)
-                best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
-                best_loss = jnp.minimum(best_loss, metrics['val_loss'])
-
-                return (rng_key, params, opt_state, best_loss, best_params), {'loss': loss, 'current_lr': current_lr, **metrics}
-
-        @scan_tqdm(num_epochs)
-        def train_epoch(carry, epoch):
-            rng_key = carry[0]
+            # get curve parameter
+            rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all) = carry
             rng_key, subkey = random.split(rng_key)
-            shuffel = jax.random.permutation(subkey, jnp.arange(train_labels.shape[0]))
-            x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
-            x_atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
-            y_ = es('(ib)...->ib...', train_labels[shuffel], b=batch_size)
-            
-            # Limit number of batches for smoke test
-            if smoke_test:
-                smoke_batch_limit = 3
-                n_batches = min(smoke_batch_limit, x_.shape[0])
-                x_ = x_[:n_batches]
-                x_atten_mask = x_atten_mask[:n_batches]
-                y_ = y_[:n_batches]
-                jax.debug.print(f"Smoke test: Limited to {n_batches} batches per epoch")
-                
-            # train on batches
-            carry, metrics = jax.lax.scan(
-                train_batch, carry, (x_, x_atten_mask, y_, jnp.arange(x_.shape[0])))
-            jax.clear_caches()
-            # jax.debug.print(f"Epoch {epoch+1}/{num_epochs}, Loss: {metrics['loss'][-1].item()}{metrics['loss'].shape}, Val Loss: {metrics['val_loss'][-1]}, Val Acc: {metrics['val_acc'][-1]}")
-            jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], metrics['val_loss'][-1], metrics['val_acc'][-1])
-            return carry, metrics
+            t = random.uniform(subkey, (1,), minval=0., maxval=1.)
+
+            # get batch from data
+            pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
+            pos = jnp.clip(pos, window_size, x_all.shape[0]-window_size-1)
+            pos_start = (pos - window_size)
+            x_batch = jax.lax.dynamic_slice(x_all, (pos_start, 0), (batch_size, x_all.shape[1]))
+            atten_batch = jax.lax.dynamic_slice(atten_all, (pos_start, 0), (batch_size, atten_all.shape[1]))
+            y_ = jax.lax.dynamic_slice(y_all, (pos_start,), (batch_size,))
+
+            loss, params, opt_state, grad_ = s_model.train_step(
+                subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+            # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+            current_lr = lr_schedule(opt_state[-1][-1].count)
+            # validate
+            rng_key, valid_key = random.split(rng_key)
+
+
+            # metrics = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
+            # mse, val_loss = valid_metrics_fn(valid_key, params)
+            metrics = jax.lax.cond((step % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
+                valid_key, params)[0], lambda x: empty_metric[0], None)
+            best_params = jax.lax.cond(
+                metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
+            best_loss = jnp.minimum(best_loss, metrics['val_loss'])
+
+            return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics}
+    
+        
 
         # print memory stats
         memory_stats = jax.devices()[0].memory_stats()
@@ -663,69 +616,21 @@ def train(logger, config):
             print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
 
-        # # # # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_0.json')
-        # for e in tqdm(range(num_epochs)):
-        #     print(f"Epoch {e+1}/{num_epochs}")
-        #     rng_key, subkey = random.split(rng_key)
-        #     shuffel = jax.random.permutation(subkey, jnp.arange(train_labels.shape[0]))
-        #     x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
-        #     atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
-        #     y_ = es('(ib)...->ib...', train_labels[shuffel], b=batch_size)
-
-        #     # train on batches
-        #     batch_loop = tqdm(enumerate(zip(x_,atten_mask, y_)), leave=False)
-        #     for b, (xb_, amb_, yb_) in batch_loop:
-        #         # skip leading padding tokens in batch for faster training
-        #         xb_ = xb_[:, (max_seqlen:=jnp.argmax(amb_, axis=1).min()):]
-        #         amb_ = amb_[:, max_seqlen:]
-
-        #         rng_key, subkey = random.split(rng_key)
-        #         # jax.profiler.save_device_memory_profile(f'mem_profile/memory_profile_{e}_{b}.json')
-        #         loss, params, opt_state, grad_ = s_model.train_step(
-        #             subkey, params, (xb_, amb_), yb_, opt_state, optimizer)
-        #         # grad_norm = jnp.linalg.norm(masked_pytree_to_matrix(grad_, curve_mask, k), axis=1).mean()
-
-        #         batch_loop.set_postfix({"Loss": loss})
-        #         logs = {
-        #             'epoch': e+1, 'batch': b+1, 'stepp': e*x_.shape[0]+b+1,
-        #             'train_loss': loss,
-        #             # 'grad_mean': grad_norm
-        #         }
-        #         if jnp.isnan(loss):
-        #             print(f"Loss is NaN at epoch {e+1}, batch {b+1}. Stopping training.")
-        #             break
-                
-        #         # validate
-        #         rng_key, valid_key = random.split(rng_key)
-        #         # if b % EVAL_EVERY_N_BATCH == 0:
-        #         #     logs =  {**logs, **valid_metrics_fn(valid_key, params)}
-        #         #     if logs['val_loss'] < best_loss:
-        #         #         best_params = jax.device_put(params, jax.devices('cpu')[0])
-        #         #         best_loss = logs['val_loss']
-        #         logger.log(logs)
-                
-        #     batch_loop.close()
-        #     if jnp.isnan(loss):
-        #         print(f"ERROR: Stopping training at epoch {e+1} due to NaN loss.")
-        #         break
-
-        # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
-
         if num_epochs > 0 or num_steps > 0:
             print(f"Start training for {num_epochs} epochs")
-            carry = (rng_key, params, opt_state, best_loss, best_params)
+            carry = (rng_key, params, opt_state, best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
             carry, metrics = jax.lax.scan(
-                train_epoch, carry, jnp.arange(num_epochs))
+                train_expert_step, carry, jnp.arange(num_steps))
 
             # log losses for wandb
-            n_batches = np.array(metrics['loss']).shape[-1]
-            epochs = np.repeat(np.arange(num_epochs), n_batches)
+            # n_batches = np.array(metrics['loss']).shape[-1]
+            # epochs = np.repeat(np.arange(num_epochs), n_batches)
 
             # clean up inf values because of lazy validation
             for key, value in metrics.items():
                 if key.startswith('val_'):
-                    metrics[key] = jnp.array(value)[:, ::EVAL_EVERY_N_BATCH].repeat(
-                        EVAL_EVERY_N_BATCH, axis=1)[:,:value.shape[1]].flatten()
+                    metrics[key] = jnp.array(value)[::EVAL_EVERY_N_BATCH].repeat(
+                        EVAL_EVERY_N_BATCH, axis=0)[:value.shape[0]].flatten()
                 else:
                     metrics[key] = jnp.array(value).flatten()
 
@@ -739,7 +644,7 @@ def train(logger, config):
                 print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
 
             # log metrics as artifact
-            jnp.savez(f'tmp_files/{logger.id}_metrics.npz', **metrics, epochs=epochs)
+            jnp.savez(f'tmp_files/{logger.id}_metrics.npz', **metrics)
             art = wandb.Artifact(name="metrics", type="npz")
             art.add_file(f'tmp_files/{logger.id}_metrics.npz')
             logger.log_artifact(art)
@@ -808,7 +713,7 @@ def train(logger, config):
                  c=plt.get_cmap('tab10')(1), linestyle="--")
 
         ax3 = ax.twinx()
-        ax3.spines["right"].set_position(("outward", 40))
+        ax3.spines["right"].set_position(("outward", 60))
         ax3.set_frame_on(True)
         ax3.patch.set_visible(False)
         ax3.plot(t_space, curve_metric['final_ece'], label="test ece",
@@ -887,8 +792,10 @@ def train(logger, config):
                 return jnp.exp(log_post)
         if num_epochs > 0 or num_steps > 0: # train ds must be defined
             print("Compute posterior weights on train set")
+            if smoke_test:
+                train_input_ids, train_attention_mask, train_labels = train_input_ids[:BATCH_SIZE_EVAL*4], train_attention_mask[:BATCH_SIZE_EVAL*4], train_labels[:BATCH_SIZE_EVAL*4]
             train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
-            train_curve_metric, _ = train_metrics_fn(rng_key, params)
+            train_curve_metric, train_logits = train_metrics_fn(rng_key, params)
 
             # plot curve of train log likelihood
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
@@ -900,7 +807,7 @@ def train(logger, config):
             ax2.plot(t_space, train_curve_metric['f_train_acc'], label="test acc",
                     c=plt.get_cmap('tab10')(1), linestyle="--")
             ax3 = ax.twinx()
-            ax3.spines["right"].set_position(("outward", 40))
+            ax3.spines["right"].set_position(("outward", 60))
             ax3.set_frame_on(True)
             ax3.patch.set_visible(False)
             ax3.plot(t_space, train_curve_metric['f_train_ece'], label="test ece",
@@ -921,7 +828,7 @@ def train(logger, config):
             # loss is mean and without correct likelihood constant. In addition Uniform prior is dropped to unnormalized log posterior computation
             weights = jax.vmap(compute_weights, in_axes=(None, 0))(-train_curve_metric['f_train_loss'], jnp.array(temperature))  # shape (#temperature, #samples)
             art_w = wandb.Artifact(name="bma_weights", type="npz")
-            jnp.savez(f'tmp_files/{logger.id}_weights.npz', weights=weights, t_space=t_space, log_like=-train_curve_metric['f_train_loss'], temperature=temperature)
+            jnp.savez(f'tmp_files/{logger.id}_weights.npz', weights=weights, t_space=t_space, log_like=-train_curve_metric['f_train_loss'], temperature=temperature, train_logits = train_logits, test_logits = logits_test, train_labels=train_labels, test_labels=test_labels)
             art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
             logger.log_artifact(art_w)
             print("Saved posterior weights artifact")
@@ -1064,8 +971,8 @@ if __name__ == '__main__':
                 'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
                 # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
                 # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
-                # 'load_params_path': False, # path to pretrained trainable parameters
-                'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
+                'load_params_path': False, # path to pretrained trainable parameters
+                # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
                 'save_params': False,
                 'eval_every_n_batch': 25,
                 'smoke_test': args.smoke_test,
@@ -1080,8 +987,8 @@ if __name__ == '__main__':
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
                                 # 'num_steps': 100 if args.smoke_test else 5000,
-                                # 'num_steps': 10,
-                                'num_steps': -1,
+                                'num_steps': 10,
+                                # 'num_steps': -1,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,

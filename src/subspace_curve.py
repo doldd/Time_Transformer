@@ -319,7 +319,7 @@ class SubspaceBaseModel:
         self.curve_mask = mask
         return mask
     
-    def init_params_from_point(self, key, point, mask, noise_fn):
+    def init_params_from_point(self, key, params, mask, noise_fn):
         """
         Initializes curve parameters from a given parameter point, optionally adding noise and handling permutation invariance.
         Args:
@@ -335,7 +335,7 @@ class SubspaceBaseModel:
             - Non-curve parameters are reverted to their original values from `point['params']`.
             - The mask used for curve parameters is stored in `self.curve_mask`.
         """
-        assert ('params' in point) and len(point.keys())==1, "Point must contain 'params' key and no other keys."
+        assert ('params' in params) and len(params.keys())==1, "Point must contain 'params' key and no other keys."
         # curve_params = [deepcopy(point['params']) for _ in range(self.k+1)]
         # # add noise to the parameters
         # param, struct = jax.tree.flatten(curve_params)
@@ -357,21 +357,57 @@ class SubspaceBaseModel:
         # all_params = deepcopy(point)
         # all_params['params'] = curve_params
 
+        # def make_curve(m, p, key):
+        #     if m:
+        #         curve_param = jnp.stack([p] * (self.k + 1))
+        #         curve_param = noise_fn(curve_param, key)
+        #         return curve_param
+        #     else:
+        #         return p
+
+        # mf, struct = jax.tree.flatten(mask)
+        # rng_keys = random.split(key, len(mf))
+        # rng_keys = jax.tree.unflatten(struct, rng_keys)
+        # all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
+
+        # self.curve_mask = mask
+        # return {'params': all_params}
+    
+        # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
         def make_curve(m, p, key):
             if m:
-                curve_param = jnp.stack([p] * (self.k + 1))
-                curve_param = noise_fn(curve_param, key)
-                return curve_param
+                if type(p) is LoRAParams:
+                    gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
+                    shape_ = (self.k+1,) + p.A.shape
+                    init_a = jax.nn.initializers.variance_scaling(in_axis=-1, out_axis=range(len(shape_))[:-1], distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
+                    # keys = random.split(key, self.k + 1)
+                    p.A = init_a(key, shape_, dtype=p.A.dtype)
+                    return p
+                elif type(p) is LoRAScaleParams:
+                    raise NotImplementedError("LoRAScaleParams initialization not implemented in init_params_from_point.")
+                elif type(p) is LoRAABParam:
+                    gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
+                    shape_ = (self.k+1,) + p.A.shape
+                    init_a = jax.nn.initializers.variance_scaling(in_axis=-1, out_axis=range(len(shape_))[:-1], distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
+                    # keys = random.split(key, self.k + 1)
+                    p.A = init_a(key, shape_, dtype=p.A.dtype)
+                    p.B = jnp.zeros((self.k + 1,) + p.B.shape, dtype=p.B.dtype)
+                    return p
+                else:
+                    curve_param = jnp.stack([p] * (self.k + 1))
+                    curve_param = noise_fn(curve_param, key)
+                    return curve_param
             else:
                 return p
 
         mf, struct = jax.tree.flatten(mask)
         rng_keys = random.split(key, len(mf))
         rng_keys = jax.tree.unflatten(struct, rng_keys)
-        all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
+        params['params'] = jax.tree.map(make_curve, mask, params['params'], rng_keys, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
 
         self.curve_mask = mask
-        return {'params': all_params}
+        return params
+
     
     def init_params(self, key, x, mask):
         """
@@ -828,9 +864,7 @@ class RepulsiveCategorySubspace(RepulsiveMixin, CategorySubspace):
 class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
     pass
 
-
-@register_pytree_node_class
-class LoRAParams:
+class LoraAbstractParams:
     def __init__(self, A, B, w0, dims: tuple, lora_alpha: float):
         self.A = A
         self.B = B
@@ -838,13 +872,16 @@ class LoRAParams:
         self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes (First axis is for B second for A)
         self.lora_alpha = lora_alpha  # Scaling factor for LoRA, can be adjusted as needed
 
+@register_pytree_node_class
+class LoRAParams(LoraAbstractParams):
+
     @property
     def shape(self):
         return {'A':self.A.shape, 'B':self.B.shape, 'w0':self.w0.shape}
 
     def __repr__(self):
-        # return f"LoRAParams(A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape})"
-        return f"LoRAParams(A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        return f"LoRA (A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        # return f"LoRA (A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
     
     def tree_flatten(self):
         children = (self.A, self.B, self.w0)
@@ -862,6 +899,42 @@ class LoRAParams:
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
         scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
         return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+    
+@register_pytree_node_class
+class LoRAABParam(LoRAParams):
+    pass
+
+@register_pytree_node_class
+class LoRAScaleParams(LoraAbstractParams):
+    def __init__(self, A, s, B, w0, dims: tuple, lora_alpha: float):
+        super().__init__(A, B, w0, dims, lora_alpha)
+        self.s = s
+
+    @property
+    def shape(self):
+        return {'A':self.A.shape, 's':self.s.shape, 'B':self.B.shape, 'w0':self.w0.shape}
+
+    def __repr__(self):
+        return f"LoRA(A={self.A.shape}, s={self.s.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        # return f"LoRA(A={self.A}, s={self.s}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+
+    def tree_flatten(self):
+        children = (self.A, self.s, self.B, self.w0)
+        aux_data = (self.dims, self.lora_alpha)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        A, s, B, w0 = children
+        return cls(A, s, B, w0, *aux_data)
+
+    def apply(self):
+        # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
+        A_ = jnp.matmul(self.s, self.A)  # Scale A by s
+        w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
+        w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
+        scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
+        return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
 
 class LoRAMixin:
     """
@@ -871,16 +944,19 @@ class LoRAMixin:
     - r (int): The rank for the LoRA adaptation.
     - lora_mask (dict): A mask indicating which parameters should be adapted using LoRA.
     - lora_dtype (str): The data type for LoRA parameters. Options are "original", "float16", "bfloat16", "float32".
+    - lora_alpha (float): Scaling factor for LoRA.
+    - lora_mode (str): The mode of LoRA adaptation. Options are "A(t)B", "As(t)B", "A(t)B(t)".
     - kwargs: Additional keyword arguments for the parent class.
     """
 
-    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, **kwargs):
+    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", **kwargs):
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
         self.w0_params = None  # Placeholder for non-LoRA parameters
         self.lora_dtype = lora_dtype
         self.lora_alpha = lora_alpha
+        self.lora_mode = lora_mode
     
     def get_dtype(self, param):
         if self.lora_dtype == "original":
@@ -900,7 +976,7 @@ class LoRAMixin:
         mask = tree_broadcast(mask, lora_params) # broadcast mask to the shape of lora_params
         def adapt_mask(mask):
             """Set B and w0 to False and A corresponds to the original curve mask."""
-            if isinstance(mask, LoRAParams):
+            if isinstance(mask, LoraAbstractParams):
                 # Do not use LoRA for w0 and B
                 if b_off:
                     mask.B = False
@@ -910,7 +986,7 @@ class LoRAMixin:
             else:
                 # For other parameters, keep the mask as is
                 return mask
-        mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoRAParams))
+        mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
         return mask
     
     def init_params_from_point(self, key, params, mask, noise_fn):
@@ -977,41 +1053,31 @@ class LoRAMixin:
                     # gain = jnp.sqrt(6 / np.prod(shape_))  # Gain for initialization
                     # A = jax.random.uniform(subkey, shape_builder(p.shape, m[0]), dtype=p.dtype)
                     A = jnp.moveaxis(A, [m[0], m[1]], [-2, -1])  # Move the first axis to the last position
-                    lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A and B as a tuple
+                    if self.lora_mode == "A(t)B":
+                        lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A and B as a tuple
+                    elif self.lora_mode == "As(t)B":
+                        s = jnp.ones((rank, 1), dtype=dtype)  # Scaling vector for A
+                        lora_params.append(LoRAScaleParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A, s and B
+                    elif self.lora_mode == "A(t)B(t)":
+                        lora_params.append(LoRAABParam(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # used to indicate both A and B are time dependent
+                    else:
+                        raise ValueError(f"Unknown lora_mode: {self.lora_mode} || Supported modes are 'A(t)B', 'As(t)B', 'A(t)B(t)'")
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
                 else:
                     lora_params.append(p)
 
             lora_params = jax.tree_util.tree_unflatten(structure, lora_params)
             return lora_params
-        params = initialize_lora_params(key, params['params'], self.lora_mask, rank=self.r)
+        params['params'] = initialize_lora_params(key, params['params'], self.lora_mask, rank=self.r)
+        params = super().init_params_from_point(key, params, mask, noise_fn)
 
-
-        # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
-        def make_curve(m, p, key):
-            if m:
-                if isinstance(p, LoRAParams):
-                    gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
-                    shape_ = (self.k+1,) + p.A.shape
-                    init_a = jax.nn.initializers.variance_scaling(in_axis=-1, out_axis=range(len(shape_))[:-1], distribution='uniform', mode="fan_in", scale=gain**2) # fan_in = all shapes except m[1]
-                    # keys = random.split(key, self.k + 1)
-                    p.A = init_a(key, shape_, dtype=p.A.dtype)
-                    return p
-                else:
-                    curve_param = jnp.stack([p] * (self.k + 1))
-                    curve_param = noise_fn(curve_param, key)
-                    return curve_param
-            else:
-                return p
-
-        mf, struct = jax.tree.flatten(mask)
-        rng_keys = random.split(key, len(mf))
-        rng_keys = jax.tree.unflatten(struct, rng_keys)
-        params = jax.tree.map(make_curve, mask, params, rng_keys, is_leaf=lambda x: isinstance(x, LoRAParams))
-
-        mask_update = self.update_mask_for_lora(mask, params, b_off=True, w0_off=True)
+        if self.lora_mode == "A(t)B(t)":
+            mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
+        else:
+            # update the original curve mask to include LoRA parameter B into curve approach if the parameter was originally selected by the mask
+            mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True)
         self.curve_mask = mask_update
-        return {'params': params}
+        return params
     
         # # update the original curve mask to include LoRA parameter A into curve approach if the parameter was originally selected by the mask
         # params = super().init_params_from_point(key, {'params': lora_params}, mask_update, noise_fn)
@@ -1043,7 +1109,7 @@ class LoRAMixin:
             'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
         
         # Apply LoRA to the parameters
-        params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoRAParams) else lp, params, is_leaf=lambda x: isinstance(x, LoRAParams))
+        params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoraAbstractParams) else lp, params, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
 
         # forward pass per sample
         out, state = self._predict(params, state, x, train=train)

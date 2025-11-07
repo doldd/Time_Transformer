@@ -303,7 +303,7 @@ def train(logger, config):
             print("Using LoRA with parameters:", lora_params)
             if regularizer:
                 print("Using LoRARepulsiveCategorySubspace with regularizer")
-                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'],
+                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
                                                         model=model, k=k, weight_decay=weight_decay,
                                                         perm_spec=perm_spec,
                                                         natural_parameterization=natural_parameterization,
@@ -311,7 +311,7 @@ def train(logger, config):
                                                         gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using QuantileSubspace without repulsive force")
-                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'],
+                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
                                                model=model, k=k, weight_decay=weight_decay, 
                                                perm_spec=perm_spec,
                                                natural_parameterization=natural_parameterization,
@@ -425,6 +425,7 @@ def train(logger, config):
         if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
             raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
 
+        print("Computing initial metrics...")
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
         init_metrics, _ = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
@@ -1075,6 +1076,7 @@ if __name__ == '__main__':
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,
+                                'lora_mode': 'A(t)B(t)',
                                 'filter_masks': 
                                     [{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                      {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},

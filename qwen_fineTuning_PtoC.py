@@ -1088,7 +1088,8 @@ if __name__ == '__main__':
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,
-                                'lora_mode': 'A(t)B(t)',
+                                # 'lora_mode': 'A(t)B(t)',
+                                'lora_mode': 'As(t)B',
                                 'filter_masks': 
                                     [{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                      {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},

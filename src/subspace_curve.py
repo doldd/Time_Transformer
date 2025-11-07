@@ -384,7 +384,11 @@ class SubspaceBaseModel:
                     p.A = init_a(key, shape_, dtype=p.A.dtype)
                     return p
                 elif type(p) is LoRAScaleParams:
-                    raise NotImplementedError("LoRAScaleParams initialization not implemented in init_params_from_point.")
+                    shape_ = (self.k+1,) + p.s.shape 
+                    init_s = jax.nn.initializers.orthogonal()
+                    p.s = init_s(key, shape_, dtype=p.s.dtype)
+                    return p
+                    # raise NotImplementedError("LoRAScaleParams initialization not implemented in init_params_from_point.")
                 elif type(p) is LoRAABParam:
                     gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
                     shape_ = (self.k+1,) + p.A.shape
@@ -972,7 +976,7 @@ class LoRAMixin:
                 raise ValueError(f"Unknown lora_dtype: {self.lora_dtype}")
 
     @staticmethod
-    def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True):
+    def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True, a_off=False):
         mask = tree_broadcast(mask, lora_params) # broadcast mask to the shape of lora_params
         def adapt_mask(mask):
             """Set B and w0 to False and A corresponds to the original curve mask."""
@@ -982,6 +986,8 @@ class LoRAMixin:
                     mask.B = False
                 if w0_off:
                     mask.w0 = False
+                if a_off:
+                    mask.A = False
                 return mask
             else:
                 # For other parameters, keep the mask as is
@@ -1056,7 +1062,9 @@ class LoRAMixin:
                     if self.lora_mode == "A(t)B":
                         lora_params.append(LoRAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A and B as a tuple
                     elif self.lora_mode == "As(t)B":
-                        s = jnp.ones((rank, 1), dtype=dtype)  # Scaling vector for A
+                        rng_key, subkey = random.split(rng_key)
+                        s = jax.nn.initializers.orthogonal()(subkey, (rank, rank), dtype=dtype)
+                        # s = jnp.ones((rank, 1), dtype=dtype)  # Scaling vector for A
                         lora_params.append(LoRAScaleParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A, s and B
                     elif self.lora_mode == "A(t)B(t)":
                         lora_params.append(LoRAABParam(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # used to indicate both A and B are time dependent
@@ -1073,6 +1081,8 @@ class LoRAMixin:
 
         if self.lora_mode == "A(t)B(t)":
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
+        elif self.lora_mode == "As(t)B":
+            mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True, a_off=True)
         else:
             # update the original curve mask to include LoRA parameter B into curve approach if the parameter was originally selected by the mask
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True)

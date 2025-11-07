@@ -760,6 +760,20 @@ def train(logger, config):
                 length = bezier_length(cp)
                 logger.log({'Curve length': length})
 
+        # compute test metrics with BMA
+        def post_pred_performance(logits, labels, weights:bool|jnp.ndarray=False):
+            # logits shape (n_samples, n_data, n_classes)
+            if type(weights) == jnp.ndarray:
+                post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
+                # post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes) #false because of log multiply
+            else:
+                post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
+            post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
+            post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
+            return {'ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
+                           'acc': post_acc,
+                           'ece': post_ece}
+ 
         # plot likelihood and acc along curve
         fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
         t_space = jnp.linspace(0, 1, 50)
@@ -806,6 +820,10 @@ def train(logger, config):
         logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
         logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
         logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
+
+        post_performance = post_pred_performance(logits_test, test_labels)
+        logger.log({f'post_pred_test_mean_{k}':v for k,v in post_performance.items()})
+
         ax.plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
         ax2 = ax.twinx()
         ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
@@ -892,7 +910,10 @@ def train(logger, config):
         if num_epochs > 0 or num_steps > 0: # train ds must be defined
             print("Compute posterior weights on train set")
             train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
-            train_curve_metric, _ = train_metrics_fn(rng_key, params)
+            train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
+
+            post_performance = post_pred_performance(logits_train, train_labels)
+            logger.log({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
 
             # plot curve of train log likelihood
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
@@ -940,18 +961,9 @@ def train(logger, config):
                         print("Loaded posterior weights from artifact")
             assert weights, f"Weights for posterior predictive could be computed or are not saved in {SWEEP_PARAM_PATH}."
 
-        def post_pred_performance(logits, labels, weights, temp):
-            # logits shape (n_samples, n_data, n_classes)
-            post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
-            post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
-            post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
-            logger.log({f'post_predictive_t{temp}': (-curve_metric['final_loss'] * weights).sum(),
-                        f'post_predictive_ll_t{temp}': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
-                        f'post_pred_acc_t{temp}': post_acc,
-                        f'post_pred_ece_t{temp}': post_ece,
-                        })
         for weight, temp in zip(weights, temperature):
-            post_pred_performance(logits_test, test_labels, weight, temp)
+            post_performance = post_pred_performance(logits_test, test_labels, weight)
+            logger.log({f'post_pred_test_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
 
         # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
         # post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == test_labels)

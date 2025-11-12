@@ -23,6 +23,10 @@ parameters:
         value: "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"
   eval_every_n_batch:
     value: 25
+  dataset_sampling:
+    parameters:
+      minibatch:
+        value: False
   lora_params:
     parameters:
       use_lora:
@@ -33,6 +37,8 @@ parameters:
         value: "float32"  # ["original", "float16", "bfloat16", "float32"]
       lora_alpha:
         value: 16.0
+      lora_mode:
+        values: ["A(t)B", "A(t)B(t)", "As(t)B"]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -44,7 +50,7 @@ parameters:
   curve_params:
     parameters:
       k:
-        values: [0, 2, 5]
+        values: [2, 5]
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -66,7 +72,7 @@ parameters:
       num_steps:
         value: 5_000
       temperature:
-        value: [1.0, 2.0, 4.0, 8.0, 16., 32.0, 512.0]
+        value: [1.0, 2.0, 4.0, 8.0, 16., 32.0,]
 
       filter_masks:
         values: 

@@ -28,6 +28,8 @@ from src.subspace_curve import (
     masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn,
     LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace
 )
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import squareform
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -75,19 +77,31 @@ class QwenTextClassificationWrapper:
         to the underlying model.apply call.
         """
         # Call underlying model.apply and forward Flax-specific kwargs
-        out = self.model.apply(
-            variables,
-            *args,
-            rngs=rngs,
-            method=method,
-            mutable=mutable,
-            capture_intermediates=capture_intermediates,
-            **kwargs,
-        )
-        # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
-        last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-
-        return last_token_logits # Return probabilities for target classes only
+        if mutable: 
+            out, state = self.model.apply(
+                variables,
+                *args,
+                rngs=rngs,
+                method=method,
+                mutable=mutable,
+                capture_intermediates=capture_intermediates,
+                **kwargs,
+            )
+            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
+            return last_token_logits, state # Return probabilities for target classes only   
+        else:
+            out = self.model.apply(
+                variables,
+                *args,
+                rngs=rngs,
+                method=method,
+                mutable=mutable,
+                capture_intermediates=capture_intermediates,
+                **kwargs,
+            )
+            # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
+            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
+            return last_token_logits # Return probabilities for target classes only     
 
 def load_text_classification_data(dataset_path: str, run=None, test=False):
     """
@@ -186,6 +200,30 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     return acc_fn
 
 
+def get_embedding(input_ids, attention_mask, model, params, batch_size = 11):
+    x_ = input_ids[:(matching_limit:=(input_ids.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    x_last = input_ids[matching_limit:]
+    x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+    att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+    att_last = attention_mask[matching_limit:]
+    att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+    # inp_last = 
+    @partial(jax.jit, donate_argnums=(0,))
+    def get_embeddings_(params, data):
+        input_ids, attention_mask = data
+        model_output, state = model.apply(freeze(params), input_ids=input_ids, attention_mask=attention_mask, train=False,
+                                capture_intermediates=True, mutable=['intermediates'])
+        embedding = state['intermediates']['norm']['__call__'][0]
+        return params, embedding
+
+    params, embedding = jax.lax.scan(get_embeddings_, params, (x_, att_m_))
+    embedding = es('ib...->(ib)...', embedding, b=batch_size)
+    if x_last.shape[0] > 0:
+        params, embedding_last = get_embeddings_(params, (x_last, att_last))
+        embedding = jnp.concatenate([embedding, embedding_last], axis=0)
+    return embedding
+
 def main():
     logger = wandb.init()
     config = wandb.config
@@ -271,6 +309,21 @@ def train(logger, config):
         model = QwenTextClassificationWrapper(**net_kwargs, target_token_ids=unique_target_ids)
         params = unfreeze(model.init(None, None))
         dtype = jax.tree.leaves(params)[0].dtype
+
+        #compute embeddings for sorting if expert sampling is used
+        ds_sampling = list(dataset_sampling.keys())
+        assert len(ds_sampling) == 1, "Only one dataset_sampling apporach could be given"
+        ds_sampling = ds_sampling[0]
+        if (ds_sampling == 'expert') and (num_steps > 0):
+            print(f"compute embeddings for expert sort")
+            sort_mode = dataset_sampling['expert'].get('sort_mode', False)
+            if sort_mode:
+                embedding = get_embedding(train_input_ids, train_attention_mask, model, params, batch_size*3)
+                print(f"Computed embeddings for expert sort with shape {embedding.shape}")
+                embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
+                embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
+                # compute cosine similarity matrix  
+                cosine_sim = jnp.dot(embedding, embedding.T)
         
         curve_mask = jax.tree.map(lambda x: False, params['params'])
         # only if k > 0, otherwise no curve parameters are used
@@ -725,11 +778,39 @@ def train(logger, config):
 
         # jax.profiler.save_device_memory_profile(f'memory_profile/memory_profile_1.json')
         if num_steps > 0:
-            ds_sampling = list(dataset_sampling.keys())
-            assert len(ds_sampling) == 1, "Only one dataset_sampling apporach could be given"
-            ds_sampling = ds_sampling[0]
             if ds_sampling == 'expert':
                 print(f"Start sorted expert training for {num_steps}")
+                if sort_mode:
+                    distance = 1 - cosine_sim
+                    distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
+                    if sort_mode == 'Hierarchical':
+                        # convert to condensed vector form
+                        condensed = squareform(distance)
+                        Z = hierarchy.linkage(condensed, method='average')
+                        Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
+                        order = hierarchy.dendrogram(Z_opt, no_plot=True)['leaves']
+                    elif sort_mode == 'Spectral':
+                        # Schritt 3: Gradientenmatrix D
+                        D = jnp.diag(distance.sum(axis=1))
+                        # Schritt 4: Laplacian L
+                        L = D - distance
+                        # Schritt 5: Eigenvektoren holen
+                        vals, vecs = jnp.linalg.eigh(L)
+                        # Schritt 6: Fiedler vector (zweiter kleinster Eigenwert)
+                        fiedler = vecs[:, -2]
+                        # Schritt 7: Sortierung nach Fiedler-Vektor
+                        order = jnp.argsort(fiedler)
+                    elif sort_mode == 'Random':
+                        order = jax.random.permutation(rng_key, distance.shape[0])
+                    elif sort_mode == 'First_data':
+                        order = jnp.argsort(distance[0])
+                    else:
+                        raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
+                    train_input_ids = train_input_ids[order]
+                    train_attention_mask = train_attention_mask[order]
+                    train_labels = train_labels[order]
+                    print(f"Data sorted for expert sampling using {sort_mode} method")
+
                 # init expert training loop
                 window_size = dataset_sampling['expert']['window_size']  # context window size for sampling
                 window_size = max(batch_size, window_size) # at least half batch size

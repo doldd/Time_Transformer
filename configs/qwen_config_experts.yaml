@@ -29,6 +29,8 @@ parameters:
         parameters:
           window_size:
             values: [4, 24]
+          sort_mode:
+            values: [False, "Hierarchical", "Spectral", "Random", "First_data"]
   lora_params:
     parameters:
       use_lora:

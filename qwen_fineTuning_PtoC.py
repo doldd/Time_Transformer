@@ -134,6 +134,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
         get_t = lambda key: jnp.linspace(0, 1., n_samples)
     else:
         get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
+    ii = len(x) // batch_size
     
     def acc_fn(rng_key, params):
         x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
@@ -148,6 +149,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
         y_last = target[matching_limit:]
         y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
+        # @scan_tqdm(ii, desc='Evaluating', leave=False)
         def pred(key, data):
             x_batch, atten_batch, y_batch = data
             # # turn off leading padding tokens in batch for faster evaluation
@@ -223,6 +225,52 @@ def get_embedding(input_ids, attention_mask, model, params, batch_size = 11):
         params, embedding_last = get_embeddings_(params, (x_last, att_last))
         embedding = jnp.concatenate([embedding, embedding_last], axis=0)
     return embedding
+
+
+def mutual_information(logits, weights:np.ndarray|bool=False):
+    """Compute mutual information from logits over samples
+
+    Args:
+        logits: jnp.ndarray of shape (n_samples, n_data, n_classes)
+    Returns:
+        mi: float mutual information averaged over each data point
+    """
+    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
+    if use_weigts:
+        avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
+    else:
+        avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
+    entropy_pred = -jnp.sum(avg_probs * jnp.log(avg_probs + 1e-12), axis=-1)  # (n_data,)
+    if use_weigts:
+        expected_nentropy = jnp.sum(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1) * weights[:, None], axis=0)  # (n_data,)
+    else:
+        expected_nentropy = jnp.mean(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1), axis=0)  # (n_data,)
+    mi = entropy_pred - expected_nentropy  # (n_data,)
+    return jnp.mean(mi)
+
+def mean_entropy(logits, weights:np.ndarray|bool=False):
+    """Compute curve entropy from logits over samples
+
+    Args:
+        logits: jnp.ndarray of shape (n_samples, n_data, n_classes)
+    Returns:
+        entropy: float predictive entropy averaged over each data point
+    """
+    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
+    if use_weigts:
+        avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
+    else:
+        avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
+    entropy_pred = -jnp.sum(avg_probs * jnp.log(avg_probs + 1e-12), axis=-1)  # (n_data,)
+    return jnp.mean(entropy_pred)
+
+def entropy(logits):
+    probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
+    entropies = -jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1)  # (n_samples, n_data)
+    return entropies  # (n_samples, n_data)
+
 
 def main():
     logger = wandb.init()
@@ -318,12 +366,17 @@ def train(logger, config):
             print(f"compute embeddings for expert sort")
             sort_mode = dataset_sampling['expert'].get('sort_mode', False)
             if sort_mode:
-                embedding = get_embedding(train_input_ids, train_attention_mask, model, params, batch_size*3)
+                embedding = get_embedding(train_input_ids, train_attention_mask, model, params, batch_size)
                 print(f"Computed embeddings for expert sort with shape {embedding.shape}")
+                device = embedding.device
+                embedding = jax.device_put(embedding, jax.devices("cpu")[0])
                 embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
                 embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
                 # compute cosine similarity matrix  
-                cosine_sim = jnp.dot(embedding, embedding.T)
+                cosine_sim = jax.device_put(jnp.dot(embedding, embedding.T), device)
+                print(f"Computed cosine similarity matrix with shape {cosine_sim.shape}")
+                del embedding
+                
         
         curve_mask = jax.tree.map(lambda x: False, params['params'])
         # only if k > 0, otherwise no curve parameters are used
@@ -484,9 +537,13 @@ def train(logger, config):
 
         print("Computing initial metrics...")
         init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
-        init_metrics, _ = init_metrics_fn(init_key, params) # returns a dict
+        init_metrics, init_out = init_metrics_fn(init_key, params) # returns a dict
         logger.summary.update(init_metrics)
         jax.debug.print("Initial metrics: {}", init_metrics)
+        # # compute mutual information (BALD)
+        # mi = mutual_information(init_out.astype(jnp.float32))
+        # logger.summary.update({'init_mutual_information': mi})
+        # jax.debug.print("Initial mutual information: {}", mi)
 
         # compute number of parameters
         n_params = sum(p.size for p in jax.tree.flatten(params)[0])
@@ -782,14 +839,18 @@ def train(logger, config):
                 print(f"Start sorted expert training for {num_steps}")
                 if sort_mode:
                     distance = 1 - cosine_sim
-                    distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
                     if sort_mode == 'Hierarchical':
                         # convert to condensed vector form
-                        condensed = squareform(distance)
+                        # distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
+                        # distance = 0.5 * (distance + distance.T)  # ensure symmetry
+                        condensed = squareform(distance, checks=False)
                         Z = hierarchy.linkage(condensed, method='average')
+                        Z = jnp.abs(Z)
                         Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
                         order = hierarchy.dendrogram(Z_opt, no_plot=True)['leaves']
+                        order = jnp.array(order)
                     elif sort_mode == 'Spectral':
+                        distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
                         # Schritt 3: Gradientenmatrix D
                         D = jnp.diag(distance.sum(axis=1))
                         # Schritt 4: Laplacian L
@@ -1018,6 +1079,10 @@ def train(logger, config):
 
             post_performance = post_pred_performance(logits_train, train_labels)
             logger.log({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
+            mi = mutual_information(logits_train.astype(jnp.float32))
+            logger.log({'train_mutual_information': mi})
+            entrop = entropy(logits_train.astype(jnp.float32))
+            logger.log({'train_std_entropy_along_curve': entrop.mean(-1).std(), 'train_mean_entropy_along_curve': entrop.mean()}) # average data/ mean or std along curve
 
             # plot curve of train log likelihood
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
@@ -1068,6 +1133,11 @@ def train(logger, config):
         for weight, temp in zip(weights, temperature):
             post_performance = post_pred_performance(logits_test, test_labels, weight)
             logger.log({f'post_pred_test_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
+            mi = mutual_information(logits_test.astype(jnp.float32), weights=weight)
+            m_entropy = mean_entropy(logits_test.astype(jnp.float32), weights=weight)
+            logger.log({f'test_mutual_information_ppd_t{temp}': mi, f'test_mean_entropy_ppd_t{temp}': m_entropy})
+        entrop = entropy(logits_test.astype(jnp.float32))
+        logger.log({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
 
         # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
         # post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == test_labels)

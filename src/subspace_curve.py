@@ -884,8 +884,8 @@ class LoRAParams(LoraAbstractParams):
         return {'A':self.A.shape, 'B':self.B.shape, 'w0':self.w0.shape}
 
     def __repr__(self):
-        return f"LoRA (A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
-        # return f"LoRA (A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        # return f"LoRA (A={self.A.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        return f"LoRA (A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
     
     def tree_flatten(self):
         children = (self.A, self.B, self.w0)
@@ -919,8 +919,8 @@ class LoRAScaleParams(LoraAbstractParams):
         return {'A':self.A.shape, 's':self.s.shape, 'B':self.B.shape, 'w0':self.w0.shape}
 
     def __repr__(self):
-        return f"LoRA(A={self.A.shape}, s={self.s.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
-        # return f"LoRA(A={self.A}, s={self.s}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        # return f"LoRA(A={self.A.shape}, s={self.s.shape}, B={self.B.shape}, w0={self.w0.shape}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
+        return f"LoRA(A={self.A}, s={self.s}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha})"
 
     def tree_flatten(self):
         children = (self.A, self.s, self.B, self.w0)

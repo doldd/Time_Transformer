@@ -845,9 +845,8 @@ def train(logger, config):
                         # distance = 0.5 * (distance + distance.T)  # ensure symmetry
                         condensed = squareform(distance, checks=False)
                         Z = hierarchy.linkage(condensed, method='average')
-                        Z = jnp.abs(Z)
                         Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
-                        order = hierarchy.dendrogram(Z_opt, no_plot=True)['leaves']
+                        order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
                         order = jnp.array(order)
                     elif sort_mode == 'Spectral':
                         distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)

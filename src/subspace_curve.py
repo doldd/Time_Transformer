@@ -849,11 +849,32 @@ class RepulsiveMixin:
     
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         # Sample t param of Bezier curve
-        nll, state = super().compute_loss_t(key, t, params, state, x, y)
+        nll, state, out = super().compute_loss_t(key, t, params, state, freezed_params, x, y)
         rep_force = self.regularizer(params)
         return nll + self.gravity * rep_force, state
+
+class EntropyMixin:
+    def __init__(self, entropy_weight=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.entropy_weight = entropy_weight
+        self.last_t = 0.
+
+    # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
+    @partial(jit, static_argnums=(0,))
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+        joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
+        loss, state, out = self.nll(joind_param, state, t, x, y, train=True)
+        probs = jax.nn.softmax(out, axis=-1)
+        n_entropy = jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1).mean()
+        loss = loss.mean() + self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
+        # loss = self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
+        self.last_t = t
+        if self.weight_decay != 0.:
+            loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
+                                    for w in jax.tree.leaves(params))
+        return loss, state
 
 # Define classes:
 class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):
@@ -1151,6 +1172,9 @@ class LoRARepulsiveQuantileSubspace(LoRAMixin, RepulsiveMixin, QuantileSubspace)
                                   weight_decay=weight_decay,
                                   perm_spec=perm_spec,
                                   natural_parameterization=natural_parameterization)
+
+class LoRAEntropyCategorySubspace(LoRAMixin, EntropyMixin, CategorySubspace):
+    pass
 
 
 #@partial(jit, static_argnums=(1))

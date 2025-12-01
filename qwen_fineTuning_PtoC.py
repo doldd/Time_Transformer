@@ -752,11 +752,7 @@ def train(logger, config):
                 pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
                 rng_key, subkey = random.split(rng_key)
                 idx = jax.random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
-                # pos = jnp.clip(pos, window_size, x_all.shape[0]-window_size-1)
-                # pos_start = (pos - window_size)
-                # x_batch = jax.lax.dynamic_slice(x_all, (pos_start, 0), (batch_size, x_all.shape[1]))
-                # atten_batch = jax.lax.dynamic_slice(atten_all, (pos_start, 0), (batch_size, atten_all.shape[1]))
-                # y_ = jax.lax.dynamic_slice(y_all, (pos_start,), (batch_size,))
+                idx %= x_all.shape[0] # wrap around
                 x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
                 atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
                 y_ = jnp.take(y_all, idx, axis=0, mode='clip')
@@ -1259,7 +1255,7 @@ if __name__ == '__main__':
                 'eval_every_n_batch': 25,
                 'smoke_test': args.smoke_test,
                 # 'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
-                'dataset_sampling': {'expert': {'window_size': 4}},  # 'balanced' or 'uniform' or None
+                'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,

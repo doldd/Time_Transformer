@@ -65,7 +65,7 @@ pos_pow.defjvp(pos_pow_jvp)
 
 
 def comb(N, k):
-  return jnp.exp(gammaln(N + 1) - gammaln(k + 1) - gammaln(N - k + 1)).round()
+    return jnp.exp(gammaln(N + 1) - gammaln(k + 1) - gammaln(N - k + 1)).round()
 
 def bezier_coeff_fn(num_bends) -> Callable:
     range = jnp.arange(0, num_bends)
@@ -112,6 +112,95 @@ def bezier_curve(num_bends, cp):
 
     f.defjvp(f_jvp)
     return f, derivative_bezier
+
+# B-Spline basis function using Cox-de Boor recursion formula
+def bspline_basis(i, p, knots, t):
+    if p == 0:
+        return jnp.where(
+            (knots[i] <= t) & (t < knots[i+1]), 1.0, 0.0
+        )
+    else:
+        denom1 = knots[i+p] - knots[i]
+        denom2 = knots[i+p+1] - knots[i+1]
+
+        term1 = jnp.where(
+            denom1 > 0,
+            (t - knots[i]) / denom1 * bspline_basis(i, p-1, knots, t),
+            0.0
+        )
+        term2 = jnp.where(
+            denom2 > 0,
+            (knots[i+p+1] - t) / denom2 * bspline_basis(i+1, p-1, knots, t),
+            0.0
+        )
+        return term1 + term2
+    
+def bspline_coeff_fn(num_ctrl, degree, knots):
+    # @jax.jit
+    def coeff(t):
+        return jnp.array([
+            bspline_basis(i, degree, knots, t)
+            for i in range(num_ctrl)
+        ])
+    return coeff
+
+def open_uniform_knots(num_ctrl, degree):
+    n = num_ctrl - 1
+    return jnp.concatenate([
+        jnp.zeros(degree),
+        jnp.linspace(0, 1, n - degree + 2),
+        jnp.ones(degree)
+    ])
+
+def bspline_curve(cp, degree, knots=None):
+    num_ctrl = cp.shape[0]
+    if knots is None:
+        knots = open_uniform_knots(num_ctrl, degree)
+    coeff_fn = bspline_coeff_fn(num_ctrl, degree, knots)
+
+    def derivative_bspline(t):
+        # analytische Ableitung der Basisfunktionen
+        def dN(i):
+            denom1 = knots[i+degree] - knots[i]
+            denom2 = knots[i+degree+1] - knots[i+1]
+
+            term1 = jnp.where(
+                denom1 > 0,
+                degree / denom1 * bspline_basis(i, degree-1, knots, t),
+                0.0
+            )
+            term2 = jnp.where(
+                denom2 > 0,
+                degree / denom2 * bspline_basis(i+1, degree-1, knots, t),
+                0.0
+            )
+            return term1 - term2
+
+        dcoeff = jnp.array([dN(i) for i in range(num_ctrl)])
+        return jnp.einsum('i,i...->...', dcoeff, cp)
+
+    @custom_jvp
+    def f(t):
+        # special case: t == last knot
+        t = jnp.where(
+            t == knots[-1],
+            t - 1e-7,   # move slightly inside
+            t
+        )
+        coeff = coeff_fn(t)
+        return jnp.einsum('i,i...->...', coeff, cp)
+
+    def f_jvp(primals, tangents):
+        t, = primals
+        t_dot, = tangents
+        primal_out = f(t)
+        tangent_out = derivative_bspline(t)
+        return primal_out, tangent_out * t_dot
+    
+
+    f.defjvp(f_jvp)
+    return f, derivative_bspline
+
 
 
 class OrthoSpan:

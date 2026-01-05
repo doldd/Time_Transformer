@@ -138,6 +138,13 @@ def bspline_basis(i, p, knots, t):
 def bspline_coeff_fn(num_ctrl, degree, knots):
     # @jax.jit
     def coeff(t):
+        t = t.squeeze() # ensure t is scalar
+        # special case: t == last knot
+        t = jnp.where(
+            t == knots[-1],
+            t - 1e-7,   # move slightly inside
+            t
+        )
         return jnp.array([
             bspline_basis(i, degree, knots, t)
             for i in range(num_ctrl)
@@ -181,12 +188,6 @@ def bspline_curve(cp, degree, knots=None):
 
     @custom_jvp
     def f(t):
-        # special case: t == last knot
-        t = jnp.where(
-            t == knots[-1],
-            t - 1e-7,   # move slightly inside
-            t
-        )
         coeff = coeff_fn(t)
         return jnp.einsum('i,i...->...', coeff, cp)
 
@@ -340,10 +341,17 @@ class SubspaceBaseModel:
 
     """
 
-    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False):
+    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_mode='b-spline'):
         self.model = model
         self.k = k
-        self.bezier = bezier_coeff_fn(k + 1)
+        if curve_mode == 'b-spline':
+            print("Using B-Spline curve parameterization")
+            degree = 2
+            knots = open_uniform_knots(k+1, degree)
+            self.bezier = bspline_coeff_fn(k+1, degree, knots)
+        else:
+            print("Using Bezier curve parameterization")
+            self.bezier = bezier_coeff_fn(k + 1)
         self.weight_decay = weight_decay
         self.perm_spec = perm_spec
         self.mutable_name = mutuable_param_name

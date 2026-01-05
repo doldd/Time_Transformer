@@ -26,7 +26,7 @@ from numpyro import distributions as dist
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
 from src.subspace_curve import (
     masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn,
-    LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace
+    LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace, LoRAEntropyCategorySubspace
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
@@ -306,6 +306,7 @@ def train(logger, config):
                          energy_weakening: float,
                          regularizer: str,
                          dataset_path: str,
+                         entropy_maxim: float,
                          filter_masks: list = None,
                          lora_params: dict = None,
                          net_kwargs: dict = None,
@@ -421,11 +422,13 @@ def train(logger, config):
                                                         gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using QuantileSubspace without repulsive force")
-                s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
-                                               model=model, k=k, weight_decay=weight_decay, 
-                                               perm_spec=perm_spec,
-                                               natural_parameterization=natural_parameterization,
-                                               mutuable_param_name=False)
+                s_model = LoRAEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                                                        model=model, k=k, weight_decay=weight_decay, 
+                                                        perm_spec=perm_spec,
+                                                        natural_parameterization=natural_parameterization,
+                                                        mutuable_param_name=False,
+                                                        entropy_weight=entropy_maxim,
+                                                        )
         else:
             if regularizer:
                 print("Using RepulsiveCategorySubspace with regularizer")
@@ -752,11 +755,7 @@ def train(logger, config):
                 pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
                 rng_key, subkey = random.split(rng_key)
                 idx = jax.random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
-                # pos = jnp.clip(pos, window_size, x_all.shape[0]-window_size-1)
-                # pos_start = (pos - window_size)
-                # x_batch = jax.lax.dynamic_slice(x_all, (pos_start, 0), (batch_size, x_all.shape[1]))
-                # atten_batch = jax.lax.dynamic_slice(atten_all, (pos_start, 0), (batch_size, atten_all.shape[1]))
-                # y_ = jax.lax.dynamic_slice(y_all, (pos_start,), (batch_size,))
+                idx %= x_all.shape[0] # wrap around
                 x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
                 atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
                 y_ = jnp.take(y_all, idx, axis=0, mode='clip')
@@ -768,16 +767,16 @@ def train(logger, config):
                 # validate
                 rng_key, valid_key = random.split(rng_key)
 
+                # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
+                idx += window_size  # move window
+                idx %= x_all.shape[0]  # wrap around
+                x_val = jnp.take(x_all, idx, axis=0, mode='clip')
+                atten_val = jnp.take(atten_all, idx, axis=0, mode='clip')
+                y_val = jnp.take(y_all, idx, axis=0, mode='clip')
+                val_loss, stat, val_out = s_model.nll(params['params'], params[s_model.mutable_name] if s_model.mutable_name else {}, t, (x_val, atten_val), y_val, False)
+                val_acc = (jnp.argmax(val_out, axis=-1) == y_val).mean()
 
-                # metrics = {'val_loss':jnp.array(jnp.inf, dtype=dtype), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32)}
-                # mse, val_loss = valid_metrics_fn(valid_key, params)
-                metrics = jax.lax.cond((step % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params)[0], lambda x: empty_metric[0], None)
-                best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
-                best_loss = jnp.minimum(best_loss, metrics['val_loss'])
-
-                return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics}
+                return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, 'val_loss': val_loss, 'val_acc': val_acc}
             return _train_expert_step
 
         # print memory stats
@@ -845,9 +844,8 @@ def train(logger, config):
                         # distance = 0.5 * (distance + distance.T)  # ensure symmetry
                         condensed = squareform(distance, checks=False)
                         Z = hierarchy.linkage(condensed, method='average')
-                        Z = jnp.abs(Z)
                         Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
-                        order = hierarchy.dendrogram(Z_opt, no_plot=True)['leaves']
+                        order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
                         order = jnp.array(order)
                     elif sort_mode == 'Spectral':
                         distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
@@ -923,7 +921,7 @@ def train(logger, config):
                 # Bezier curve length        
                 cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
                 length = bezier_length(cp)
-                logger.log({'Curve length': length})
+                logger.summary.update({'Curve length': length})
 
         # compute test metrics with BMA
         def post_pred_performance(logits, labels, weights:bool|jnp.ndarray=False):
@@ -982,12 +980,12 @@ def train(logger, config):
         # plot last params
         # valid
         curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-        logger.log({k+'_mean':v.mean() for k,v in curve_metric.items()})
-        logger.log({k+'_max':v.max() for k,v in curve_metric.items()})
-        logger.log({k+'_min':v.min() for k,v in curve_metric.items()})
+        logger.summary.update({k+'_mean':v.mean() for k,v in curve_metric.items()})
+        logger.summary.update({k+'_max':v.max() for k,v in curve_metric.items()})
+        logger.summary.update({k+'_min':v.min() for k,v in curve_metric.items()})
 
         post_performance = post_pred_performance(logits_test, test_labels)
-        logger.log({f'post_pred_test_mean_{k}':v for k,v in post_performance.items()})
+        logger.summary.update({f'post_pred_test_mean_{k}':v for k,v in post_performance.items()})
 
         ax.plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
         ax2 = ax.twinx()
@@ -1078,17 +1076,17 @@ def train(logger, config):
             train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
 
             post_performance = post_pred_performance(logits_train, train_labels)
-            logger.log({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
+            logger.summary.update({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
             mi = mutual_information(logits_train.astype(jnp.float32))
-            logger.log({'train_mutual_information': mi})
+            logger.summary.update({'train_mutual_information': mi})
             entrop = entropy(logits_train.astype(jnp.float32))
-            logger.log({'train_std_entropy_along_curve': entrop.mean(-1).std(), 'train_mean_entropy_along_curve': entrop.mean()}) # average data/ mean or std along curve
+            logger.summary.update({'train_std_entropy_along_curve': entrop.mean(-1).std(), 'train_mean_entropy_along_curve': entrop.mean()}) # average data/ mean or std along curve
 
             # plot curve of train log likelihood
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
-            logger.log({k+'_mean':v.mean() for k,v in train_curve_metric.items()})
-            logger.log({k+'_max':v.max() for k,v in train_curve_metric.items()})
-            logger.log({k+'_min':v.min() for k,v in train_curve_metric.items()})
+            logger.summary.update({k+'_mean':v.mean() for k,v in train_curve_metric.items()})
+            logger.summary.update({k+'_max':v.max() for k,v in train_curve_metric.items()})
+            logger.summary.update({k+'_min':v.min() for k,v in train_curve_metric.items()})
             ax.plot(t_space, -train_curve_metric['f_train_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
             ax2 = ax.twinx()
             ax2.plot(t_space, train_curve_metric['f_train_acc'], label="test acc",
@@ -1132,12 +1130,12 @@ def train(logger, config):
 
         for weight, temp in zip(weights, temperature):
             post_performance = post_pred_performance(logits_test, test_labels, weight)
-            logger.log({f'post_pred_test_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
+            logger.summary.update({f'post_pred_test_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
             mi = mutual_information(logits_test.astype(jnp.float32), weights=weight)
             m_entropy = mean_entropy(logits_test.astype(jnp.float32), weights=weight)
-            logger.log({f'test_mutual_information_ppd_t{temp}': mi, f'test_mean_entropy_ppd_t{temp}': m_entropy})
+            logger.summary.update({f'test_mutual_information_ppd_t{temp}': mi, f'test_mean_entropy_ppd_t{temp}': m_entropy})
         entrop = entropy(logits_test.astype(jnp.float32))
-        logger.log({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
+        logger.summary.update({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
 
         # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
         # post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == test_labels)
@@ -1256,11 +1254,11 @@ if __name__ == '__main__':
                 # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
                 'load_params_path': False, # path to pretrained trainable parameters
                 # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
-                'save_params': False,
-                'eval_every_n_batch': 25,
+                'save_params': True,
+                'eval_every_n_batch': 1,
                 'smoke_test': args.smoke_test,
                 # 'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
-                'dataset_sampling': {'expert': {'window_size': 4}},  # 'balanced' or 'uniform' or None
+                'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
                 'lora_params': {'use_lora': True, 'r': 8, 
                                 'lora_dtype': 'float32',
                                 'lora_alpha': 16.0,
@@ -1273,14 +1271,15 @@ if __name__ == '__main__':
                                     ]},  # use lora for query projection
                 'curve_params': {'k': 2,
                                 'num_epochs': -1,
-                                # 'num_steps': 100 if args.smoke_test else 5000,
-                                'num_steps': 10,
+                                'num_steps': 10 if args.smoke_test else 5000,
+                                # 'num_steps': 5000,
                                 # 'num_steps': -1,
                                 'batch_size': args.batch_size,
                                 'natural_parameterization': False,
                                 'gravity': 0.0,
                                 'energy_weakening': 1., 
                                 'regularizer': False,
+                                'entropy_maxim': .01,
                                 'weight_decay': 0.,
                                 'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                                 'temperature': [1.0, 2.0, 4.0,],

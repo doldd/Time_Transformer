@@ -528,9 +528,6 @@ def train(logger, config):
         logger.summary.update({'n_params_trainable': n_params})
         opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
 
-        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        print(f"Control points shape: {cp_w.shape}")
-        del cp_w
         # loss, params, opt_state, grad_ = s_model.train_step(
         #             random.PRNGKey(0), params, x[:32], y[:32], opt_state, optimizer)
         # print(f"Initial loss: {loss}, grad norm: {jnp.linalg.norm(masked_pytree_to_matrix(grad_, mask, k))}")
@@ -656,18 +653,18 @@ def train(logger, config):
 
     train_params = []
     params = None
-    for k in range(config['curve_params']['k'] + 1):
+    num_ensembles = config['curve_params']['k'] + 1
+    for k in range(num_ensembles):
         print(f"Training DE member {k}")
-        config_cp = deepcopy(config)
-        config_cp['curve_params']['k'] = 0 
+        config['curve_params']['k'] = 0 
 
         if params is not None:
             del params  # free memory
             jax.clear_caches()
         rng_key, s_model, params = train_curve_inner(
-            rng_key, **config_cp['curve_params'], net_kwargs=config_cp['net_kwargs'], 
-            lora_params=config_cp.get('lora_params', None), dataset_path=config_cp['dataset_path'],
-            smoke_test=config_cp.get('smoke_test', False))
+            rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
+            lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
+            smoke_test=config.get('smoke_test', False))
         train_params.append(s_model.only_trainable_params(params['params']))
         rng_key, _ = random.split(rng_key)
 

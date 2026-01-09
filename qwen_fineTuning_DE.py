@@ -692,89 +692,6 @@ def train(logger, config):
     # preds = jnp.argmax(avg_probs, axis=-1)
     # accuracy = jnp.mean(preds == test_labels)
 
-    def setup_de_metrics(model, static_params, batch_size, x, attention_mask, target, average=True, key_prefix='', num_bins_ece=15):
-        ii = len(x) // batch_size
-        
-        def acc_fn(rng_key, ensemble_params):
-            n_samples = len(ensemble_params)
-            x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-            x_last = x[matching_limit:]
-            x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-            att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-            att_last = attention_mask[matching_limit:]
-            att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-
-            y_all = target[:matching_limit]  # drop non matching batch size
-            y_last = target[matching_limit:]
-            y_ = es('(ib)...->ib...', y_all, b=batch_size)
-
-            #@scan_tqdm(ii, desc='Evaluating', leave=False)
-            def pred(key, data):
-                x_batch, atten_batch, y_batch = data
-
-                # @jax.jit
-                def eval(e_params):
-                    param = jax.tree.map(lambda tp, p, m: tp if m else p, e_params, static_params, model.train_mask)
-                    loss, _, out = model.nll(param, {}, 0, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
-                    acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-                    return loss*batch_size, acc, out  # sum over batch
-
-                oo = jax.tree.map(eval, ensemble_params, is_leaf=lambda x: isinstance(x, dict))
-                loss, acc, out = map(list, zip(*oo))
-                # loss, acc, out = jax.lax.map(eval, ensemble_params)
-                loss = jnp.array(loss)  # shape (n_samples,)
-                acc = jnp.array(acc)  # shape (n_samples,)
-                out = jnp.stack(out, axis=0)  # shape (n_samples, batch_size, output_dim)
-
-                if average:
-                    # mean over samples
-                    return key, (jnp.sum(loss), jnp.sum(acc), out)
-                else:
-                    return key, (loss, acc, out)  # no mean over samples
-
-            # shape (n_data, draws, output_dim)
-            rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
-            # compute loss of last irregular batch
-            if len(x_last) > 0:
-                rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
-                loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-                acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
-                out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
-            else:
-                out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
-
-            # # compute the expected calibration error (ECE)
-            ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
-
-            if average:
-                ece = jnp.mean(ece)
-                loss = loss.sum() / (n_samples * x.shape[0])
-                acc = acc.sum() / (n_samples * x.shape[0])
-            else:
-                loss = jnp.sum(loss, axis=0) / x.shape[0]
-                acc = jnp.sum(acc, axis=0) / x.shape[0]
-
-            return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
-        return acc_fn
-
-    test_metrics_fn = setup_de_metrics(s_model, params['params'], BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, average=True, key_prefix='test_')
-    curve_metric, logits_test = test_metrics_fn(rng_key, train_params)
-    # compute accuracy
-    probs = jax.nn.softmax(logits_test, axis=-1)
-    avg_probs = jnp.mean(probs, axis=0)
-    preds = jnp.argmax(avg_probs, axis=-1)
-    accuracy = jnp.mean(preds == test_labels)
-    # compute ece
-    ece = ece_fn(avg_probs, test_labels, num_bins=15)
-    # compute nll for averaged probs
-    ll = dist.Categorical(probs=avg_probs).log_prob(test_labels).mean()
-    logger.summary.update({'test_de_mean_loss': curve_metric['test_loss'],
-                           'test_de_acc': accuracy,
-                           'test_de_ece': ece,
-                           'test_de_ll': ll,})
-
-
     if SAVE_PARAMS:
         artifact = wandb.Artifact(name="params", type="pytree")
         print("Save artifacts")
@@ -784,6 +701,103 @@ def train(logger, config):
         artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
         print("Log artifact")
         logger.log_artifact(artifact)
+
+    # def setup_de_metrics(model, static_params, batch_size, x, attention_mask, target, average=True, key_prefix='', num_bins_ece=15):
+    #     ii = len(x) // batch_size
+        
+    #     def acc_fn(rng_key, ensemble_params):
+    #         n_samples = len(ensemble_params)
+    #         x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    #         x_last = x[matching_limit:]
+    #         x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+    #         att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+    #         att_last = attention_mask[matching_limit:]
+    #         att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+
+    #         y_all = target[:matching_limit]  # drop non matching batch size
+    #         y_last = target[matching_limit:]
+    #         y_ = es('(ib)...->ib...', y_all, b=batch_size)
+
+    #         #@scan_tqdm(ii, desc='Evaluating', leave=False)
+    #         def pred(key, data):
+    #             x_batch, atten_batch, y_batch = data
+
+    #             # @jax.jit
+    #             def eval(e_params):
+    #                 param = jax.tree.map(lambda tp, p, m: tp if m else p, e_params, static_params, model.train_mask)
+    #                 loss, _, out = model.nll(param, {}, 0, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
+    #                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
+    #                 return loss*batch_size, acc, out  # sum over batch
+
+    #             oo = jax.tree.map(eval, ensemble_params, is_leaf=lambda x: isinstance(x, dict))
+    #             loss, acc, out = map(list, zip(*oo))
+    #             # loss, acc, out = jax.lax.map(eval, ensemble_params)
+    #             loss = jnp.array(loss)  # shape (n_samples,)
+    #             acc = jnp.array(acc)  # shape (n_samples,)
+    #             out = jnp.stack(out, axis=0)  # shape (n_samples, batch_size, output_dim)
+
+    #             if average:
+    #                 # mean over samples
+    #                 return key, (jnp.sum(loss), jnp.sum(acc), out)
+    #             else:
+    #                 return key, (loss, acc, out)  # no mean over samples
+
+    #         # shape (n_data, draws, output_dim)
+    #         rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
+    #         # compute loss of last irregular batch
+    #         if len(x_last) > 0:
+    #             rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
+    #             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
+    #             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
+    #             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
+    #         else:
+    #             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
+
+    #         # # compute the expected calibration error (ECE)
+    #         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
+
+    #         if average:
+    #             ece = jnp.mean(ece)
+    #             loss = loss.sum() / (n_samples * x.shape[0])
+    #             acc = acc.sum() / (n_samples * x.shape[0])
+    #         else:
+    #             loss = jnp.sum(loss, axis=0) / x.shape[0]
+    #             acc = jnp.sum(acc, axis=0) / x.shape[0]
+
+    #         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
+    #     return acc_fn
+
+    test_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, key_prefix='test_')
+    logits_test = []
+    for i, t_param in enumerate(train_params):
+        param = jax.tree.map(lambda tp, p, m: tp if m else p, t_param, params['params'], s_model.train_mask)
+        metric, logits_test_m = test_metrics_fn(rng_key, {'params': param})
+        print(f"DE member {i} test loss: {metric['test_loss']}, test acc: {metric['test_acc']}, test ece: {metric['test_ece']}")
+        print(f"Shape member logit {logits_test_m.shape}")
+        logits_test.append(logits_test_m.astype(jnp.float32))
+         # log individual member metrics
+        logger.summary.update({f'test_loss_member_{i}': metric['test_loss'],
+                               f'test_acc_member_{i}': metric['test_acc'],
+                               f'test_ece_member_{i}': metric['test_ece'],})
+
+    logits_test = jnp.stack(logits_test, axis=0)  # shape (n_ensembles, n_data, output_dim)
+    print(f"Shape stacked logits {logits_test.shape}")
+
+    # test_metrics_fn = setup_de_metrics(s_model, params['params'], BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, average=True, key_prefix='test_')
+    # curve_metric, logits_test = test_metrics_fn(rng_key, train_params)
+    # compute accuracy
+    probs = jax.nn.softmax(logits_test, axis=-1)
+    avg_probs = jnp.mean(probs, axis=0)
+    preds = jnp.argmax(avg_probs, axis=-1)
+    accuracy = jnp.mean(preds == test_labels)
+    # compute ece
+    ece = ece_fn(avg_probs, test_labels, num_bins=15)
+    # compute nll for averaged probs
+    ll = dist.Categorical(probs=avg_probs).log_prob(test_labels).mean()
+    logger.summary.update({'test_de_acc': accuracy,
+                           'test_de_ece': ece,
+                           'test_de_ll': ll,})
 
 
     logger.finish()

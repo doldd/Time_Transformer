@@ -279,6 +279,14 @@ def train(logger, config):
         model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
         config['net_kwargs']['model_path'] = model_artifact.download()
 
+    # Configure optimizer kwargs
+    if isinstance(config['curve_params']['optimizer_conf']['kwargs']['learning_rate'], dict):
+        lr_schedule = getattr(optax, config['curve_params']['optimizer_conf']['kwargs']['learning_rate']['name'])(
+            **config['curve_params']['optimizer_conf']['kwargs']['learning_rate']['kwargs'])
+    else:
+        lr_schedule = optax.constant_schedule(config['curve_params']['optimizer_conf']['kwargs']['learning_rate'])
+    config['curve_params']['optimizer_conf']['kwargs']['learning_rate'] = lr_schedule
+
     def train_curve_inner(rng_key,
                          k: int,
                          num_epochs: int,
@@ -505,13 +513,13 @@ def train(logger, config):
         # logger.summary.update(init_metrics)
         # jax.debug.print("Initial metrics: {}", init_metrics)
 
-        # Define optimizer
-        if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
-            lr_schedule = getattr(optax, optimizer_conf['kwargs']['learning_rate']['name'])(
-                **optimizer_conf['kwargs']['learning_rate']['kwargs'])
-        else:
-            lr_schedule = optax.constant_schedule(optimizer_conf['kwargs']['learning_rate'])
-        optimizer_conf['kwargs']['learning_rate'] = lr_schedule
+        # # Define optimizer
+        # if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
+        #     lr_schedule = getattr(optax, optimizer_conf['kwargs']['learning_rate']['name'])(
+        #         **optimizer_conf['kwargs']['learning_rate']['kwargs'])
+        # else:
+        #     lr_schedule = optax.constant_schedule(optimizer_conf['kwargs']['learning_rate'])
+        # optimizer_conf['kwargs']['learning_rate'] = lr_schedule
         optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
         # Add gradient clipping to the optimizer using optax.chain
         opt_chain_list = []
@@ -535,11 +543,10 @@ def train(logger, config):
         best_loss = np.inf
         empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=jnp.float32), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_ece': jnp.array(jnp.inf, dtype=jnp.float32)}, None
         if val:
-            print("Put best parameters to cpu device")
+            print("save best parameters")
             # best_params = jax.device_get(params)  # best params on cpu to save memory
             best_params = s_model.only_trainable_params(params['params'])  # best params on cpu to save memory
             # best_params = jax.device_put(params, jax.devices('cpu')[0])  # best params on cpu to save memory
-            print("best parameters to cpu device")
             valid_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10 if k > 0 else 1, key_prefix='val_')
             def get_best_params(params):
                 # return jax.device_get(params)

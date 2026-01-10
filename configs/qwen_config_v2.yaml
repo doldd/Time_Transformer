@@ -41,14 +41,14 @@ parameters:
       use_lora:
         value: True
       r:
-        value: 8
+        values: [8, 32]
       lora_dtype:
         value: "float32"  # ["original", "float16", "bfloat16", "float32"]
       lora_alpha:
         value: 16.0
       lora_mode:
         # values: ["A(t)B", "A(t)B(t)", "As(t)B"]
-        value: "As(t)B"
+        value: "A(t)B(t)"
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -60,7 +60,7 @@ parameters:
   curve_params:
     parameters:
       k:
-        values: [5, 10]
+        values: [2, 5, 10]
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -87,7 +87,7 @@ parameters:
         value: 0.1
       entropy_maxim:
         # values: [0.1, 1., 2.5, 5.0, 7.5, 10]
-        values: [0., 5.0]
+        values: [0., 2.5, 5.0, 7.5]
         # value: 5.
 
       filter_masks:

@@ -1,6 +1,6 @@
-program: qwen_fineTuning_PtoC.py
-name: Qwen LoRA MAP v2
-description: "to save_params with all fixes and posterior predictive evaluation"
+program: qwen_fineTuning_PtoC copy.py
+name: Qwen LoRA Valid B-spline
+description: "Compare validation loss with no curve vs curve. Pick best model and temperature according to val loss. Then evaluate on test set. Use B-spline with degree=2"
 method: grid
 metric:
   goal: maximize
@@ -10,11 +10,12 @@ parameters:
     value: True
   dataset_path:
     values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
-             "ddold/qwen_PtoC/winogrande_s_dataset:v0",
-             "ddold/qwen_PtoC/boolq_dataset:v0",
+            #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
+            #  "ddold/qwen_PtoC/boolq_dataset:v0",
              "ddold/qwen_PtoC/obqa_dataset:v0",
              "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
-             "ddold/qwen_PtoC/ARC-Easy_dataset:v0"]
+            #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
+             ]
   load_params_path:
     value: False
   net_kwargs:
@@ -27,6 +28,14 @@ parameters:
     parameters:
       minibatch:
         value: False
+  # dataset_sampling:
+  #   parameters:
+  #     expert:
+  #       parameters:
+  #         window_size:
+  #           values: [4,]
+  #         sort_mode:
+  #           values: [False,]  # "Hierarchical", "Spectral", "Random", "First_data"]
   lora_params:
     parameters:
       use_lora:
@@ -38,7 +47,8 @@ parameters:
       lora_alpha:
         value: 16.0
       lora_mode:
-        values: ["A(t)B", "A(t)B(t)", "As(t)B"]
+        # values: ["A(t)B", "A(t)B(t)", "As(t)B"]
+        value: "As(t)B"
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -50,7 +60,7 @@ parameters:
   curve_params:
     parameters:
       k:
-        values: [2, 5]
+        values: [5, 10]
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -72,7 +82,13 @@ parameters:
       num_steps:
         value: 5_000
       temperature:
-        value: [1.0, 2.0, 4.0, 8.0, 16., 32.0,]
+        value: [0.5, 1.0, 2.0, 4.0, 8.0, 16., 32.0,]
+      val_percentage:
+        value: 0.1
+      entropy_maxim:
+        # values: [0.1, 1., 2.5, 5.0, 7.5, 10]
+        values: [0., 5.0]
+        # value: 5.
 
       filter_masks:
         values: 
@@ -119,7 +135,7 @@ command:
 - ${env}
 - ${interpreter}
 - ${program}
-- "--train"
-- "curve"
+# - "--train"
+# - "curve"
 - "--use-sweep"
 #- ${args}

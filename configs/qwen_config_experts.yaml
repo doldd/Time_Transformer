@@ -125,7 +125,7 @@ command:
 - ${env}
 - ${interpreter}
 - ${program}
-- "--train"
-- "curve"
+# - "--train"
+# - "curve"
 - "--use-sweep"
 #- ${args}

@@ -926,11 +926,13 @@ def train(logger, config):
         # compute test metrics with BMA
         def post_pred_performance(logits, labels, weights:bool|jnp.ndarray=False):
             # logits shape (n_samples, n_data, n_classes)
-            if type(weights) == jnp.ndarray:
-                post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
+            print(f"weights type {type(weights)} for BMA prediction {type(weights) == False}")
+            if type(weights) == False:
+                post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
                 # post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes) #false because of log multiply
             else:
-                post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
+                print("Using provided weights for BMA prediction")
+                post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
             post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
             post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
             return {'ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),

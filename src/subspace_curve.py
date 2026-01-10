@@ -341,10 +341,10 @@ class SubspaceBaseModel:
 
     """
 
-    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_mode='b-spline'):
+    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier'):
         self.model = model
         self.k = k
-        if curve_mode == 'b-spline':
+        if curve_parameterization == 'b-spline':
             print("Using B-Spline curve parameterization")
             degree = 2
             knots = open_uniform_knots(k+1, degree)

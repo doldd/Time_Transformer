@@ -317,6 +317,7 @@ def train(logger, config):
                          temperature: list = [1.0,],
                          dataset_sampling: dict = None,
                          val_percentage: float = 0.0,
+                         curve_parameterization = 'bezier',
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
@@ -421,6 +422,7 @@ def train(logger, config):
                                                         perm_spec=perm_spec,
                                                         natural_parameterization=natural_parameterization,
                                                         mutuable_param_name=False,
+                                                        curve_parameterization=curve_parameterization,
                                                         gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using QuantileSubspace without repulsive force")
@@ -431,6 +433,7 @@ def train(logger, config):
                                                       perm_spec=perm_spec,
                                                       natural_parameterization=natural_parameterization,
                                                       mutuable_param_name=False,
+                                                      curve_parameterization=curve_parameterization,
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
@@ -440,6 +443,7 @@ def train(logger, config):
                                                    perm_spec=perm_spec,
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
+                                                   curve_parameterization=curve_parameterization,
                                                    )
         else:
             if regularizer:
@@ -448,12 +452,14 @@ def train(logger, config):
                                                    perm_spec=perm_spec,
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
+                                                   curve_parameterization=curve_parameterization,
                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 print("Using CategorySubspace without repulsive force")
                 s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
                                            perm_spec=perm_spec,
                                            natural_parameterization=natural_parameterization,
+                                           curve_parameterization=curve_parameterization,
                                            mutuable_param_name=False)
 
 
@@ -1285,6 +1291,7 @@ if __name__ == '__main__':
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                             'temperature': [1.0, 2.0, 4.0,],
                             'val_percentage' : 0.1,
+                            'curve_parameterization': 'bezier',
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
                             'filter_masks':[{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},

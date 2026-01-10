@@ -893,6 +893,7 @@ class QuantileSubspace(SubspaceBaseModel):
 
 class RepulsiveMixin:
     def __init__(self, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
+        print("Using Repulsive Mixin with regularizer:", regularizer)
         super().__init__(**kwargs)
         self.gravity = gravity
         self.energy_weakening = energy_weakening
@@ -909,6 +910,8 @@ class RepulsiveMixin:
         else:
             raise ValueError(f"Unknown regularizer type: {regularizer}")
 
+
+    @partial(jit, static_argnums=(0,))
     def repulsive_force(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -921,6 +924,7 @@ class RepulsiveMixin:
         force = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
         return force
 
+    @partial(jit, static_argnums=(0,))
     def repulsive_energy(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -934,6 +938,7 @@ class RepulsiveMixin:
         log_energy = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
         return log_energy
 
+    @partial(jit, static_argnums=(0,))
     def summed_cosine_similarity(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -942,7 +947,8 @@ class RepulsiveMixin:
         upper_triangular_indices = jnp.triu_indices(n, k=1)
         cosine_sim = jnp.sum(dot_res[upper_triangular_indices])
         return cosine_sim
-
+    
+    @partial(jit, static_argnums=(0,))
     def summed_cosine_similarity_square(self, params):
         return self.summed_cosine_similarity(params) ** 2
     
@@ -956,6 +962,7 @@ class RepulsiveMixin:
 
 class EntropyMixin:
     def __init__(self, entropy_weight=0.0, **kwargs):
+        print("Using Entropy Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
         self.last_t = 0.
@@ -977,6 +984,7 @@ class EntropyMixin:
 
 class EntropyMixin2:
     def __init__(self, entropy_weight=0.0, **kwargs):
+        print("Using Entropy Mixin 2 with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
         self.last_t = 0.
@@ -1002,6 +1010,7 @@ class EntropyMixin2:
     
 class JensenShannonMixin:
     def __init__(self, entropy_weight=0.0, **kwargs):
+        print("Using Jensen-Shannon Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
         self.last_t = 0.
@@ -1129,6 +1138,7 @@ class LoRAMixin:
     """
 
     def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", **kwargs):
+        print(f"Using LoRA Mixin with rank={r}, dtype={lora_dtype}, alpha={lora_alpha}, mode={lora_mode}")
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
@@ -1307,25 +1317,16 @@ class LoRACategorySubspace(LoRAMixin, CategorySubspace):
     pass
 
 class LoRARepulsiveCategorySubspace(LoRAMixin, RepulsiveMixin, CategorySubspace):
-    def __init__(self, model, k, weight_decay=0, perm_spec = False, natural_parameterization=False, r=1, lora_mask=None, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
-        LoRAMixin.__init__(self, r=r, lora_mask=lora_mask, **kwargs)
-        RepulsiveMixin.__init__(self, gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-        CategorySubspace.__init__(self, model=model, k=k,
-                                  weight_decay=weight_decay,
-                                  perm_spec=perm_spec,
-                                  natural_parameterization=natural_parameterization)
+    pass
+        
+class LoRARepulsiveEntropyCategorySubspace(LoRAMixin, RepulsiveMixin, JensenShannonMixin, CategorySubspace):
+    pass
 
 class LoRAQuantileSubspace(LoRAMixin, QuantileSubspace):
     pass
 
 class LoRARepulsiveQuantileSubspace(LoRAMixin, RepulsiveMixin, QuantileSubspace):
-    def __init__(self, model, k, quantiles, weight_decay=0, perm_spec = False, natural_parameterization=False, r=1, lora_mask=None, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
-        LoRAMixin.__init__(self, r=r, lora_mask=lora_mask, **kwargs)
-        RepulsiveMixin.__init__(self, gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-        QuantileSubspace.__init__(self, model=model, k=k, quantiles=quantiles,
-                                  weight_decay=weight_decay,
-                                  perm_spec=perm_spec,
-                                  natural_parameterization=natural_parameterization)
+    pass
 
 class LoRAEntropyCategorySubspace(LoRAMixin, EntropyMixin2, CategorySubspace):
     pass

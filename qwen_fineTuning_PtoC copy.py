@@ -26,7 +26,7 @@ from numpyro import distributions as dist
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
 from src.subspace_curve import (
     masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn,
-    LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace, LoRAEntropyCategorySubspace, LoRAJSDCategorySubspace
+    LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace, LoRAEntropyCategorySubspace, LoRAJSDCategorySubspace, LoRARepulsiveEntropyCategorySubspace
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
@@ -304,7 +304,7 @@ def train(logger, config):
                          natural_parameterization: bool,
                          gravity: float,
                          energy_weakening: float,
-                         regularizer: str,
+                         regularizer: str|bool,
                          dataset_path: str,
                          entropy_maxim: float,
                          filter_masks: list = None,
@@ -415,19 +415,26 @@ def train(logger, config):
             weight_decay = 0.0  # set to 0.0 to avoid double weight decay in model
         if lora_params and lora_params['use_lora']:
             print("Using LoRA with parameters:", lora_params)
-            if regularizer:
-                print("Using LoRARepulsiveCategorySubspace with regularizer")
-                s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
-                                                        model=model, k=k, weight_decay=weight_decay,
-                                                        perm_spec=perm_spec,
-                                                        natural_parameterization=natural_parameterization,
-                                                        mutuable_param_name=False,
-                                                        curve_parameterization=curve_parameterization,
-                                                        gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-            else:
-                print("Using QuantileSubspace without repulsive force")
+            if isinstance(regularizer, str):
                 if entropy_maxim > 0.0:
-                    print("Using LoRAJSDCategorySubspace with entropy maximization")
+                    s_model = LoRARepulsiveEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                                                                   model=model, k=k, weight_decay=weight_decay,
+                                                                   perm_spec=perm_spec,
+                                                                   natural_parameterization=natural_parameterization,
+                                                                   mutuable_param_name=False,
+                                                                   curve_parameterization=curve_parameterization,
+                                                                   gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
+                                                                   entropy_weight=entropy_maxim,)
+                else:
+                    s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                                                            model=model, k=k, weight_decay=weight_decay,
+                                                            perm_spec=perm_spec,
+                                                            natural_parameterization=natural_parameterization,
+                                                            mutuable_param_name=False,
+                                                            curve_parameterization=curve_parameterization,
+                                                            gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
+            else:
+                if entropy_maxim > 0.0:
                     s_model = LoRAJSDCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
                                                       model=model, k=k, weight_decay=weight_decay, 
                                                       perm_spec=perm_spec,
@@ -437,7 +444,6 @@ def train(logger, config):
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
-                    print("Using LoRACategorySubspace without entropy maximization")
                     s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
                                                    model=model, k=k, weight_decay=weight_decay, 
                                                    perm_spec=perm_spec,
@@ -447,7 +453,6 @@ def train(logger, config):
                                                    )
         else:
             if regularizer:
-                print("Using RepulsiveCategorySubspace with regularizer")
                 s_model = RepulsiveCategorySubspace(model=model, k=k, weight_decay=weight_decay,
                                                    perm_spec=perm_spec,
                                                    natural_parameterization=natural_parameterization,
@@ -455,7 +460,6 @@ def train(logger, config):
                                                    curve_parameterization=curve_parameterization,
                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
-                print("Using CategorySubspace without repulsive force")
                 s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
                                            perm_spec=perm_spec,
                                            natural_parameterization=natural_parameterization,
@@ -557,11 +561,13 @@ def train(logger, config):
         if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
             raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
 
-        print("Computing initial metrics...")
-        init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
-        init_metrics, init_out = init_metrics_fn(init_key, params) # returns a dict
-        logger.summary.update(init_metrics)
-        jax.debug.print("Initial metrics: {}", init_metrics)
+        # always the same for LoRA
+        # print("Computing initial metrics...")
+        # init_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, n_samples=1, use_linspace=True, average=True, key_prefix='init_')
+        # init_metrics, init_out = init_metrics_fn(init_key, params) # returns a dict
+        # logger.summary.update(init_metrics)
+        # jax.debug.print("Initial metrics: {}", init_metrics)
+
         # # compute mutual information (BALD)
         # mi = mutual_information(init_out.astype(jnp.float32))
         # logger.summary.update({'init_mutual_information': mi})
@@ -1283,10 +1289,10 @@ if __name__ == '__main__':
                             # 'num_steps': -1,
                             'batch_size': args.batch_size,
                             'natural_parameterization': False,
-                            'gravity': 0.0,
+                            'gravity': 5.0,
                             'energy_weakening': 4., 
-                            'regularizer': False,
-                            'entropy_maxim': 0.,
+                            'regularizer': 'cosine', # False, 'cosine', 'energy', 'force', 
+                            'entropy_maxim': 5.,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                             'temperature': [1.0, 2.0, 4.0,],
@@ -1315,6 +1321,6 @@ if __name__ == '__main__':
                                                                     'freeze_other_params': True,
                                                 },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="JSDMax_double_loss_JSDfix_wd_JSDclip", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="Regularizer test", entity="ddold", config=config)
         train(logger, config)
 

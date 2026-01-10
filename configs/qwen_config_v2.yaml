@@ -7,7 +7,7 @@ metric:
   name: acc_val_curve
 parameters:
   save_params:
-    value: True
+    value: False
   dataset_path:
     values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
             #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
@@ -89,6 +89,8 @@ parameters:
         # values: [0.1, 1., 2.5, 5.0, 7.5, 10]
         values: [0., 2.5, 5.0, 7.5]
         # value: 5.
+      curve_parameterization:
+        value: "bezier"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
 
       filter_masks:
         values: 

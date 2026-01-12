@@ -590,7 +590,50 @@ def train(logger, config):
         else:
             lr_schedule = optax.constant_schedule(optimizer_conf['kwargs']['learning_rate'])
         optimizer_conf['kwargs']['learning_rate'] = lr_schedule
-        optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
+        if optimizer_conf['name'].startswith('sam'):
+            # lr = optimizer_conf['kwargs'].pop('adv_lr')
+            rho = optimizer_conf['kwargs'].pop('adv_rho')
+            adv_opt = optax.chain(optax.contrib.normalize(), optax.sgd(rho))
+            optim_name = optimizer_conf['name'].split('_')[1]
+            base_opt = getattr(optax, optim_name)(**optimizer_conf['kwargs'])
+            optimizer = optax.contrib.sam(base_opt, adv_optimizer=adv_opt, sync_period=2, opaque_mode=True)
+            
+            @partial(jit, static_argnums=(6), donate_argnums=(2,5))
+            # @profile
+            def train_step_sam(key, t, params, x, y, opt_state, optimizer):
+                """
+                Performs a single training step.
+
+                Parameters:
+                - key: The random key for generating random numbers.
+                - params: The parameters of the model.
+                - x: The input data.
+                - y: The target output.
+                - opt_state: The optimizer state.
+                - optimizer: The optimizer.
+
+                Returns:
+                - The loss, updated parameters, and updated optimizer state.
+
+                """
+                self = s_model 
+                trainable_params = self.only_trainable_params(params['params'])
+                freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
+                (loss, (stats_params, logs)), grads = jax.value_and_grad(
+                    self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
+                # update params
+                updates, opt_state = optimizer.update(
+                    grads, opt_state, trainable_params, grad_fn=lambda pp, _ : jax.grad(lambda p: self.compute_loss(key, t, p, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)[0])(pp))
+                trainable_params = optax.apply_updates(trainable_params, updates)
+                params = jax.tree.map(lambda x, y, m: x if m else y, trainable_params, unfreeze(freezed_params), self.train_mask)
+                params = {'params': params}
+                if self.mutable_name:
+                    params[self.mutable_name] = stats_params
+                return loss, params, opt_state, (grads, logs)
+
+            s_model.train_step = train_step_sam  # use SAM train step
+        else:
+            optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
         # Add gradient clipping to the optimizer using optax.chain
         opt_chain_list = []
         if "grad_clip_norm" in optimizer_conf:
@@ -724,7 +767,8 @@ def train(logger, config):
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
             # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-            current_lr = lr_schedule(opt_state[-1][-1].count)
+            # current_lr = lr_schedule(opt_state[-1][-1].count)
+            current_lr = 1.
             # validate
             rng_key, valid_key = random.split(rng_key)
 
@@ -789,7 +833,8 @@ def train(logger, config):
                 loss, params, opt_state, (grad_, logs) = s_model.train_step(
                     subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-                current_lr = lr_schedule(opt_state[-1][-1].count)
+                # current_lr = lr_schedule(opt_state[-1][-1].count)
+                current_lr = 1.
                 
                 # validate
                 # rng_key, valid_key = random.split(rng_key)
@@ -1314,9 +1359,16 @@ if __name__ == '__main__':
                             #                                                                 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                             #                                                 'momentum': 0.9, 
                             #                                                 'nesterov': True},},
-                            'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                            # 'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                            #                                                 'weight_decay': 0.01,
+                            #                                                 },
+                            #                                         'freeze_other_params': True,
+                            #                     },
+                            'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                             'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
                                                                             'weight_decay': 0.01,
+                                                                            'adv_rho': 0.05,
                                                                             },
                                                                     'freeze_other_params': True,
                                                 },

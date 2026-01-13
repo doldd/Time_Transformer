@@ -778,7 +778,7 @@ def train(logger, config):
                 metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, metrics['val_loss'])
 
-            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics}
+            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):

@@ -1012,8 +1012,11 @@ class JensenShannonMixin:
     def __init__(self, entropy_weight=0.0, **kwargs):
         print("Using Jensen-Shannon Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
-        self.entropy_weight = entropy_weight
+        # self.entropy_weight = entropy_weight
         self.last_t = 0.
+        self.update_idx = 0
+        self.entropy_sched = optax.schedules.exponential_decay(init_value=entropy_weight, transition_steps=5, decay_rate=0.99, transition_begin=100)
+
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
@@ -1033,7 +1036,10 @@ class JensenShannonMixin:
         kl_2 = jnp.sum(probs_2 * (jnp.log(probs_2 + 1e-8) - jnp.log(m + 1e-8)), axis=-1)
         jsd = (0.5 * (kl_1 + kl_2)).mean()
 
-        loss = nll.mean() + nll2.mean() - self.entropy_weight * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
+        lr_ent = self.entropy_sched(self.update_idx)
+        loss = (nll.mean() + nll2.mean())*jnp.minimum(1., 1./(lr_ent+1-12)) 
+        loss -= lr_ent * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
+        self.update_idx += 1
         if self.weight_decay != 0.:
             loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                     for w in jax.tree.leaves(params))

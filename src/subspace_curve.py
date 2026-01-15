@@ -616,7 +616,7 @@ class SubspaceBaseModel:
         return alpha * (x ** 2).sum()
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y, step):
         """
         Computes the loss of the model.
 
@@ -645,7 +645,7 @@ class SubspaceBaseModel:
             return loss, (state, {'nll': nll, 'weight_decay': w_norm})
 
     @partial(jit, static_argnums=(0,))
-    def compute_loss_natural_t(self, key, t, params, state, x, y):
+    def compute_loss_natural_t(self, key, t, params, state, x, y, step):
         """
         Computes the loss of the model.
 
@@ -703,10 +703,11 @@ class SubspaceBaseModel:
         - The loss, updated parameters, and updated optimizer state.
 
         """
+        opt_state, step = opt_state
         trainable_params = self.only_trainable_params(params['params'])
         freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
         (loss, (stats_params, logs)), grads = jax.value_and_grad(
-            self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
+            self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y, step)
         # update params
         updates, opt_state = optimizer.update(
             grads, opt_state, trainable_params)
@@ -954,9 +955,9 @@ class RepulsiveMixin:
     
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y, step):
         # Sample t param of Bezier curve
-        nll, (state, logs) = super().compute_loss_t(key, t, params, state, freezed_params, x, y)
+        nll, (state, logs) = super().compute_loss_t(key, t, params, state, freezed_params, x, y, step)
         rep_force = self.regularizer(params)
         return nll + self.gravity * rep_force, (state, {'repulsive_force': rep_force, **logs})
 
@@ -969,7 +970,7 @@ class EntropyMixin:
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y, step):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
         probs = jax.nn.softmax(out, axis=-1)
@@ -991,7 +992,7 @@ class EntropyMixin2:
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y, step):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
         probs = jax.nn.softmax(out, axis=-1)
@@ -1013,14 +1014,12 @@ class JensenShannonMixin:
         print("Using Jensen-Shannon Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
         # self.entropy_weight = entropy_weight
-        self.last_t = 0.
-        self.update_idx = 0
-        self.entropy_sched = optax.schedules.exponential_decay(init_value=entropy_weight, transition_steps=5, decay_rate=0.99, transition_begin=100)
+        self.entropy_sched = optax.schedules.exponential_decay(init_value=entropy_weight, transition_steps=1000, decay_rate=0.02, transition_begin=500)
 
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     @partial(jit, static_argnums=(0,))
-    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y, step):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
         probs_1 = jax.nn.softmax(out, axis=-1)
@@ -1036,14 +1035,13 @@ class JensenShannonMixin:
         kl_2 = jnp.sum(probs_2 * (jnp.log(probs_2 + 1e-8) - jnp.log(m + 1e-8)), axis=-1)
         jsd = (0.5 * (kl_1 + kl_2)).mean()
 
-        lr_ent = self.entropy_sched(self.update_idx)
-        loss = (nll.mean() + nll2.mean())*jnp.minimum(1., 1./(lr_ent+1-12)) 
+        lr_ent = self.entropy_sched(step)
+        loss = (nll.mean() + nll2.mean()) * 0.5 # *jnp.minimum(1., 1./(lr_ent+1-12)) 
         loss -= lr_ent * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
-        self.update_idx += 1
         if self.weight_decay != 0.:
             loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                     for w in jax.tree.leaves(params))
-        return loss.squeeze(), (state, {'nll1': nll.mean(), 'nll2': nll2.mean(), 'jsd': jsd})
+        return loss.squeeze(), (state, {'nll1': nll.mean(), 'nll2': nll2.mean(), 'jsd': jsd, 'lr_ent': lr_ent})
 
 # Define classes:
 class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):

@@ -617,10 +617,11 @@ def train(logger, config):
 
                 """
                 self = s_model 
+                opt_state, step = opt_state
                 trainable_params = self.only_trainable_params(params['params'])
                 freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
                 (loss, (stats_params, logs)), grads = jax.value_and_grad(
-                    self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
+                    self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y, step)
                 # update params
                 updates, opt_state = optimizer.update(
                     grads, opt_state, trainable_params, grad_fn=lambda pp, _ : jax.grad(lambda p: self.compute_loss(key, t, p, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)[0])(pp))
@@ -751,8 +752,8 @@ def train(logger, config):
             return rel_center
         
         # init metric
-        # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        # rel_center_fn = init_rel_center(cp_w)
+        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+        rel_center_fn = init_rel_center(cp_w)
 
         @partial(jit, donate_argnums=(0,))
         def train_batch(carry, batch):
@@ -765,10 +766,10 @@ def train(logger, config):
             rng_key, subkey = random.split(rng_key)
             t = random.uniform(subkey, (1,), minval=0., maxval=1.)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
-                subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+                subkey, t, params, (x_batch, atten_batch), y_, (opt_state, update_idx), optimizer)
             # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-            # current_lr = lr_schedule(opt_state[-1][-1].count)
-            current_lr = 1.
+            current_lr = lr_schedule(update_idx)
+            # current_lr = 1.
             # validate
             rng_key, valid_key = random.split(rng_key)
 
@@ -778,7 +779,14 @@ def train(logger, config):
                 metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, metrics['val_loss'])
 
-            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            upper_length = upper_bound(cp)
+            lower_length = lower_bound(cp)
+            mean_center = mass_center(cp)
+            gyration_radius = gyration(cp)
+            rel_center = rel_center_fn(cp)
+
+            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length, 'lower_length': lower_length, 'mean_center': mean_center, 'gyration_radius': gyration_radius, 'rel_center': rel_center, **metrics, **logs}
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -1306,14 +1314,15 @@ if __name__ == '__main__':
             # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
             'load_params_path': False, # path to pretrained trainable parameters
             # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
             'save_params': True,
-            'eval_every_n_batch': 1,
+            'eval_every_n_batch': 500,
             'smoke_test': args.smoke_test,
             'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
             # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
@@ -1336,7 +1345,7 @@ if __name__ == '__main__':
                             'natural_parameterization': False,
                             'gravity': 5.0,
                             'energy_weakening': 4., 
-                            'regularizer': 'cosine', # False, 'cosine', 'energy', 'force', 
+                            'regularizer': False, # False, 'cosine', 'energy', 'force', 
                             'entropy_maxim': 5.,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
@@ -1359,19 +1368,19 @@ if __name__ == '__main__':
                             #                                                                 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                             #                                                 'momentum': 0.9, 
                             #                                                 'nesterov': True},},
-                            # 'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                            #                                                 'weight_decay': 0.01,
-                            #                                                 },
-                            #                                         'freeze_other_params': True,
-                            #                     },
-                            'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                            'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
                                                                                             'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
                                                                             'weight_decay': 0.01,
-                                                                            'adv_rho': 0.05,
                                                                             },
                                                                     'freeze_other_params': True,
                                                 },
+                            # 'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                            #                                                 'weight_decay': 0.01,
+                            #                                                 'adv_rho': 0.05,
+                            #                                                 },
+                            #                                         'freeze_other_params': True,
+                            #                     },
                         }}
         logger = wandb.init(project="qwen_PtoC", name="Regularizer test", entity="ddold", config=config)
         train(logger, config)

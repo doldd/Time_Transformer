@@ -582,6 +582,12 @@ def train(logger, config):
         # if SAVE_PARAMS:
         #     jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
         #     artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
+        # if SAVE_PARAMS:
+        #     print("Save init params")
+        #     # jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
+        #     trainable_params = s_model.only_trainable_params(params['params'])
+        #     jnp.save(f'tmp_files/{logger.id}_trainable_params_init.npy', trainable_params)
+        #     artifact.add_file(f'tmp_files/{logger.id}_trainable_params_init.npy')
 
         # Define optimizer
         if isinstance(optimizer_conf['kwargs']['learning_rate'], dict):
@@ -777,6 +783,9 @@ def train(logger, config):
             best_params = jax.lax.cond(
                 metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
             best_loss = jnp.minimum(best_loss, metrics['val_loss'])
+
+            # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
+            # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
 
             return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
@@ -1313,7 +1322,7 @@ if __name__ == '__main__':
             'load_params_path': False, # path to pretrained trainable parameters
             # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
             'save_params': True,
-            'eval_every_n_batch': 1,
+            'eval_every_n_batch': 250,
             'smoke_test': args.smoke_test,
             'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
             # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
@@ -1321,7 +1330,7 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'As(t)B',
+                            'lora_mode': 'A(t)B(t)',
                             'filter_masks': 
                                 [{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                     {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -1336,8 +1345,8 @@ if __name__ == '__main__':
                             'natural_parameterization': False,
                             'gravity': 5.0,
                             'energy_weakening': 4., 
-                            'regularizer': 'cosine', # False, 'cosine', 'energy', 'force', 
-                            'entropy_maxim': 5.,
+                            'regularizer': False, # False, 'cosine', 'energy', 'force', 
+                            'entropy_maxim': 2.5,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                             'temperature': [1.0, 2.0, 4.0,],
@@ -1359,20 +1368,20 @@ if __name__ == '__main__':
                             #                                                                 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
                             #                                                 'momentum': 0.9, 
                             #                                                 'nesterov': True},},
-                            # 'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                            #                                                 'weight_decay': 0.01,
-                            #                                                 },
-                            #                                         'freeze_other_params': True,
-                            #                     },
-                            'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                            'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                            'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                                                                                            'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
                                                                             'weight_decay': 0.01,
-                                                                            'adv_rho': 0.05,
                                                                             },
                                                                     'freeze_other_params': True,
                                                 },
+                            # 'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
+                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                            #                                                 'weight_decay': 0.01,
+                            #                                                 'adv_rho': 0.05,
+                            #                                                 },
+                            #                                         'freeze_other_params': True,
+                            #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="Regularizer test", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="Regularizer test entropy single nll fast", entity="ddold", config=config)
         train(logger, config)
 

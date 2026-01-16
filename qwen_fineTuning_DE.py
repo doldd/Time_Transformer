@@ -787,17 +787,23 @@ def train(logger, config):
     # test_metrics_fn = setup_de_metrics(s_model, params['params'], BATCH_SIZE_EVAL, test_input_ids, test_attention_mask, test_labels, average=True, key_prefix='test_')
     # curve_metric, logits_test = test_metrics_fn(rng_key, train_params)
     # compute accuracy
-    probs = jax.nn.softmax(logits_test, axis=-1)
-    avg_probs = jnp.mean(probs, axis=0)
-    preds = jnp.argmax(avg_probs, axis=-1)
+    log_probs = jax.nn.log_softmax(logits_test, axis=-1)
+    post_predict_logits = jax.nn.logsumexp(log_probs, axis=0) - jnp.log(log_probs.shape[0])
+
+    # probs = jax.nn.softmax(logits_test, axis=-1)
+    # avg_probs = jnp.mean(probs, axis=0)
+    # post_predict_logits = jnp.log(avg_probs)
+
+    preds = jnp.argmax(post_predict_logits, axis=-1)
     accuracy = jnp.mean(preds == test_labels)
     # compute ece
-    ece = ece_fn(avg_probs, test_labels, num_bins=15)
+    ece = ece_fn(post_predict_logits, test_labels, num_bins=15)
     # compute nll for averaged probs
-    ll = dist.Categorical(probs=avg_probs).log_prob(test_labels).mean()
+    ll = dist.Categorical(logits=post_predict_logits).log_prob(test_labels).mean()
     logger.summary.update({'test_de_acc': accuracy,
                            'test_de_ece': ece,
                            'test_de_ll': ll,})
+    
 
 
     logger.finish()

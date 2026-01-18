@@ -767,14 +767,13 @@ def train(logger, config):
             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
             # atten_batch = atten_batch[:, max_seqlen:]
 
-            rng_key, params, opt_state, best_loss, best_params, update_idx = carry
+            rng_key, params, (opt_state, current_step), best_loss, best_params, update_idx = carry
             rng_key, subkey = random.split(rng_key)
             t = random.uniform(subkey, (1,), minval=0., maxval=1.)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
             # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-            # current_lr = lr_schedule(opt_state[-1][-1].count)
-            current_lr = 1.
+            current_lr = lr_schedule(current_step)
             # validate
             rng_key, valid_key = random.split(rng_key)
 
@@ -787,7 +786,7 @@ def train(logger, config):
             # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
             # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
 
-            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+            return (rng_key, params, (opt_state, current_step+1), best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -826,7 +825,7 @@ def train(logger, config):
                 # atten_batch = atten_batch[:, max_seqlen:]
 
                 # get curve parameter
-                rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all) = carry
+                rng_key, params, (opt_state, current_step), best_loss, best_params, (x_all, atten_all, y_all) = carry
                 rng_key, subkey = random.split(rng_key)
                 t = random.uniform(subkey, (1,), minval=0., maxval=1.)
 
@@ -842,8 +841,7 @@ def train(logger, config):
                 loss, params, opt_state, (grad_, logs) = s_model.train_step(
                     subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-                # current_lr = lr_schedule(opt_state[-1][-1].count)
-                current_lr = 1.
+                current_lr = lr_schedule(current_step)
                 
                 # validate
                 # rng_key, valid_key = random.split(rng_key)
@@ -866,7 +864,7 @@ def train(logger, config):
                     metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
 
-                return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+                return (rng_key, params, (opt_state, current_step+1), best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
 
             return _train_expert_step
@@ -967,12 +965,12 @@ def train(logger, config):
                 window_size = max(batch_size, window_size) # at least half batch size
                 train_expert_step = init_train_expert(window_size)
                 # start expert training loop
-                carry = (rng_key, params, opt_state, best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
+                carry = (rng_key, params, (opt_state, 1), best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
                 carry, metrics = jax.lax.scan(
                     train_expert_step, carry, jnp.arange(num_steps))
             elif ds_sampling == 'minibatch':
                 print(f"Start minibatch training for {num_epochs} epochs")
-                carry = (rng_key, params, opt_state, best_loss, best_params, 0) # 0 is used for update counts
+                carry = (rng_key, params, (opt_state, 1), best_loss, best_params, 0) # 0 is used for update counts
                 carry, metrics = jax.lax.scan(
                     train_epoch, carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training
@@ -1312,10 +1310,10 @@ if __name__ == '__main__':
         config = {
             'rng_seed': 1,
             # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-            # 'dataset_path': "ddold/qwen_PtoC/winogrande_s_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
@@ -1332,7 +1330,8 @@ if __name__ == '__main__':
                             # 'lora_mode': 'A(t)B(t)',
                             'lora_mode': 'A(t)B(t)',
                             'filter_masks': 
-                                [{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                                [
+                                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                     {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                     {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
                                 ]},  # use lora for query projection
@@ -1346,7 +1345,7 @@ if __name__ == '__main__':
                             'gravity': 5.0,
                             'energy_weakening': 4., 
                             'regularizer': False, # False, 'cosine', 'energy', 'force', 
-                            'entropy_maxim': 2.5,
+                            'entropy_maxim': 0.,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                             'temperature': [1.0, 2.0, 4.0,],
@@ -1354,7 +1353,8 @@ if __name__ == '__main__':
                             'curve_parameterization': 'bezier',
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
-                            'filter_masks':[{'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+                            'filter_masks':[
+                                            {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
                                             {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
                                             {'keys': ["lm_head", "kernel"], 'op': 'all'},
                                             ],
@@ -1382,6 +1382,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="Regularizer test entropy single nll fast", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="LastLayer test", entity="ddold", config=config)
         train(logger, config)
 

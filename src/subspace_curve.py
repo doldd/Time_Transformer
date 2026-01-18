@@ -1033,7 +1033,8 @@ class JensenShannonMixin:
         kl_2 = jnp.sum(probs_2 * (jnp.log(probs_2 + 1e-8) - jnp.log(m + 1e-8)), axis=-1)
         jsd = (0.5 * (kl_1 + kl_2)).mean()
 
-        loss = nll.mean() + nll2.mean() - self.entropy_weight * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
+        # loss = nll.mean() + nll2.mean() - self.entropy_weight * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
+        loss = nll.mean() - self.entropy_weight * jsd  * jnp.maximum(jnp.abs(t - t2), 0.1)
         if self.weight_decay != 0.:
             loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                     for w in jax.tree.leaves(params))

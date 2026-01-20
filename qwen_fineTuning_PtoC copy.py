@@ -757,8 +757,8 @@ def train(logger, config):
             return rel_center
         
         # init metric
-        # cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        # rel_center_fn = init_rel_center(cp_w)
+        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+        rel_center_fn = init_rel_center(cp_w)
 
         @partial(jit, donate_argnums=(0,))
         def train_batch(carry, batch):
@@ -767,13 +767,13 @@ def train(logger, config):
             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
             # atten_batch = atten_batch[:, max_seqlen:]
 
-            rng_key, params, (opt_state, current_step), best_loss, best_params, update_idx = carry
+            rng_key, params, opt_state, best_loss, best_params, update_idx = carry
             rng_key, subkey = random.split(rng_key)
             t = random.uniform(subkey, (1,), minval=0., maxval=1.)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
             # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-            current_lr = lr_schedule(current_step)
+            current_lr = lr_schedule(update_idx)
             # validate
             rng_key, valid_key = random.split(rng_key)
 
@@ -786,7 +786,15 @@ def train(logger, config):
             # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
             # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
 
-            return (rng_key, params, (opt_state, current_step+1), best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            upper_length = upper_bound(cp)
+            lower_length = lower_bound(cp)
+            mean_center = mass_center(cp)
+            gyration_radius = gyration(cp)
+            rel_center = rel_center_fn(cp)
+
+            return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length, 'lower_length': lower_length, 'mean_center': mean_center, 'gyration_radius': gyration_radius, 'rel_center': rel_center, **metrics, **logs}
+
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -825,7 +833,7 @@ def train(logger, config):
                 # atten_batch = atten_batch[:, max_seqlen:]
 
                 # get curve parameter
-                rng_key, params, (opt_state, current_step), best_loss, best_params, (x_all, atten_all, y_all) = carry
+                rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all) = carry
                 rng_key, subkey = random.split(rng_key)
                 t = random.uniform(subkey, (1,), minval=0., maxval=1.)
 
@@ -841,7 +849,7 @@ def train(logger, config):
                 loss, params, opt_state, (grad_, logs) = s_model.train_step(
                     subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
                 # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-                current_lr = lr_schedule(current_step)
+                current_lr = lr_schedule(step)
                 
                 # validate
                 # rng_key, valid_key = random.split(rng_key)
@@ -864,7 +872,7 @@ def train(logger, config):
                     metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
                 best_loss = jnp.minimum(best_loss, metrics['val_loss'])
 
-                return (rng_key, params, (opt_state, current_step+1), best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+                return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
 
             return _train_expert_step
@@ -965,12 +973,12 @@ def train(logger, config):
                 window_size = max(batch_size, window_size) # at least half batch size
                 train_expert_step = init_train_expert(window_size)
                 # start expert training loop
-                carry = (rng_key, params, (opt_state, 1), best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
+                carry = (rng_key, params, opt_state, best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
                 carry, metrics = jax.lax.scan(
                     train_expert_step, carry, jnp.arange(num_steps))
             elif ds_sampling == 'minibatch':
                 print(f"Start minibatch training for {num_epochs} epochs")
-                carry = (rng_key, params, (opt_state, 1), best_loss, best_params, 0) # 0 is used for update counts
+                carry = (rng_key, params, opt_state, best_loss, best_params, 0) # 0 is used for update counts
                 carry, metrics = jax.lax.scan(
                     train_epoch, carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training

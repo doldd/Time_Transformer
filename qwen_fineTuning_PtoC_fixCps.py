@@ -499,7 +499,7 @@ def train(logger, config):
                 if p != False:
                     def map_fn(m,p,cp_f):
                         if m:
-                            p = p.at[i].set(cp_f[0])
+                            p = p.at[i].set(cp_f)
                         return p
                     params['params'] = jax.tree.map(map_fn, s_model.curve_mask, params['params'], p)
 

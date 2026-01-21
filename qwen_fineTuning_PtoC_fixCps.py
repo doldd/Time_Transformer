@@ -297,6 +297,9 @@ def train(logger, config):
         artifact = wandb.Artifact(name="params", type="pytree")
 
     input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(config['dataset_path'], run=logger)
+    # shuffle once for train/val split
+    rng_key, split_key = random.split(rng_key)
+    perm_idx = random.permutation(split_key, len(input_ids))
     print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
 
     test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = load_text_classification_data(config['dataset_path'], run=logger, test=True)
@@ -342,7 +345,6 @@ def train(logger, config):
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
-        rng_key, split_key = random.split(rng_key)
         # Load dataset
         assert not ((num_epochs > 0) and (num_steps > 0)), "Only one of num_epochs or num_steps should be > 0"
         val = False
@@ -357,7 +359,6 @@ def train(logger, config):
 
             # Split data (simple train/val split) # we dont use validate data
             n_train = int(np.ceil((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
-            perm_idx = random.permutation(split_key, len(input_ids))
             train_input_ids = input_ids[perm_idx][:n_train]
             train_attention_mask = attention_mask[perm_idx][:n_train]
             train_labels = labels[perm_idx][:n_train]

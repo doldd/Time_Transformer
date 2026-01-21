@@ -922,7 +922,7 @@ def train(logger, config):
         # for stats_name, v in memory_stats.items():
         #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
-        if num_steps > 0 and ((k==0) or (k > 1) and (np.sum(fixed_cps_train_params) <= k)): # only if there are free control points left to train
+        if num_steps > 0 and ((k==0) or (k > 1) and (np.sum([0. if type(p) == bool else 1. for p in fixed_cps_train_params]) <= k)): # only if there are free control points left to train
             if ds_sampling == 'expert':
                 print(f"Start sorted expert training for {num_steps}")
                 if sort_mode == 'Random':

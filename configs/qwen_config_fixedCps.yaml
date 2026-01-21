@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Qwen LoRA Valid Fixed Control Points
+name: Linear ModeConnect vs Curve
 description: "Test with fixed control points."
 method: grid
 metric:
@@ -23,7 +23,7 @@ parameters:
       model_path:
         value: "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"
   eval_every_n_batch:
-    value: 25
+    value: 50
   dataset_sampling:
     parameters:
       minibatch:
@@ -61,8 +61,9 @@ parameters:
     parameters:
       cp_fix:
         values: 
+          - [1, 1]
           - [1, 0, 1]
-          - [1, 0, 0, 0, 1] 
+          # - [1, 0, 0, 0, 1] 
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -84,7 +85,7 @@ parameters:
       num_steps:
         value: 5_000
       temperature:
-        value: [0.5, 1.0, 2.0, 4.0, 8.0, 16., 32.0,]
+        value: [1.0,]
       val_percentage:
         value: 0.1
       entropy_maxim:

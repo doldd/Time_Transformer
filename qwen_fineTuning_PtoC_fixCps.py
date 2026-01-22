@@ -30,11 +30,18 @@ from src.subspace_curve import (
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
+from enum import Enum
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # import sys
 # sys.setrecursionlimit(200)
+
+class ProcessState(Enum):
+    PRETRAINING = 1
+    CURVE_FITTING = 2
+    CURVE_EVAL = 3
+    ERROR = 0
 
 class QwenTextClassificationWrapper:
     """
@@ -319,6 +326,7 @@ def train(logger, config):
     config['curve_params']['optimizer_conf']['kwargs']['learning_rate'] = lr_schedule
 
     def train_curve_inner(rng_key,
+                         curve_state: ProcessState,
                          k: int,
                          num_epochs: int,
                          batch_size: int,
@@ -427,7 +435,6 @@ def train(logger, config):
             optimizer_conf['kwargs']['weight_decay'] = weight_decay
             weight_decay = 0.0  # set to 0.0 to avoid double weight decay in model
         if lora_params and lora_params['use_lora']:
-            assert lora_params['lora_mode'] == 'A(t)B(t)', "Only A(t)B(t) LoRA mode makes sense for subspace curves with pretrained point parameters" 
             print("Using LoRA with parameters:", lora_params)
             if isinstance(regularizer, str):
                 if entropy_maxim > 0.0:
@@ -492,9 +499,9 @@ def train(logger, config):
         
         #*** Fix control points handling ***#
         #*** Map pretrained control points which are fixed into params vector ***#
-        if k > 0:
-            assert jax.tree.all(jax.tree.map(lambda x, y: x == y, s_model.train_mask, s_model.curve_mask)), "Pretraind Curve fitting requieres train mask and curve mask to be the same(Lora Params also Curve param)"
         if fixed_cps_train_params != False:
+            # if k > 0:
+            #     assert jax.tree.all(jax.tree.map(lambda x, y: x == y, s_model.train_mask, s_model.curve_mask)), "Pretraind Curve fitting requieres train mask and curve mask to be the same(Lora Params also Curve param)"
             assert (len(fixed_cps_train_params) == (k+1)), "fixed_cps_train_params length must match k or be False"
             for i,p in enumerate(fixed_cps_train_params):
                 if p != False:
@@ -588,8 +595,8 @@ def train(logger, config):
                     return p
             params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
         
-        if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
-            raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
+            if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
+                raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
 
         # compute number of parameters for last curve fitting run
         if k > 0:
@@ -922,7 +929,9 @@ def train(logger, config):
         # for stats_name, v in memory_stats.items():
         #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
         
-        if num_steps > 0 and ((k==0) or (k > 1) and (np.sum([0. if type(p) == bool else 1. for p in fixed_cps_train_params]) <= k)): # only if there are free control points left to train
+        # train loop if num_steps or num_epochs > 0 and k = 0 => single point fine-tuning or 
+        # if num_steps > 0 and ((k==0) or (k > 1) and (np.sum([0. if type(p) == bool else 1. for p in fixed_cps_train_params]) <= k)): # only if there are free control points left to train
+        if num_steps > 0 and ((curve_state == ProcessState.CURVE_FITTING) or (curve_state == ProcessState.PRETRAINING)): # only if there are free control points left to train
             if ds_sampling == 'expert':
                 print(f"Start sorted expert training for {num_steps}")
                 if sort_mode == 'Random':
@@ -973,7 +982,6 @@ def train(logger, config):
                 carry, metrics = jax.lax.scan(
                     train_epoch, carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training
-
             else:
                 raise ValueError(f"Unknown dataset_sampling method {ds_sampling} given. Choose either 'expert' or 'minibatch'.")
 
@@ -1041,7 +1049,7 @@ def train(logger, config):
         post_performance = post_pred_performance(logits_test, test_labels)
         logger.summary.update({f'{logger_prefix}post_pred_test_mean_{k}':v for k,v in post_performance.items()})
 
-        if k > 0:
+        if (curve_state == ProcessState.CURVE_FITTING) or (curve_state == ProcessState.CURVE_EVAL):
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
             ax.plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
             ax2 = ax.twinx()
@@ -1166,52 +1174,69 @@ def train(logger, config):
         #             })
         return rng_key, s_model, params
 
-    
-    train_params = []
+
+
     params = None
     cp_fix = config['curve_params'].pop('cp_fix')
-    for i, fixed in enumerate(cp_fix):
-        if fixed:
-            print(f"Training cp member {i}")
-            config['curve_params']['k'] = 0 
 
-            if params is not None:
-                del params  # free memory
-                jax.clear_caches()
-            rng_key, s_model, params = train_curve_inner(
-                rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
-                lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
-                smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
-                logger_prefix=f'cp_fixed_{i}_')
-            train_params.append(s_model.only_trainable_params(params['params']))
-            rng_key, _ = random.split(rng_key)
-        else:
-            train_params.append(False)
+    # pretrain fixed control points 
+    if np.sum(cp_fix) > 0:
+        curve_state = ProcessState.PRETRAINING
+        if config.get('lora_params', None) is not None:
+            assert config['lora_params']['lora_mode'] == 'A(t)B(t)', "Only A(t)B(t) LoRA mode makes sense for subspace curves with fixed control points" 
+        train_params = []
+        print("Pretraining fixed control points")
+        for i, fixed in enumerate(cp_fix):
+            if fixed:
+                print(f"Training cp member {i}")
+                config['curve_params']['k'] = 0 
 
-    if SAVE_PARAMS:
-        artifact = wandb.Artifact(name="params", type="pytree")
-        print("Save pretrained trainable params")
-        jnp.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
-        # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
-        artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
+                if params is not None:
+                    del params  # free memory
+                    jax.clear_caches()
+                rng_key, s_model, params = train_curve_inner(
+                    rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
+                    lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
+                    smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
+                    logger_prefix=f'cp_fixed_{i}_')
+                train_params.append(s_model.only_trainable_params(params['params']))
+                rng_key, _ = random.split(rng_key)
+            else:
+                train_params.append(False)
 
-    del params  # free memory
-    jax.clear_caches()
-    # train curve model
-    print("Training curve model")
-    config['curve_params']['k'] = len(cp_fix)-1
-    rng_key, s_model, params = train_curve_inner(
-            rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
-            lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
-            smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 
-            fixed_cps_train_params=train_params)
+        if SAVE_PARAMS:
+            artifact = wandb.Artifact(name="params", type="pytree")
+            print("Save pretrained trainable params")
+            jnp.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
+            # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
+            artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
+    else:
+        train_params = False
+    if params is not None:
+        del params  # free memory
+        jax.clear_caches()
     
-    if SAVE_PARAMS:
-        print("Save final trainable params")
-        jnp.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
-        # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
-        artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
-        logger.log_artifact(artifact)
+
+    # train curve model
+    if len(cp_fix) > 1:
+        print("Training curve model")
+        config['curve_params']['k'] = len(cp_fix)-1
+        if len(cp_fix) == np.sum(cp_fix): # all control points are fixed e.g. [1,1] but we check linear mode connection
+            curve_state = ProcessState.CURVE_EVAL
+        else:
+            curve_state = ProcessState.CURVE_FITTING
+        rng_key, s_model, params = train_curve_inner(
+                rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
+                lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
+                smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 
+                fixed_cps_train_params=train_params)
+    
+        if SAVE_PARAMS:
+            print("Save final trainable params")
+            jnp.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
+            # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
+            artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
+            logger.log_artifact(artifact)
 
     logger.finish()
 
@@ -1247,10 +1272,10 @@ if __name__ == '__main__':
         config = {
             'rng_seed': 1,
             # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            # 'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
@@ -1285,7 +1310,7 @@ if __name__ == '__main__':
                             'entropy_maxim': 0.,
                             'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
-                            'temperature': [1.0, 2.0, 4.0,],
+                            'temperature': [1.0,],
                             'val_percentage' : 0.1,
                             'curve_parameterization': 'bezier',
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},

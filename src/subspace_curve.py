@@ -344,7 +344,7 @@ class SubspaceBaseModel:
     def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier'):
         self.model = model
         self.k = k
-        if curve_parameterization == 'b-spline':
+        if 'b-spline' in curve_parameterization:
             print("Using B-Spline curve parameterization")
             degree = 2
             knots = open_uniform_knots(k+1, degree)
@@ -541,7 +541,7 @@ class SubspaceBaseModel:
     
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def _predict(self, params, state, inputs, train) -> Tuple[jnp.ndarray, dict]:
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
@@ -568,7 +568,7 @@ class SubspaceBaseModel:
         return out, net_state
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the output of the model for given parameters, time, and input.
@@ -582,17 +582,26 @@ class SubspaceBaseModel:
         - The output of the model.
 
         """
-        # sample Bezier coefficient
-        bezier_coeff = self.bezier(t)
-        # Compute one parameter set per sample
-        params = jax.tree.map(lambda p, m: jnp.einsum(
-            'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
+        if type(t) is dict:
+            def curve_to_point(t, p, m):
+                if m:
+                    bezier_coeff = self.bezier(t)
+                    return jnp.einsum('k,k...->...', bezier_coeff, p).astype(p.dtype)
+                else:
+                    return p
+            params = jax.tree.map(curve_to_point, t, params, self.curve_mask)
+        else:
+            # sample Bezier coefficient
+            bezier_coeff = self.bezier(t)
+            # Compute one parameter set per sample
+            params = jax.tree.map(lambda p, m: jnp.einsum(
+                'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
 
         # forward pass per sample
         out, state = self._predict(params, state, x, train=train)
         return out, state
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Abstract method for computing the negative log-likelihood loss of the model.
@@ -615,7 +624,7 @@ class SubspaceBaseModel:
     def l2_loss(x, alpha):
         return alpha * (x ** 2).sum()
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         """
         Computes the loss of the model.
@@ -644,7 +653,7 @@ class SubspaceBaseModel:
             loss = nll + w_norm
             return loss, (state, {'nll': nll, 'weight_decay': w_norm})
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_natural_t(self, key, t, params, state, x, y):
         """
         Computes the loss of the model.
@@ -684,8 +693,8 @@ class SubspaceBaseModel:
         return weighted_loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                  for w in jax.tree.leaves(params['params'])), state
 
-    # @partial(jit, static_argnums=(0, 6))
-    @partial(jit, static_argnums=(0, 7), donate_argnums=(3,6))
+    # @partial(jit, static_argnums=(0, 7))
+    # @partial(jit, static_argnums=(0, 7), donate_argnums=(3,6))
     # @profile
     def train_step(self, key, t, params, x, y, opt_state, optimizer):
         """
@@ -721,7 +730,7 @@ class SubspaceBaseModel:
 class CategorySubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
@@ -758,7 +767,7 @@ class RegressionSubspace(SubspaceBaseModel):
         self.log_scale = out_dist_log_scale
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
@@ -822,7 +831,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         return params
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
@@ -847,7 +856,7 @@ class QuantileSubspace(SubspaceBaseModel):
         self.quantiles = jnp.array(quantiles, dtype=jnp.float32)
 
     @staticmethod
-    @jit
+    # @jit
     def _quantile_loss(pred, actual, quantile: float):
         """Calculates quantile loss.
 
@@ -865,7 +874,7 @@ class QuantileSubspace(SubspaceBaseModel):
         return 2 * jnp.where(loss_first >= 0, loss_first, loss_second)
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
@@ -911,7 +920,7 @@ class RepulsiveMixin:
             raise ValueError(f"Unknown regularizer type: {regularizer}")
 
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def repulsive_force(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -924,7 +933,7 @@ class RepulsiveMixin:
         force = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
         return force
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def repulsive_energy(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -938,7 +947,7 @@ class RepulsiveMixin:
         log_energy = jax.lax.fori_loop(0, n - 1, body_fun, 0.0)
         return log_energy
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def summed_cosine_similarity(self, params):
         cp_w = masked_pytree_to_matrix(params, self.curve_mask, self.k)
         n = cp_w.shape[0]
@@ -948,12 +957,12 @@ class RepulsiveMixin:
         cosine_sim = jnp.sum(dot_res[upper_triangular_indices])
         return cosine_sim
     
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def summed_cosine_similarity_square(self, params):
         return self.summed_cosine_similarity(params) ** 2
     
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         # Sample t param of Bezier curve
         nll, (state, logs) = super().compute_loss_t(key, t, params, state, freezed_params, x, y)
@@ -968,7 +977,7 @@ class EntropyMixin:
         self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
@@ -990,7 +999,7 @@ class EntropyMixin2:
         self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
@@ -1016,7 +1025,7 @@ class JensenShannonMixin:
         self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
@@ -1284,7 +1293,7 @@ class LoRAMixin:
         raise NotImplementedError("init_params not possible for LoRA.")
     
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,))
     def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the output of the model for given parameters, time, and input.
@@ -1298,11 +1307,26 @@ class LoRAMixin:
         - The output of the model.
 
         """
-        # sample Bezier coefficient
-        bezier_coeff = self.bezier(t)
-        # Compute one parameter set per sample
-        params = jax.tree.map(lambda p, m: jnp.einsum(
-            'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
+        if type(t) is dict:
+            def curve_to_point(t, p, m):
+                if m:
+                    bezier_coeff = self.bezier(t)
+                    return jnp.einsum('k,k...->...', bezier_coeff, p).astype(p.dtype)
+                return p
+            params = jax.tree.map(curve_to_point, t, params, self.curve_mask)
+        else:
+            # sample Bezier coefficient
+            bezier_coeff = self.bezier(t)
+            # Compute one parameter set per sample
+            params = jax.tree.map(lambda p, m: jnp.einsum(
+                'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
+
+        # # sample Bezier coefficient
+        # bezier_coeff = self.bezier(t)
+        # # Compute one parameter set per sample
+        # params = jax.tree.map(lambda p, m: jnp.einsum(
+        #     'k,k...->...', bezier_coeff, p).astype(p.dtype) if m else p, params, self.curve_mask)
+        
         
         # Apply LoRA to the parameters
         params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoraAbstractParams) else lp, params, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
@@ -1382,7 +1406,7 @@ def pytree_to_vec(pytree):
     return jax.tree.reduce(lambda x, y: jnp.concatenate(
         [x, y.reshape(-1)], axis=-1), pytree)
 
-@jit
+# @jit
 def vec_to_single_pytree(vec, subspace_params):
     """
     Converts a vector representation of parameters to a pytree structure with no loading dimension.
@@ -1415,7 +1439,7 @@ def vec_to_single_pytree(vec, subspace_params):
     return jax.tree.unflatten(structure, flatten_leafs)
 
 
-@jit
+# @jit
 def vec_to_pytree(vec, subspace_params):
     """
     Converts a vector representation of parameters to a pytree structure.
@@ -1447,7 +1471,7 @@ def vec_to_pytree(vec, subspace_params):
         index = upper_index
     return jax.tree.unflatten(structure, flatten_leafs)
 
-@jit
+# @jit
 def matrix_to_pytree(vec, subspace_params):
     """
     Converts a vector representation of parameters to a pytree structure.

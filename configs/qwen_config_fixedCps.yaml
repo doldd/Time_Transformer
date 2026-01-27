@@ -1,6 +1,6 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Linear ModeConnect vs Curve
-description: "Test with fixed control points."
+name: Flat Lora Curvespace
+description: "Test with open control points. k=3 and Flat-LoRA with weight noise."
 method: grid
 metric:
   goal: maximize
@@ -9,11 +9,12 @@ parameters:
   save_params:
     value: True
   dataset_path:
-    values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
+    values: [
+            "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             #  "ddold/qwen_PtoC/boolq_dataset:v0",
-             "ddold/qwen_PtoC/obqa_dataset:v0",
-             "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
+            #  "ddold/qwen_PtoC/obqa_dataset:v0",
+            #  "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
              ]
   load_params_path:
@@ -47,8 +48,10 @@ parameters:
       lora_alpha:
         value: 16.0
       lora_mode:
-        # values: ["A(t)B", "A(t)B(t)", "As(t)B"]
-        value: "A(t)B(t)"
+        # values: ["A(t)B", "A(t)B(t)", "As(t)B", "Asd(t)B",]
+        values: ["Asd(t)B",]
+      lora_rho:
+        values: [1., 0.5, 0.1, 0.05, 0.01]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -61,8 +64,11 @@ parameters:
     parameters:
       cp_fix:
         values: 
-          - [1, 1]
-          - [1, 0, 1]
+          # - [1, 1]
+          # - [1, 0, 1]
+          # - [1,]
+          - [0, 0, 0]
+          # - [0, 0, 0, 0, 0, 0]
           # - [1, 0, 0, 0, 1] 
       batch_size:
         values: [4,]
@@ -94,6 +100,9 @@ parameters:
         value: 0.
       curve_parameterization:
         value: "bezier"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
+      curve_sampling_mode:
+        # value: "per_leaf"  # ["per_leaf", "combined"]
+        values: ["per_leaf", "combined"]
 
       filter_masks:
         values: 

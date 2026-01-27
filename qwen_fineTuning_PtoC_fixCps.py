@@ -31,6 +31,7 @@ from src.subspace_curve import (
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
 from enum import Enum
+import time
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -138,82 +139,161 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
 
+# def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
+#     if t_sample_fn is None:
+#         if use_linspace:
+#             get_t = lambda key: jnp.linspace(0, 1., n_samples)
+#         else:
+#             get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
+#     else:
+#         if use_linspace:
+#             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
+#         def tree_per_sample_fn(key):
+#             keys = jax.random.split(key, n_samples)
+#             return [t_sample_fn(k) for k in keys]
+#         get_t = tree_per_sample_fn
+#     ii = len(x) // batch_size
+    
+#     x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+#     x_last = x[matching_limit:]
+#     x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+#     att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+#     att_last = attention_mask[matching_limit:]
+#     att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+
+#     y_all = target[:matching_limit]  # drop non matching batch size
+#     y_last = target[matching_limit:]
+#     y_ = es('(ib)...->ib...', y_all, b=batch_size)
+
+#     def acc_fn(rng_key, params):
+#         # @scan_tqdm(ii, desc='Evaluating', leave=False)
+#         def pred(key, data):
+#             x_batch, atten_batch, y_batch = data
+#             # # turn off leading padding tokens in batch for faster evaluation
+#             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
+#             # atten_batch = atten_batch[:, max_seqlen:]
+
+#             # @jax.jit
+#             def eval(t):
+#                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
+#                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
+#                 return loss*batch_size, acc, out  # sum over batch
+#                 # return loss*batch_size, acc  # sum over batch
+            
+#             key, subkey = random.split(key)
+
+#             # draw samples to approximate curve performance
+#             t = get_t(subkey)
+#             loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
+#             # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
+
+#             if average:
+#                 # mean over samples
+#                 return key, (jnp.sum(loss), jnp.sum(acc), out)
+#             else:
+#                 return key, (loss, acc, out)  # no mean over samples
+
+#         # shape (n_data, draws, output_dim)
+#         rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
+#         # compute loss of last irregular batch
+#         if len(x_last) > 0:
+#             rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
+#             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
+#             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
+#             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
+#         else:
+#             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
+
+#         # # compute the expected calibration error (ECE)
+#         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
+
+#         if average:
+#             ece = jnp.mean(ece)
+#             loss = loss.sum() / (n_samples * x.shape[0])
+#             acc = acc.sum() / (n_samples * x.shape[0])
+#         else:
+#             loss = jnp.sum(loss, axis=0) / x.shape[0]
+#             acc = jnp.sum(acc, axis=0) / x.shape[0]
+
+#         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
+#     return acc_fn
+
 def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
     if t_sample_fn is None:
         if use_linspace:
             get_t = lambda key: jnp.linspace(0, 1., n_samples)
         else:
-            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
+            get_t = lambda key: jax.random.uniform(key, (n_samples,), minval=0., maxval=1.)
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
-        def tree_per_sample_fn(key):
-            keys = jax.random.split(key, n_samples)
-            return [t_sample_fn(k) for k in keys]
-        get_t = tree_per_sample_fn
+        # get_t = partial(t_sample_fn, n_samples=n_samples)
+        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(jax.random.split(k, n_samples))
     ii = len(x) // batch_size
     
-    x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-    x_last = x[matching_limit:]
-    x_ = es('(ib)...->ib...', x_, b=batch_size)
+    idx = jnp.arange(len(x))
+    idx_ = idx[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    idx_ = es('(ib)...->ib...', idx_, b=batch_size)
+    idx_last = idx[matching_limit:]
 
-    att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-    att_last = attention_mask[matching_limit:]
-    att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+    # x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    # x_last = x[matching_limit:]
+    # x_ = es('(ib)...->ib...', x_, b=batch_size)
 
-    y_all = target[:matching_limit]  # drop non matching batch size
-    y_last = target[matching_limit:]
-    y_ = es('(ib)...->ib...', y_all, b=batch_size)
+    # att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+    # att_last = attention_mask[matching_limit:]
+    # att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+
+    # y_all = target[:matching_limit]  # drop non matching batch size
+    # y_last = target[matching_limit:]
+    # y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
     def acc_fn(rng_key, params):
         # @scan_tqdm(ii, desc='Evaluating', leave=False)
-        def pred(key, data):
-            x_batch, atten_batch, y_batch = data
-            # # turn off leading padding tokens in batch for faster evaluation
-            # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-            # atten_batch = atten_batch[:, max_seqlen:]
+        def pred(rng_key, data_idx):
+            x_batch = x.at[data_idx].get()
+            att_m_batch = attention_mask.at[data_idx].get()
+            y_batch = target.at[data_idx].get()
 
-            # @jax.jit
-            def eval(t):
-                loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
-                acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-                return loss*batch_size, acc, out  # sum over batch
-                # return loss*batch_size, acc  # sum over batch
+            rng_key, key_ = jax.random.split(rng_key)
+            t_tree = get_t(key_)  # shape (n_samples,)
+            # keys = jax.random.split(key_, n_samples)
             
-            key, subkey = random.split(key)
+            def single_pred(_, t):
+                # t = get_t(key)  # shape (n_samples,) or list of trees
+                loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=None)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
+                return None, (loss*batch_size, out)
+            
+            _, (loss, out) = jax.lax.scan(single_pred, None, t_tree)
+            return rng_key, (loss, out)  # loss shape (n_samples), out shape (n_samples, batch_size, output_dim)
 
-            # draw samples to approximate curve performance
-            t = get_t(subkey)
-            loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
-            # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
+        rng_key, (loss, out) = jax.lax.scan(pred, rng_key, idx_) # loss shape (n_batches, n_samples), out shape (n_batches, n_samples, batch_size, output_dim)
 
-            if average:
-                # mean over samples
-                return key, (jnp.sum(loss), jnp.sum(acc), out)
-            else:
-                return key, (loss, acc, out)  # no mean over samples
-
-        # shape (n_data, draws, output_dim)
-        rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
+        # shape (n_data, output_dim)
         # compute loss of last irregular batch
-        if len(x_last) > 0:
-            rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
+        if len(idx_last) > 0:
+            rng_key, (loss_last, out_last) = pred(rng_key, idx_last)
             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-            acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
+            # jax.debug.print(f"out_last shape: {out_last.shape}")
             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
         else:
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
+        loss = loss.transpose(1,0)
+
         # # compute the expected calibration error (ECE)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
+        # acc = jax.vmap(lambda logits, labels: jnp.mean(jnp.argmax(logits, axis=-1) == labels), in_axes=(0, None))(out, target)  # shape (n_samples,)
+        acc = jnp.argmax(out, axis=-1) == target # shape (n_samples, n_data)
 
         if average:
             ece = jnp.mean(ece)
             loss = loss.sum() / (n_samples * x.shape[0])
             acc = acc.sum() / (n_samples * x.shape[0])
         else:
-            loss = jnp.sum(loss, axis=0) / x.shape[0]
-            acc = jnp.sum(acc, axis=0) / x.shape[0]
+            loss = jnp.sum(loss, axis=1) / x.shape[0]
+            acc = jnp.sum(acc, axis=1) / x.shape[0]
 
         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
     return acc_fn
@@ -311,8 +391,8 @@ def train(logger, config):
     SWEEP_PARAM_PATH = config.get('load_params_path', False)
 
     # Create artifact for storing parameters
-    if SAVE_PARAMS:
-        artifact = wandb.Artifact(name="params", type="pytree")
+    # if SAVE_PARAMS:
+    artifact = wandb.Artifact(name="params", type="pytree")
 
     input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(config['dataset_path'], run=logger)
     # shuffle once for train/val split
@@ -533,20 +613,15 @@ def train(logger, config):
             #     t_vec = jax.random.uniform(key, (num_leaves_parameter,), minval=0., maxval=1.)
             #     t_tree = jax.tree.unflatten(t_structure, t_vec)
             #     return t_tree
-
             only_curves = jax.tree.map(lambda m: True if m else None, s_model.curve_mask)
             num_curve_leaves = len(jax.tree.leaves(only_curves))
             struct = jax.tree.structure(only_curves)
 
             def t_sample_fn(key):
-                keys = jax.random.split(key, num_curve_leaves)
-                keys_tree = jax.tree.unflatten(struct, keys)
-                keys_tree = jax.tree.map(lambda k: False if k is None else k, keys_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
-
-                t_tree = jax.tree.map(lambda k, m: jax.random.uniform(k, (1,), minval=0., maxval=1.) if m else False, keys_tree, s_model.curve_mask)
+                t_flatt = jax.random.uniform(key, (num_curve_leaves,), minval=0., maxval=1.)
+                t_tree = jax.tree.unflatten(struct, t_flatt)
+                t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
                 return t_tree
-
-
         else:
             def t_sample_fn(key):
                 return random.uniform(key, (1,), minval=0., maxval=1.)
@@ -653,6 +728,8 @@ def train(logger, config):
         #     # jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
         #     trainable_params = s_model.only_trainable_params(params['params'])
         #     jnp.save(f'tmp_files/{logger.id}_trainable_params_init.npy', trainable_params)
+                #     import time
+                # time.sleep(0.5)
         #     artifact.add_file(f'tmp_files/{logger.id}_trainable_params_init.npy')
 
         # Define optimizer
@@ -1234,8 +1311,8 @@ def train(logger, config):
     # pretrain fixed control points 
     if np.sum(cp_fix) > 0:
         curve_state = ProcessState.PRETRAINING
-        if config.get('lora_params', None) is not None:
-            assert config['lora_params']['lora_mode'] == 'A(t)B(t)', "Only A(t)B(t) LoRA mode makes sense for subspace curves with fixed control points" 
+        if config.get('lora_params', None) is not None and np.sum(cp_fix) < len(cp_fix):
+            assert config['lora_params']['lora_mode'] == 'As(t)B(t)', "Only As(t)B(t) LoRA mode makes sense for subspace curves with fixed control points" 
         train_params = []
         print("Pretraining fixed control points")
         for i, fixed in enumerate(cp_fix):
@@ -1257,10 +1334,11 @@ def train(logger, config):
                 train_params.append(False)
 
         if SAVE_PARAMS:
-            artifact = wandb.Artifact(name="params", type="pytree")
-            print("Save pretrained trainable params")
-            jnp.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
+            print("Save pretrained trainable params ...")
+            np.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
             # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
+            time.sleep(1)  # ensure file is written
+            print("Saved pretrained parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
     else:
         train_params = False
@@ -1284,12 +1362,16 @@ def train(logger, config):
                 fixed_cps_train_params=train_params)
     
         if SAVE_PARAMS:
-            print("Save final trainable params")
-            jnp.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
+            print("Save final trainable params ...")
+            np.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
             # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
+            time.sleep(1)  # ensure file is written
+            print("Saved trainable parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
-            logger.log_artifact(artifact)
-
+    if SAVE_PARAMS:    
+        logger.log_artifact(artifact)
+        time.sleep(5)  # ensure artifact is logged
+        print("Logged artifact with parameters.")
     logger.finish()
 
 
@@ -1324,10 +1406,10 @@ if __name__ == '__main__':
         config = {
             'rng_seed': 1,
             # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            # 'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
@@ -1342,7 +1424,7 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'A(t)B',
+                            'lora_mode': 'Asd(t)B',
                             'filter_masks': 
                                 [
                                     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -1403,6 +1485,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="Old Fixed script A(t)B", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="MLE Asd(t)B", entity="ddold", config=config)
         train(logger, config)
 

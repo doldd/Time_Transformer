@@ -485,6 +485,11 @@ class SubspaceBaseModel:
                     init_s = jax.nn.initializers.orthogonal()
                     p.s = init_s(key, shape_, dtype=p.s.dtype)
                     return p
+                elif type(p) is LoRAScaleDiagParams:
+                    shape_ = (self.k+1,) + p.s.shape 
+                    init_s = jax.nn.initializers.normal(stddev=1.)
+                    p.s = init_s(key, shape_, dtype=p.s.dtype)
+                    return p
                     # raise NotImplementedError("LoRAScaleParams initialization not implemented in init_params_from_point.")
                 elif type(p) is LoRAABParam:
                     gain = math.sqrt(2 / (1 + 5))  # Gain for initialization sqrt(2/(1+math.sqrt(5)^2)) for ReLU
@@ -569,7 +574,7 @@ class SubspaceBaseModel:
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
+    def __call__(self, params, state, t, x, train=True, key=None) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the output of the model for given parameters, time, and input.
 
@@ -602,7 +607,7 @@ class SubspaceBaseModel:
         return out, state
 
     # @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y, train:bool) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+    def nll(self, params, state, t, x, y, train:bool, key) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Abstract method for computing the negative log-likelihood loss of the model.
 
@@ -643,7 +648,7 @@ class SubspaceBaseModel:
         # Sample t param of Bezier curve
         # t = random.uniform(key, (1,), minval=0., maxval=1.)
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
-        nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
+        nll, state, out = self.nll(joind_param, state, t, x, y, train=True, key=key)
         nll = nll.mean()
         if self.weight_decay == 0.:
             return nll, (state, {'nll': nll})
@@ -672,7 +677,7 @@ class SubspaceBaseModel:
         # Sample t param of Bezier curve
 
         t = random.uniform(key, (1,), minval=0., maxval=1.)
-        loss, state, out = self.nll(params, state, t, x, y, train=True)
+        loss, state, out = self.nll(params, state, t, x, y, train=True, key=key)
 
         raise ValueError("Natural parameterization currently not implemented for SubspaceBaseModel (pytree_to_matrix needs masking)")
         cp_w = pytree_to_matrix(params['params'], self.k)
@@ -731,7 +736,7 @@ class CategorySubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+    def nll(self, params, state, t, x, y, train:bool=True, key=None) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -745,7 +750,7 @@ class CategorySubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
+        out, state = self(params, state, t, x, train=train, key=key)  # shape (n_samples, n_data, output_dim)
 
         nll = optax.losses.softmax_cross_entropy_with_integer_labels(
                 logits=out, labels=y)
@@ -768,7 +773,7 @@ class RegressionSubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+    def nll(self, params, state, t, x, y, train:bool=True, key=None) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -782,7 +787,7 @@ class RegressionSubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
+        out, state = self(params, state, t, x, train=train, key=key)  # shape (n_data, output_dim)
         assert out.shape[-1] == 1, "RegressionSubspace expects output_dim=1"
         assert y.ndim == 1, "RegressionSubspace expects y to be 1D"
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(self.log_scale)+1e-8)
@@ -832,7 +837,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+    def nll(self, params, state, t, x, y, train:bool=True, key=None) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -846,7 +851,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x, train=train)  # shape (n_data, output_dim)
+        out, state = self(params, state, t, x, train=train, key=key)  # shape (n_data, output_dim)
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
         return nll, state, out
     
@@ -875,7 +880,7 @@ class QuantileSubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def nll(self, params, state, t, x, y, train:bool=True) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
+    def nll(self, params, state, t, x, y, train:bool=True, key=None) -> Tuple[jnp.ndarray, dict, jnp.ndarray]:
         """
         Computes the negative log-likelihood loss of the model.
 
@@ -889,7 +894,7 @@ class QuantileSubspace(SubspaceBaseModel):
         - The negative log-likelihood loss.
 
         """
-        out, state = self(params, state, t, x, train=train)  # shape (n_samples, n_data, output_dim)
+        out, state = self(params, state, t, x, train=train, key=key)  # shape (n_samples, n_data, output_dim)
         out_quantile = out[1]
 
         loss = jnp.square(out_quantile[:,:,0] - y) 
@@ -980,7 +985,7 @@ class EntropyMixin:
     # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
-        nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
+        nll, state, out = self.nll(joind_param, state, t, x, y, train=True, key=key)
         probs = jax.nn.softmax(out, axis=-1)
         n_entropy = jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1).mean()
         loss = nll.mean() + self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
@@ -1002,7 +1007,7 @@ class EntropyMixin2:
     # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
-        nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
+        nll, state, out = self.nll(joind_param, state, t, x, y, train=True, key=key)
         probs = jax.nn.softmax(out, axis=-1)
 
         # apply entropy loss only to misclassified samples
@@ -1028,12 +1033,12 @@ class JensenShannonMixin:
     # @partial(jit, static_argnums=(0,))
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
         joind_param = jax.tree.map(lambda x, y, m: x if m else y, params, unfreeze(freezed_params), self.train_mask)
-        nll, state, out = self.nll(joind_param, state, t, x, y, train=True)
+        nll, state, out = self.nll(joind_param, state, t, x, y, train=True, key=key)
         probs_1 = jax.nn.softmax(out, axis=-1)
 
         key, t2 = random.split(key)
         t2 = random.uniform(key, (1,), minval=0., maxval=1.)
-        nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True)
+        nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
         probs_2 = jax.nn.softmax(out2, axis=-1)
 
         # jsd divergence between probs_1 and probs_2
@@ -1133,6 +1138,17 @@ class LoRAScaleParams(LoraAbstractParams):
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
         scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
         return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+    
+@register_pytree_node_class
+class LoRAScaleDiagParams(LoRAScaleParams):
+    def apply(self):
+        # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
+        A_ = jnp.matmul(jnp.diag(self.s), self.A)  # Scale A by s
+        w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
+        w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
+        scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
+        return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+
 
 class LoRAMixin:
     """
@@ -1144,11 +1160,12 @@ class LoRAMixin:
     - lora_dtype (str): The data type for LoRA parameters. Options are "original", "float16", "bfloat16", "float32".
     - lora_alpha (float): Scaling factor for LoRA.
     - lora_mode (str): The mode of LoRA adaptation. Options are "A(t)B", "As(t)B", "A(t)B(t)".
+    - lora_rho (float): if > 0, use Flat-LoRA with adding weight noise of factor rho.
     - kwargs: Additional keyword arguments for the parent class.
     """
 
-    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", **kwargs):
-        print(f"Using LoRA Mixin with rank={r}, dtype={lora_dtype}, alpha={lora_alpha}, mode={lora_mode}")
+    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", lora_rho: float=.0, **kwargs):
+        print(f"Using LoRA Mixin with rank={r}, dtype={lora_dtype}, alpha={lora_alpha}, mode={lora_mode}, rho={lora_rho}")
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
@@ -1156,6 +1173,7 @@ class LoRAMixin:
         self.lora_dtype = lora_dtype
         self.lora_alpha = lora_alpha
         self.lora_mode = lora_mode
+        self.lora_rho = lora_rho
     
     def get_dtype(self, param):
         if self.lora_dtype == "original":
@@ -1263,6 +1281,11 @@ class LoRAMixin:
                         lora_params.append(LoRAScaleParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A, s and B
                     elif self.lora_mode == "A(t)B(t)":
                         lora_params.append(LoRAABParam(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # used to indicate both A and B are time dependent
+                    elif self.lora_mode == "Asd(t)B":    
+                        rng_key, subkey = random.split(rng_key)
+                        s = jax.nn.initializers.normal(stddev=1.)(subkey, (rank,), dtype=dtype)
+                        # s = jnp.ones((rank, 1), dtype=dtype)  # Scaling vector for A
+                        lora_params.append(LoRAScaleDiagParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha))  # Store A, s and B
                     else:
                         raise ValueError(f"Unknown lora_mode: {self.lora_mode} || Supported modes are 'A(t)B', 'As(t)B', 'A(t)B(t)'")
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
@@ -1276,12 +1299,18 @@ class LoRAMixin:
 
         if self.lora_mode == "A(t)B(t)":
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
-        elif self.lora_mode == "As(t)B":
+        elif self.lora_mode == "As(t)B" or self.lora_mode == "Asd(t)B":
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True, a_off=True)
         else:
             # update the original curve mask to include LoRA parameter B into curve approach if the parameter was originally selected by the mask
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True)
         self.curve_mask = mask_update
+
+        # initialize parameters for Flat-LoRA weight noise
+        only_lora_params = jax.tree.map(lambda m: True if isinstance(m, LoraAbstractParams) else None, self.curve_mask, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
+        self.num_train_leaves = len(jax.tree.leaves(only_lora_params))
+        self.struct_lora = jax.tree.structure(only_lora_params)
+
         return params
     
         # # update the original curve mask to include LoRA parameter A into curve approach if the parameter was originally selected by the mask
@@ -1291,10 +1320,10 @@ class LoRAMixin:
     
     def init_params(self, key, x, mask):
         raise NotImplementedError("init_params not possible for LoRA.")
-    
+
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
     # @partial(jit, static_argnums=(0,))
-    def __call__(self, params, state, t, x, train=True) -> Tuple[jnp.ndarray, dict]:
+    def __call__(self, params, state, t, x, train=True, key=None) -> Tuple[jnp.ndarray, dict]:
         """
         Computes the output of the model for given parameters, time, and input.
 
@@ -1330,6 +1359,21 @@ class LoRAMixin:
         
         # Apply LoRA to the parameters
         params = jax.tree.map(lambda lp: lp.apply() if isinstance(lp, LoraAbstractParams) else lp, params, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
+        if (self.lora_rho > 0.) and (key != None):
+            # Apply Flat-LoRA weight noise
+            def get_t_tree(key):
+                keys_flatt = jax.random.split(key, self.num_train_leaves)
+                keys_tree = jax.tree.unflatten(self.struct_lora, keys_flatt)
+                keys_tree = jax.tree.map(lambda k: False if k is None else k, keys_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
+                return keys_tree
+            def apply_noise(p, k):
+                scaling = self.lora_rho / jnp.sqrt(p.shape[0])
+                w_noise = scaling * jnp.linalg.norm(p, axis=0, keepdims=True) * jax.random.normal(k, p.shape, dtype=p.dtype)
+                return p + w_noise
+
+            key_tree = get_t_tree(key)
+            params = jax.tree.map(lambda p, k: p if k is False else apply_noise(p, k), params, key_tree)
+
 
         # forward pass per sample
         out, state = self._predict(params, state, x, train=train)

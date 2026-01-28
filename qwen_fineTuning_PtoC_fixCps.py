@@ -531,7 +531,8 @@ def train(logger, config):
             print("Using LoRA with parameters:", lora_params)
             if isinstance(regularizer, str):
                 if entropy_maxim > 0.0:
-                    s_model = LoRARepulsiveEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                    s_model = LoRARepulsiveEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
+                                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
                                                                    model=model, k=k, weight_decay=weight_decay,
                                                                    perm_spec=perm_spec,
                                                                    natural_parameterization=natural_parameterization,
@@ -540,7 +541,8 @@ def train(logger, config):
                                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
                                                                    entropy_weight=entropy_maxim,)
                 else:
-                    s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                    s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
+                                                            lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
                                                             model=model, k=k, weight_decay=weight_decay,
                                                             perm_spec=perm_spec,
                                                             natural_parameterization=natural_parameterization,
@@ -549,7 +551,8 @@ def train(logger, config):
                                                             gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 if entropy_maxim > 0.0:
-                    s_model = LoRAJSDCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                    s_model = LoRAJSDCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
+                                                      lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
                                                       model=model, k=k, weight_decay=weight_decay, 
                                                       perm_spec=perm_spec,
                                                       natural_parameterization=natural_parameterization,
@@ -558,7 +561,8 @@ def train(logger, config):
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
-                    s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                    s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
+                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
                                                    model=model, k=k, weight_decay=weight_decay, 
                                                    perm_spec=perm_spec,
                                                    natural_parameterization=natural_parameterization,

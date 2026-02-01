@@ -1316,7 +1316,7 @@ def train(logger, config):
     if np.sum(cp_fix) > 0:
         curve_state = ProcessState.PRETRAINING
         if config.get('lora_params', None) is not None and np.sum(cp_fix) < len(cp_fix):
-            assert config['lora_params']['lora_mode'] == 'As(t)B(t)', "Only As(t)B(t) LoRA mode makes sense for subspace curves with fixed control points" 
+            assert config['lora_params']['lora_mode'] == 'A(t)B(t)', "Only A(t)B(t) LoRA mode makes sense for subspace curves with fixed control points" 
         train_params = []
         print("Pretraining fixed control points")
         for i, fixed in enumerate(cp_fix):

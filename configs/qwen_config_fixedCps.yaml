@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Flat Lora Curvespace
+name: Flat Lora Saves
 description: "Test with open control points. k=3 and Flat-LoRA with weight noise."
 method: grid
 metric:
@@ -7,14 +7,14 @@ metric:
   name: acc_val_curve
 parameters:
   save_params:
-    value: False
+    value: True
   dataset_path:
     values: [
-            # "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             #  "ddold/qwen_PtoC/boolq_dataset:v0",
              "ddold/qwen_PtoC/obqa_dataset:v0",
-             "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
+            #  "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
              ]
   load_params_path:
@@ -50,8 +50,9 @@ parameters:
       lora_mode:
         # values: ["A(t)B", "A(t)B(t)", "As(t)B", "Asd(t)B",]
         values: ["Asd(t)B", "A(t)B(t)"]
+        # values: ["A(t)B(t)", ]
       lora_rho:
-        values: [10., 1., 0.1, 0.01,]
+        values: [0.5, 0.1, 0.]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -65,9 +66,9 @@ parameters:
       cp_fix:
         values: 
           # - [1, 1]
-          # - [1, 0, 1]
-          # - [1,]
+          - [1, 0, 1]
           - [0, 0, 0]
+          - [1,]
           # - [0, 0, 0, 0, 0, 0]
           # - [1, 0, 0, 0, 1] 
       batch_size:
@@ -102,7 +103,8 @@ parameters:
         value: "bezier"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
       curve_sampling_mode:
         # value: "per_leaf"  # ["per_leaf", "combined"]
-        values: ["per_leaf", "combined"]
+        # values: ["per_leaf", "combined"]
+        values: ["per_leaf"]
 
       filter_masks:
         values: 
@@ -143,7 +145,7 @@ parameters:
         #   freeze_non_curve_params:
         #     value: True
   rng_seed:
-    values: [1, 2, 4, 8]
+    values: [1, 2,]
 
 command:
 - ${env}

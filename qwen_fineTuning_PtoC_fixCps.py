@@ -260,12 +260,13 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             t_tree = get_t(key_)  # shape (n_samples,)
             # keys = jax.random.split(key_, n_samples)
             
-            def single_pred(_, t):
-                # t = get_t(key)  # shape (n_samples,) or list of trees
-                loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=None)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
-                return None, (loss*batch_size, out)
+            def single_pred(key, t):
+                # t is either scalar or tree of shape ()
+                key, subkey = jax.random.split(key)
+                loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=subkey)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
+                return key, (loss*batch_size, out)
             
-            _, (loss, out) = jax.lax.scan(single_pred, None, t_tree)
+            rng_key, (loss, out) = jax.lax.scan(single_pred, rng_key, t_tree)
             return rng_key, (loss, out)  # loss shape (n_samples), out shape (n_samples, batch_size, output_dim)
 
         rng_key, (loss, out) = jax.lax.scan(pred, rng_key, idx_) # loss shape (n_batches, n_samples), out shape (n_batches, n_samples, batch_size, output_dim)
@@ -532,7 +533,7 @@ def train(logger, config):
             if isinstance(regularizer, str):
                 if entropy_maxim > 0.0:
                     s_model = LoRARepulsiveEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
+                                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                                    model=model, k=k, weight_decay=weight_decay,
                                                                    perm_spec=perm_spec,
                                                                    natural_parameterization=natural_parameterization,
@@ -542,7 +543,7 @@ def train(logger, config):
                                                                    entropy_weight=entropy_maxim,)
                 else:
                     s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                            lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
+                                                            lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                             model=model, k=k, weight_decay=weight_decay,
                                                             perm_spec=perm_spec,
                                                             natural_parameterization=natural_parameterization,
@@ -552,7 +553,7 @@ def train(logger, config):
             else:
                 if entropy_maxim > 0.0:
                     s_model = LoRAJSDCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                      lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
+                                                      lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                       model=model, k=k, weight_decay=weight_decay, 
                                                       perm_spec=perm_spec,
                                                       natural_parameterization=natural_parameterization,
@@ -562,7 +563,7 @@ def train(logger, config):
                                                       )
                 else:
                     s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),
+                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),  lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                    model=model, k=k, weight_decay=weight_decay, 
                                                    perm_spec=perm_spec,
                                                    natural_parameterization=natural_parameterization,
@@ -1410,10 +1411,10 @@ if __name__ == '__main__':
         config = {
             'rng_seed': 1,
             # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
-            # 'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
             'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
             # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
@@ -1428,7 +1429,9 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'Asd(t)B',
+                            'lora_mode': 'A(t)eB',
+                            'lora_rho': .1,
+                            'lora_rho_s': .0,
                             'filter_masks': 
                                 [
                                     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -1456,7 +1459,7 @@ if __name__ == '__main__':
                             'temperature': [1.0,],
                             'val_percentage' : 0.1,
                             'curve_parameterization': 'bezier',
-                            'curve_sampling_mode': 'combined', # 'per_leave' or 'combined'
+                            'curve_sampling_mode': 'combined_noBMA', # 'per_leave' or 'combined'
                             # 'curve_sampling_mode': 'per_leave', # 'per_leave' or 'combined'
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
@@ -1489,6 +1492,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="MLE Asd(t)B", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="MLE Asd(t)eB rho_s=0. rho_w=0.", entity="ddold", config=config)
         train(logger, config)
 

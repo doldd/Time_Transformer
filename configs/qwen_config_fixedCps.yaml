@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Flat Lora Saves
+name: Flat Lora + Tunnel
 description: "Test with open control points. k=3 and Flat-LoRA with weight noise."
 method: grid
 metric:
@@ -14,7 +14,7 @@ parameters:
             #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             #  "ddold/qwen_PtoC/boolq_dataset:v0",
              "ddold/qwen_PtoC/obqa_dataset:v0",
-            #  "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
+             "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
              ]
   load_params_path:
@@ -42,17 +42,19 @@ parameters:
       use_lora:
         value: True
       r:
-        value: 8
+        values: [8, 224]
       lora_dtype:
         value: "float32"  # ["original", "float16", "bfloat16", "float32"]
       lora_alpha:
         value: 16.0
       lora_mode:
         # values: ["A(t)B", "A(t)B(t)", "As(t)B", "Asd(t)B",]
-        values: ["Asd(t)B", "A(t)B(t)"]
-        # values: ["A(t)B(t)", ]
+        # values: ["Asd(t)B", "A(t)B(t)"]
+        values: ["A(t)eB", "Asd(t)eB" ]
       lora_rho:
         values: [0.5, 0.1, 0.]
+      lora_rho_s:
+        values: [0.0, 0.1, 0.5, 1., 2.]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -66,9 +68,10 @@ parameters:
       cp_fix:
         values: 
           # - [1, 1]
-          - [1, 0, 1]
+          # - [1, 0, 1]
           - [0, 0, 0]
-          - [1,]
+          - [0, 0, 0, 0, 0, 0]
+          # - [1,]
           # - [0, 0, 0, 0, 0, 0]
           # - [1, 0, 0, 0, 1] 
       batch_size:
@@ -104,7 +107,7 @@ parameters:
       curve_sampling_mode:
         # value: "per_leaf"  # ["per_leaf", "combined"]
         # values: ["per_leaf", "combined"]
-        values: ["per_leaf"]
+        values: ["combined_noBMA"]
 
       filter_masks:
         values: 
@@ -145,7 +148,7 @@ parameters:
         #   freeze_non_curve_params:
         #     value: True
   rng_seed:
-    values: [1, 2,]
+    values: [1, 20, 400, 8000]
 
 command:
 - ${env}

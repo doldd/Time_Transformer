@@ -499,6 +499,12 @@ class SubspaceBaseModel:
                     p.A = init_a(key, shape_, dtype=p.A.dtype)
                     p.B = jnp.zeros((self.k + 1,) + p.B.shape, dtype=p.B.dtype)
                     return p
+                elif (type(p) is LoRARotaEpsilonDiagscaleRotbParams):
+                        key, subkey = random.split(key)
+                        p.A = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
+                        key, subkey = random.split(key)
+                        p.B = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
+                        return p
                 else:
                     curve_param = jnp.stack([p] * (self.k + 1))
                     curve_param = noise_fn(curve_param, key)
@@ -1213,10 +1219,50 @@ class LoRAepsilonScaleDiagParams(LoRAScaleDiagParams):
     def _apply(self, key):
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         epsilon_s = random.normal(key, self.s.shape) * self.lora_rho_s + 1. # Add noise around 1
-        w = jnp.einsum('...i,i,i,ij->...j', self.B, self.s, epsilon_s, self.A)
+        w = jnp.einsum('...r,r,r,rj->...j', self.B, self.s, epsilon_s, self.A)
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
         scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
         return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+
+# get stiefel manifold projection for tall matrices
+def constrain_to_stiefel_mainfold(V):
+    """
+    Erzeugt eine m x r Matrix mit orthonormalen Spalten.
+    V: (m, r) - Die Matrix der r Reflektor-Vektoren.
+    """
+    m, r = V.shape
+    # Wir starten mit den ersten r Spalten der Einheitsmatrix
+    # Das ist eine m x r Matrix
+    A_init = jnp.eye(m, r)
+    V /= (jnp.linalg.norm(V, axis=0, keepdims=True) + 1e-8)  # Normierung der Reflektor-Vektoren
+    
+    # Wir wenden die r Spiegelungen nacheinander an
+    def housholder(A, v):
+        # v must be a unit vector
+        # H @ A = (I - 2vv^T) @ A = A - 2 * v @ (v^T @ A)
+        # v^T @ A ist ein Vektor der Größe (r,)
+        A = A - 2.0 * jnp.outer(v, v.T @ A)
+        # A_next = apply_householder_to_tall(A, v)
+        return A, None
+
+    A_final, _ = jax.lax.scan(housholder, A_init, V.T, unroll=False)
+    return A_final
+
+@register_pytree_node_class
+class LoRARotaEpsilonDiagscaleRotbParams(LoRAepsilonScaleDiagParams):
+    def _apply(self, key):
+        # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
+        # A_ = jnp.matmul(self.s, self.A)  # Scale A by s
+        # w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
+        A = constrain_to_stiefel_mainfold(self.A.T).T  # Constrain A to the Stiefel manifold
+        B = constrain_to_stiefel_mainfold(self.B)  # Constrain B to the Stiefel manifold
+        epsilon_s = random.normal(key, self.s.shape[0]) * self.lora_rho_s + 1. # Add noise
+        w = jnp.einsum('...r,r,r,ri->...i', B, self.s, epsilon_s, A)
+        w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
+        scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
+        return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
+
+
 
 
 
@@ -1266,7 +1312,7 @@ class LoRAMixin:
                 raise ValueError(f"Unknown lora_dtype: {self.lora_dtype}")
 
     @staticmethod
-    def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True, a_off=False):
+    def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True, a_off=False, s_on=None):
         mask = tree_broadcast(mask, lora_params) # broadcast mask to the shape of lora_params
         def adapt_mask(mask):
             """Set B and w0 to False and A corresponds to the original curve mask."""
@@ -1278,6 +1324,8 @@ class LoRAMixin:
                     mask.w0 = False
                 if a_off:
                     mask.A = False
+                if type(s_on) is bool:
+                    mask.s = s_on
                 return mask
             else:
                 # For other parameters, keep the mask as is
@@ -1370,6 +1418,15 @@ class LoRAMixin:
                         lora_params.append(LoRAepsilonABParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # used to indicate both A and B are time dependent
                     elif self.lora_mode == "A(t)eB":
                         lora_params.append(LoRAepsilonAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # used to indicate both A and B are time dependent
+                    elif (self.lora_mode == "Arot(t)sdeBrot(t)"):
+                        # because B is identiy => Bs = 0 => defaut Lora behavior
+                        rng_key, subkey = random.split(rng_key)
+                        s = jax.nn.initializers.zeros(subkey, (rank,), dtype=dtype)
+                        rng_key, subkey = random.split(rng_key)
+                        A = jax.nn.initializers.orthogonal()(subkey, A.shape, dtype=dtype)
+                        rng_key, subkey = random.split(rng_key)
+                        B = jax.nn.initializers.orthogonal()(subkey, B.shape, dtype=dtype)
+                        lora_params.append(LoRARotaEpsilonDiagscaleRotbParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # Store A, s and B
                     else:
                         raise ValueError(f"Unknown lora_mode: {self.lora_mode} || Supported modes are 'A(t)B', 'As(t)B', 'A(t)B(t)'")
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
@@ -1381,8 +1438,12 @@ class LoRAMixin:
         params['params'] = initialize_lora_params(key, params['params'], self.lora_mask, rank=self.r)
         params = super().init_params_from_point(key, params, mask, noise_fn)
 
-        if (self.lora_mode == "A(t)B(t)") or (self.lora_mode == "A(t)eB(t)"):
-            mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
+        if (self.lora_mode == "A(t)B(t)") or (self.lora_mode == "A(t)eB(t)") or (self.lora_mode == "Arot(t)sdeBrot(t)"):
+            # s for mode "Arot(t)sdeBrot(t)" is automatically set to zero
+            if self.lora_mode == "Arot(t)sdeBrot(t)":
+                mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True, s_on=False)
+            else:
+                mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
         elif (self.lora_mode == "As(t)B") or (self.lora_mode == "Asd(t)B") or (self.lora_mode == "Asd(t)eB"):
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True, a_off=True)
         else:

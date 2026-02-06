@@ -1429,7 +1429,8 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'A(t)eB',
+                            # 'lora_mode': 'A(t)eB',
+                            'lora_mode': 'Arot(t)sdeBrot(t)',
                             'lora_rho': .1,
                             'lora_rho_s': .0,
                             'filter_masks': 

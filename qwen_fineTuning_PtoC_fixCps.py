@@ -390,6 +390,8 @@ def train(logger, config):
     BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
     SAVE_PARAMS = config.get('save_params', False)
     SWEEP_PARAM_PATH = config.get('load_params_path', False)
+    
+    LOG_CURVE_METRICS = True # whether to log curve metrics like length and mutual information during training (can slow down training)
 
     # Create artifact for storing parameters
     # if SAVE_PARAMS:
@@ -720,8 +722,8 @@ def train(logger, config):
 
         # compute number of parameters for last curve fitting run
         if k > 0:
-            n_params = sum(p.size for p in jax.tree.flatten(params)[0])
-            param_memory = sum(p.size*p.dtype.itemsize for p in jax.tree.flatten(params)[0])
+            n_params = sum(p.size if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
+            param_memory = sum(p.size*p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
             logger.summary.update({'n_params': n_params, 'memory_params': param_memory})
             print(f"Number of parameters: {n_params:_}\nMemory of parameters: {param_memory/(1024**2):_}MB")
 
@@ -920,6 +922,17 @@ def train(logger, config):
         cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
         rel_center_fn = init_rel_center(cp_w)
 
+        if lora_params.get('rho_scheduler_frequency', 0.0) > 0.0:
+            def setup_rho_schedule(n_total_steps, frequency=0.5):
+                print(f"Using cosine rho schedule with total steps {n_total_steps}")
+                base_frequency = n_total_steps / (2*frequency)
+                def rho_sched(x, base):
+                    return base * 0.5 * (1 - jnp.cos(x / base_frequency * jnp.pi))
+                return rho_sched
+            rho_scheduler = setup_rho_schedule(num_steps, lora_params.get('rho_scheduler_frequency', 0.0))
+        else:
+            rho_scheduler = lambda step, base: base
+
         # @partial(jit, donate_argnums=(0,))
         def train_batch(carry, batch_idx):
             rng_key, params, opt_state, best_loss, best_params, update_idx = carry
@@ -931,6 +944,10 @@ def train(logger, config):
             rng_key, subkey = random.split(rng_key)
             t = t_sample_fn(subkey)
             # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
+            if lora_params.get('lora_rho', 0.0) > 0.0:
+                current_rho = rho_scheduler(update_idx, lora_params.get('lora_rho', 0.0))
+                current_rho_s = rho_scheduler(update_idx, lora_params.get('lora_rho_s', 0.0))
+                params = s_model.set_lora_rho(current_rho, current_rho_s, params)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
             # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
@@ -947,7 +964,7 @@ def train(logger, config):
             # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
             # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
 
-            if k>0:
+            if k>0 and LOG_CURVE_METRICS:
                 cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
                 upper_length = upper_bound(cp)
                 lower_length = lower_bound(cp)
@@ -1125,14 +1142,16 @@ def train(logger, config):
             art.add_file(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz')
             logger.log_artifact(art)
 
+            rng_key = carry[0]
+            params = carry[1]  # last params on device
+            last_trainable_params = None
             if val:
-                params = carry[1]  # last params on device
+                # params = carry[1]  # last params on device
+                last_trainable_params = s_model.only_trainable_params(params['params'])
                 best_curve_params = carry[4]  # best params (only trainable params)
                 # update last params with best curve params (only trainable params were stored)
                 params['params'] = jax.tree.map(lambda x, y, m: x if m else y, best_curve_params, params['params'], s_model.train_mask)
-            else:
-                params = carry[1]  # last params on device
-            rng_key = carry[0]
+            
 
             if k > 0:
                 # Bezier curve length        
@@ -1306,7 +1325,7 @@ def train(logger, config):
         #             'post_pred_acc': post_acc,
         #             'post_pred_ece': post_ece,
         #             })
-        return rng_key, s_model, params
+        return rng_key, s_model, params, last_trainable_params
 
 
 
@@ -1328,7 +1347,7 @@ def train(logger, config):
                 if params is not None:
                     del params  # free memory
                     # jax.clear_caches()
-                rng_key, s_model, params = train_curve_inner(
+                rng_key, s_model, params, _ = train_curve_inner(
                     rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                     lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                     smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
@@ -1360,7 +1379,7 @@ def train(logger, config):
             curve_state = ProcessState.CURVE_EVAL
         else:
             curve_state = ProcessState.CURVE_FITTING
-        rng_key, s_model, params = train_curve_inner(
+        rng_key, s_model, params, last_trainable_params = train_curve_inner(
                 rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                 lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                 smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 
@@ -1369,10 +1388,15 @@ def train(logger, config):
         if SAVE_PARAMS:
             print("Save final trainable params ...")
             np.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
+            if last_trainable_params is not None:
+                np.save(f'tmp_files/{logger.id}_last_trainable_params.npy', last_trainable_params)
             # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
             time.sleep(1)  # ensure file is written
             print("Saved trainable parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
+            if last_trainable_params is not None:
+                artifact.add_file(f'tmp_files/{logger.id}_last_trainable_params.npy')
+
     if SAVE_PARAMS:    
         logger.log_artifact(artifact)
         time.sleep(5)  # ensure artifact is logged
@@ -1431,8 +1455,9 @@ if __name__ == '__main__':
                             # 'lora_mode': 'A(t)B(t)',
                             # 'lora_mode': 'A(t)eB',
                             'lora_mode': 'Arot(t)sdeBrot(t)',
-                            'lora_rho': .1,
-                            'lora_rho_s': .0,
+                            'lora_rho': 1.,
+                            'lora_rho_s': 1.,
+                            'rho_scheduler_frequency': 0.5,
                             'filter_masks': 
                                 [
                                     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},

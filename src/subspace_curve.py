@@ -501,9 +501,11 @@ class SubspaceBaseModel:
                     return p
                 elif (type(p) is LoRARotaEpsilonDiagscaleRotbParams):
                         key, subkey = random.split(key)
-                        p.A = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
+                        # p.A = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
+                        p.A = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
                         key, subkey = random.split(key)
-                        p.B = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
+                        # p.B = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
+                        p.B = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
                         return p
                 else:
                     curve_param = jnp.stack([p] * (self.k + 1))
@@ -1074,7 +1076,7 @@ class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
     pass
 
 class LoraAbstractParams:
-    def __init__(self, A, B, w0, dims: tuple, lora_alpha: float, lora_rho_w: float):
+    def __init__(self, A, B, w0, lora_rho_w: float, dims: tuple, lora_alpha: float):
         self.A = A
         self.B = B
         self.w0 = w0
@@ -1100,6 +1102,14 @@ class LoraAbstractParams:
         key, subkey = random.split(key)
         return self.add_w_noise(p, subkey)
         # return p
+
+    def set_rho(self, rho_s, rho_w):
+        # if isinstance(p, LoraAbstractParams):
+        self.lora_rho_w = rho_w
+        if hasattr(self, 'lora_rho_s'):
+            self.lora_rho_s = rho_s
+        return self
+        # return p
         
 
 @register_pytree_node_class
@@ -1114,8 +1124,8 @@ class LoRAParams(LoraAbstractParams):
         return f"LoRA (A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha}, lora_rho_w={self.lora_rho_w})"
     
     def tree_flatten(self):
-        children = (self.A, self.B, self.w0)
-        aux_data = (self.dims, self.lora_alpha, self.lora_rho_w)
+        children = (self.A, self.B, self.w0, self.lora_rho_w)
+        aux_data = (self.dims, self.lora_alpha)
         return children, aux_data
 
     def _apply(self, key):
@@ -1131,8 +1141,8 @@ class LoRAABParam(LoRAParams):
 
 @register_pytree_node_class
 class LoRAScaleParams(LoraAbstractParams):
-    def __init__(self, A, s, B, w0, dims: tuple, lora_alpha: float, lora_rho_w: float):
-        super().__init__(A, B, w0, dims, lora_alpha, lora_rho_w)
+    def __init__(self, A, s, B, w0, lora_rho_w: float, dims: tuple, lora_alpha: float):
+        super().__init__(A, B, w0, lora_rho_w, dims, lora_alpha)
         self.s = s
 
     @property
@@ -1144,8 +1154,8 @@ class LoRAScaleParams(LoraAbstractParams):
         return f"LoRA(A={self.A}, s={self.s}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha}, lora_rho_w={self.lora_rho_w})"
 
     def tree_flatten(self):
-        children = (self.A, self.s, self.B, self.w0)
-        aux_data = (self.dims, self.lora_alpha, self.lora_rho_w)
+        children = (self.A, self.s, self.B, self.w0, self.lora_rho_w)
+        aux_data = (self.dims, self.lora_alpha)
         return children, aux_data
 
     def _apply(self, key):
@@ -1171,8 +1181,8 @@ class LoRAScaleDiagParams(LoRAScaleParams):
     
 @register_pytree_node_class
 class LoRAepsilonAParams(LoRAABParam):
-    def __init__(self, A, B, w0, dims: tuple, lora_alpha: float, lora_rho_w: float, lora_rho_s: float):
-        super().__init__(A, B, w0, dims, lora_alpha, lora_rho_w)
+    def __init__(self, A, B, w0, lora_rho_w: float, lora_rho_s: float, dims: tuple, lora_alpha: float):
+        super().__init__(A, B, w0, lora_rho_w, dims, lora_alpha)
         self.lora_rho_s = lora_rho_s
 
     def __repr__(self):
@@ -1180,8 +1190,8 @@ class LoRAepsilonAParams(LoRAABParam):
         return f"LoRA(A={self.A}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha}, rho_w={self.lora_rho_w}, rho_s={self.lora_rho_s})"
 
     def tree_flatten(self):
-        children = (self.A, self.B, self.w0)
-        aux_data = (self.dims, self.lora_alpha, self.lora_rho_w, self.lora_rho_s)
+        children = (self.A, self.B, self.w0, self.lora_rho_w, self.lora_rho_s)
+        aux_data = (self.dims, self.lora_alpha)
         return children, aux_data
 
 
@@ -1202,8 +1212,8 @@ class LoRAepsilonABParams(LoRAepsilonAParams):
 
 @register_pytree_node_class
 class LoRAepsilonScaleDiagParams(LoRAScaleDiagParams):
-    def __init__(self, A, s, B, w0, dims: tuple, lora_alpha: float, lora_rho_w: float, lora_rho_s: float):
-        super().__init__(A, s, B, w0, dims, lora_alpha, lora_rho_w)
+    def __init__(self, A, s, B, w0, lora_rho_w: float, lora_rho_s: float, dims: tuple, lora_alpha: float):
+        super().__init__(A, s, B, w0, lora_rho_w, dims, lora_alpha)
         self.lora_rho_s = lora_rho_s
 
     def __repr__(self):
@@ -1211,8 +1221,8 @@ class LoRAepsilonScaleDiagParams(LoRAScaleDiagParams):
         return f"LoRA(A={self.A}, s={self.s}, B={self.B}, w0={self.w0}) with dims={self.dims} and lora_alpha={self.lora_alpha}, rho_w={self.lora_rho_w}, rho_s={self.lora_rho_s})"
 
     def tree_flatten(self):
-        children = (self.A, self.s, self.B, self.w0)
-        aux_data = (self.dims, self.lora_alpha, self.lora_rho_w, self.lora_rho_s)
+        children = (self.A, self.s, self.B, self.w0, self.lora_rho_w, self.lora_rho_s)
+        aux_data = (self.dims, self.lora_alpha)
         return children, aux_data
 
 
@@ -1311,6 +1321,13 @@ class LoRAMixin:
             else:
                 raise ValueError(f"Unknown lora_dtype: {self.lora_dtype}")
 
+    def set_lora_rho(self, rho_w, rho_s, params):
+        # inplace update of rho for all lora params in the pytree
+        params['params'] = jax.tree.map(lambda p: p.set_rho(rho_s=rho_s, rho_w=rho_w) if isinstance(p, LoraAbstractParams) else p, params['params'], is_leaf=lambda p: isinstance(p, LoraAbstractParams))
+        # self.curve_mask = jax.tree.map(lambda p: p.set_rho(rho_s=rho_s, rho_w=rho_w) if isinstance(p, LoraAbstractParams) else p, self.curve_mask, is_leaf=lambda p: isinstance(p, LoraAbstractParams))
+        # self.train_mask = jax.tree.map(lambda p: p.set_rho(rho_s=rho_s, rho_w=rho_w) if isinstance(p, LoraAbstractParams) else p, self.train_mask, is_leaf=lambda p: isinstance(p, LoraAbstractParams))
+        return params
+
     @staticmethod
     def update_mask_for_lora(mask, lora_params, b_off=True, w0_off=True, a_off=False, s_on=None):
         mask = tree_broadcast(mask, lora_params) # broadcast mask to the shape of lora_params
@@ -1326,6 +1343,9 @@ class LoRAMixin:
                     mask.A = False
                 if type(s_on) is bool:
                     mask.s = s_on
+                if hasattr(mask, 'lora_rho_s'):
+                    mask.lora_rho_s = False
+                mask.lora_rho_w = False
                 return mask
             else:
                 # For other parameters, keep the mask as is
@@ -1423,9 +1443,11 @@ class LoRAMixin:
                         rng_key, subkey = random.split(rng_key)
                         s = jax.nn.initializers.zeros(subkey, (rank,), dtype=dtype)
                         rng_key, subkey = random.split(rng_key)
-                        A = jax.nn.initializers.orthogonal()(subkey, A.shape, dtype=dtype)
+                        # A = jax.nn.initializers.orthogonal()(subkey, A.shape, dtype=dtype)
+                        A = jax.nn.initializers.normal(stddev=0.01)(subkey, A.shape, dtype=dtype)  # add small noise to make sure we are not exactly on the stiefel manifold at the beginning
                         rng_key, subkey = random.split(rng_key)
-                        B = jax.nn.initializers.orthogonal()(subkey, B.shape, dtype=dtype)
+                        # B = jax.nn.initializers.orthogonal()(subkey, B.shape, dtype=dtype)
+                        B = jax.nn.initializers.normal(stddev=0.01)(subkey, B.shape, dtype=dtype)  # add small noise to make sure we are not exactly on the stiefel manifold at the beginning
                         lora_params.append(LoRARotaEpsilonDiagscaleRotbParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # Store A, s and B
                     else:
                         raise ValueError(f"Unknown lora_mode: {self.lora_mode} || Supported modes are 'A(t)B', 'As(t)B', 'A(t)B(t)'")

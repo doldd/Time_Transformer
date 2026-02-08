@@ -10,11 +10,11 @@ parameters:
     value: True
   dataset_path:
     values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
-            #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
-            #  "ddold/qwen_PtoC/boolq_dataset:v0",
+             "ddold/qwen_PtoC/winogrande_s_dataset:v0",
+             "ddold/qwen_PtoC/boolq_dataset:v0",
              "ddold/qwen_PtoC/obqa_dataset:v0",
              "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
-            #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
+             "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
              ]
   load_params_path:
     value: False
@@ -48,7 +48,7 @@ parameters:
   curve_params:
     parameters:
       k:
-        values: [3, 6, 10]
+        values: [2, 3, 5, 10, 20]
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -70,7 +70,7 @@ parameters:
       num_steps:
         value: 5_000
       temperature:
-        value: [0.5, 1.0]
+        value: [1.0,]
       val_percentage:
         value: 0.1
 
@@ -113,7 +113,7 @@ parameters:
         #   freeze_non_curve_params:
         #     value: True
   rng_seed:
-    values: [1, 2, 4, 8]
+    values: [1, 20, 400, 8000]
 
 command:
 - ${env}

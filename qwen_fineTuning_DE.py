@@ -129,74 +129,82 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
 
-def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15):
-    if use_linspace:
-        get_t = lambda key: jnp.linspace(0, 1., n_samples)
+def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
+    if t_sample_fn is None:
+        if use_linspace:
+            get_t = lambda key: jnp.linspace(0, 1., n_samples)
+        else:
+            get_t = lambda key: jax.random.uniform(key, (n_samples,), minval=0., maxval=1.)
     else:
-        get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
+        if use_linspace:
+            raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
+        # get_t = partial(t_sample_fn, n_samples=n_samples)
+        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(jax.random.split(k, n_samples))
     ii = len(x) // batch_size
     
+    idx = jnp.arange(len(x))
+    idx_ = idx[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    idx_ = es('(ib)...->ib...', idx_, b=batch_size)
+    idx_last = idx[matching_limit:]
+
+    # x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    # x_last = x[matching_limit:]
+    # x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+    # att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+    # att_last = attention_mask[matching_limit:]
+    # att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+
+    # y_all = target[:matching_limit]  # drop non matching batch size
+    # y_last = target[matching_limit:]
+    # y_ = es('(ib)...->ib...', y_all, b=batch_size)
+
     def acc_fn(rng_key, params):
-        x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-        x_last = x[matching_limit:]
-        x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-        att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-        att_last = attention_mask[matching_limit:]
-        att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-
-        y_all = target[:matching_limit]  # drop non matching batch size
-        y_last = target[matching_limit:]
-        y_ = es('(ib)...->ib...', y_all, b=batch_size)
-
         # @scan_tqdm(ii, desc='Evaluating', leave=False)
-        def pred(key, data):
-            x_batch, atten_batch, y_batch = data
-            # # turn off leading padding tokens in batch for faster evaluation
-            # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-            # atten_batch = atten_batch[:, max_seqlen:]
+        def pred(rng_key, data_idx):
+            x_batch = x.at[data_idx].get()
+            att_m_batch = attention_mask.at[data_idx].get()
+            y_batch = target.at[data_idx].get()
 
-            # @jax.jit
-            def eval(t):
-                loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
-                acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-                return loss*batch_size, acc, out  # sum over batch
-                # return loss*batch_size, acc  # sum over batch
+            rng_key, key_ = jax.random.split(rng_key)
+            t_tree = get_t(key_)  # shape (n_samples,)
+            # keys = jax.random.split(key_, n_samples)
             
-            key, subkey = random.split(key)
+            def single_pred(key, t):
+                # t is either scalar or tree of shape ()
+                key, subkey = jax.random.split(key)
+                loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=subkey)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
+                return key, (loss*batch_size, out)
+            
+            rng_key, (loss, out) = jax.lax.scan(single_pred, rng_key, t_tree)
+            return rng_key, (loss, out)  # loss shape (n_samples), out shape (n_samples, batch_size, output_dim)
 
-            # draw samples to approximate curve performance
-            t = get_t(subkey)
-            loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
-            # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
+        rng_key, (loss, out) = jax.lax.scan(pred, rng_key, idx_) # loss shape (n_batches, n_samples), out shape (n_batches, n_samples, batch_size, output_dim)
 
-            if average:
-                # mean over samples
-                return key, (jnp.sum(loss), jnp.sum(acc), out)
-            else:
-                return key, (loss, acc, out)  # no mean over samples
-
-        # shape (n_data, draws, output_dim)
-        rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
+        # shape (n_data, output_dim)
         # compute loss of last irregular batch
-        if len(x_last) > 0:
-            rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
+        if len(idx_last) > 0:
+            rng_key, (loss_last, out_last) = pred(rng_key, idx_last)
             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-            acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
+            # jax.debug.print(f"out_last shape: {out_last.shape}")
             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
         else:
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
+        loss = loss.transpose(1,0)
+
         # # compute the expected calibration error (ECE)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
+        # acc = jax.vmap(lambda logits, labels: jnp.mean(jnp.argmax(logits, axis=-1) == labels), in_axes=(0, None))(out, target)  # shape (n_samples,)
+        acc = jnp.argmax(out, axis=-1) == target # shape (n_samples, n_data)
 
         if average:
             ece = jnp.mean(ece)
             loss = loss.sum() / (n_samples * x.shape[0])
             acc = acc.sum() / (n_samples * x.shape[0])
         else:
-            loss = jnp.sum(loss, axis=0) / x.shape[0]
-            acc = jnp.sum(acc, axis=0) / x.shape[0]
+            loss = jnp.sum(loss, axis=1) / x.shape[0]
+            acc = jnp.sum(acc, axis=1) / x.shape[0]
 
         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
     return acc_fn
@@ -377,6 +385,7 @@ def train(logger, config):
             if regularizer:
                 print("Using LoRARepulsiveCategorySubspace with regularizer")
                 s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                                                        lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                         model=model, k=k, weight_decay=weight_decay,
                                                         perm_spec=perm_spec,
                                                         natural_parameterization=natural_parameterization,
@@ -385,6 +394,7 @@ def train(logger, config):
             else:
                 print("Using QuantileSubspace without repulsive force")
                 s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], lora_mode=lora_params['lora_mode'],
+                                                lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
                                                 model=model, k=k, weight_decay=weight_decay, 
                                                 perm_spec=perm_spec,
                                                 natural_parameterization=natural_parameterization,
@@ -501,8 +511,8 @@ def train(logger, config):
             raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
 
         # compute number of parameters
-        n_params = sum(p.size for p in jax.tree.flatten(params)[0])
-        param_memory = sum(p.size*p.dtype.itemsize for p in jax.tree.flatten(params)[0])
+        n_params = sum(p.size if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
+        param_memory = sum(p.size*p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
         logger.summary.update({'n_params': n_params, 'memory_params': param_memory})
         print(f"Number of parameters: {n_params:_}\nMemory of parameters: {param_memory/(1024**2):_}MB")
 
@@ -660,7 +670,7 @@ def train(logger, config):
 
     train_params = []
     params = None
-    num_ensembles = config['curve_params']['k'] + 1
+    num_ensembles = config['curve_params']['k']
     for k in range(num_ensembles):
         print(f"Training DE member {k}")
         config['curve_params']['k'] = 0 

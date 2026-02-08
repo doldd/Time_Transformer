@@ -677,7 +677,7 @@ def train(logger, config):
 
         if params is not None:
             del params  # free memory
-            jax.clear_caches()
+            # jax.clear_caches()
         rng_key, s_model, params = train_curve_inner(
             rng_key, **config['curve_params'], net_kwargs=config['net_kwargs'], 
             lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],

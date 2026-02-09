@@ -509,7 +509,7 @@ class SubspaceBaseModel:
                     return p
                 elif (type(p) is LoRAAEpsilonRotdiagscaleBParams):
                     shape_ = (self.k+1,) + p.s.shape 
-                    init_s = jax.nn.initializers.constant(value=0.0)
+                    init_s = jax.nn.initializers.constant(value=-10.0)
                     p.s = init_s(key, shape_, dtype=p.s.dtype)
                     return p
                 else:
@@ -1271,8 +1271,10 @@ class LoRARotaEpsilonDiagscaleRotbParams(LoRAepsilonScaleDiagParams):
         # w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
         A = constrain_to_stiefel_mainfold(self.A.T).T  # Constrain A to the Stiefel manifold
         B = constrain_to_stiefel_mainfold(self.B)  # Constrain B to the Stiefel manifold
-        epsilon_s = random.normal(key, self.s.shape[0]) * self.lora_rho_s + 1. # Add noise
-        w = jnp.einsum('...r,r,r,ri->...i', B, self.s, epsilon_s, A)
+        epsilon_s = random.normal(key, self.s.shape[0]) * self.lora_rho_s + 1. # Add noise around 1
+        epsilon_s = jax.nn.softplus(epsilon_s) + 1e-8  # Ensure epsilon_s is positive
+        s = jax.nn.softplus(self.s) + 1e-8  # Ensure s is positive
+        w = jnp.einsum('...r,r,r,ri->...i', B, s, epsilon_s, A)
         w = jnp.moveaxis(w, [-2, -1], self.dims)  # Move the last two axes to the positions specified by m
         scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
         return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
@@ -1448,7 +1450,7 @@ class LoRAMixin:
                     elif (self.lora_mode == "Arot(t)sdeBrot(t)") or (self.lora_mode == "Arotsd(t)eB"):
                         # because B is identiy => Bs = 0 => defaut Lora behavior
                         rng_key, subkey = random.split(rng_key)
-                        s = jax.nn.initializers.zeros(subkey, (rank,), dtype=dtype)
+                        s = jax.nn.initializers.constant(-10.)(subkey, (rank,), dtype=dtype)
                         rng_key, subkey = random.split(rng_key)
                         # A = jax.nn.initializers.orthogonal()(subkey, A.shape, dtype=dtype)
                         A = jax.nn.initializers.normal(stddev=0.01)(subkey, A.shape, dtype=dtype)  # add small noise to make sure we are not exactly on the stiefel manifold at the beginning

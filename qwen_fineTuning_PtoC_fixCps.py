@@ -384,7 +384,7 @@ def train(logger, config):
         logger: Wandb logger
         config: Training configuration
     """
-    jax.clear_caches()
+    # jax.clear_caches()
     rng_key = random.PRNGKey(config['rng_seed'])
     EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
     BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
@@ -940,6 +940,13 @@ def train(logger, config):
         else:
             rho_scheduler = lambda step, base: base
 
+        def inf_mean(x):
+            mask = jnp.isfinite(x)
+            sum = jnp.where(mask, x, 0).sum()
+            count = mask.sum()
+            return sum / count
+
+
         # @partial(jit, donate_argnums=(0,))
         def train_batch(carry, batch_idx):
             rng_key, params, opt_state, best_loss, best_params, update_idx = carry
@@ -1005,7 +1012,9 @@ def train(logger, config):
                 train_batch, carry, shuffel_idx)
             # jax.clear_caches()
             # jax.debug.print(f"Epoch {epoch+1}/{num_epochs}, Loss: {metrics['loss'][-1].item()}{metrics['loss'].shape}, Val Loss: {metrics['val_loss'][-1]}, Val Acc: {metrics['val_acc'][-1]}")
-            jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], metrics['val_loss'][::EVAL_EVERY_N_BATCH].mean(), metrics['val_acc'][::EVAL_EVERY_N_BATCH].mean())
+            val_loss_ = inf_mean(metrics['val_loss'])
+            val_acc_ = inf_mean(metrics['val_acc'])
+            jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], val_loss_, val_acc_)
             return carry, metrics
 
 
@@ -1188,9 +1197,10 @@ def train(logger, config):
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # valid
-        # set lora noise for evaluation if specified
+        # set lora noise off for evaluation if specified
         if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-            params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
+            # params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
+            params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
         curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
         post_performance = post_pred_performance(logits_test, test_labels)
         logger.summary.update({f'{logger_prefix}post_pred_test_mean_{k}':v for k,v in post_performance.items()})
@@ -1238,9 +1248,6 @@ def train(logger, config):
                     if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
                         params = s_model.set_lora_rho(0., 0., params)
                     train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
-                    # reset lora noise if specified
-                    if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                        params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
 
                     post_performance = post_pred_performance(logits_train, train_labels)
                     logger.summary.update({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
@@ -1321,10 +1328,11 @@ def train(logger, config):
 
             if curve_sampling_mode != "combined":
                 print("Using random sampling to approx. independent curves")
-
-                test_metrics_fn_approx = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=False, average=False, key_prefix='approx_', t_sample_fn=t_sample_fn)
-                # valid
-                curve_metric, logits_test = test_metrics_fn_approx(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
+                if "combined" not in curve_sampling_mode:
+                    print("Using random sampling to approx. independent curves")
+                    test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=False, average=False, key_prefix='approx_', t_sample_fn=t_sample_fn)
+                    # valid
+                    curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
                 post_performance = post_pred_performance(logits_test, test_labels)
                 logger.summary.update({f'{logger_prefix}approx_pred_test_mean_{k}':v for k,v in post_performance.items()})
 
@@ -1332,6 +1340,19 @@ def train(logger, config):
                 m_entropy = mean_entropy(logits_test.astype(jnp.float32))
                 entrop = entropy(logits_test.astype(jnp.float32))
                 logger.summary.update({f'test_mutual_information_approx': mi, f'test_mean_entropy_approx': m_entropy, 'std_entropy_approx': entrop.mean(-1).std(), 'mean_entropy_approx': entrop.mean()})
+
+            # reset lora noise if specified
+            if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+                params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
+                curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
+                post_performance = post_pred_performance(logits_test, test_labels)
+                logger.summary.update({f'{logger_prefix}approx_pred_test_mean_wRho_{k}':v for k,v in post_performance.items()})
+
+                mi = mutual_information(logits_test.astype(jnp.float32))
+                m_entropy = mean_entropy(logits_test.astype(jnp.float32))
+                entrop = entropy(logits_test.astype(jnp.float32))
+                logger.summary.update({f'test_mutual_information_approx_wRho_': mi, f'test_mean_entropy_approx_wRho_': m_entropy, 'std_entropy_approx_wRho_': entrop.mean(-1).std(), 'mean_entropy_approx_wRho_': entrop.mean()})
+
 
 
         # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
@@ -1362,7 +1383,6 @@ def train(logger, config):
 
                 if params is not None:
                     del params  # free memory
-                    # jax.clear_caches()
                 rng_key, s_model, params, _ = train_curve_inner(
                     rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                     lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
@@ -1384,7 +1404,6 @@ def train(logger, config):
         train_params = False
     if params is not None:
         del params  # free memory
-        # jax.clear_caches()
     
 
     # train curve model
@@ -1470,10 +1489,10 @@ if __name__ == '__main__':
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
                             # 'lora_mode': 'Asd(t)eB',
-                            'lora_mode': 'Arotsd(t)eB',
-                            # 'lora_mode': 'Arot(t)sdeBrot(t)',
+                            # 'lora_mode': 'Arotsd(t)eB',
+                            'lora_mode': 'Arot(t)sdeBrot(t)',
                             'lora_rho': .25,
-                            'lora_rho_s': 1.,
+                            'lora_rho_s': 0.,
                             'rho_scheduler_frequency': 100.,
                             'filter_masks': 
                                 [
@@ -1488,7 +1507,7 @@ if __name__ == '__main__':
                                 # ]},  # use lora for query projection
             'curve_params': {'cp_fix': args.cp_fix,
                             'num_epochs': -1,
-                            'num_steps': 10 if args.smoke_test else 5_000,
+                            'num_steps': 10 if args.smoke_test else 3_000,
                             # 'num_steps': 5000,
                             # 'num_steps': -1,
                             'batch_size': args.batch_size,
@@ -1522,7 +1541,7 @@ if __name__ == '__main__':
                             #                                                 'momentum': 0.9, 
                             #                                                 'nesterov': True},},
                             'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                            'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                                                                                            'kwargs': {'transition_steps': 3_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
                                                                             'weight_decay': 0.01,
                                                                             },
                                                                     'freeze_other_params': True,
@@ -1535,6 +1554,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="test_half_val_rho_frequ=100_rotsd(t)", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="test_half_val_rho_frequ=100_rotAB(t)_positive", entity="ddold", config=config)
         train(logger, config)
 

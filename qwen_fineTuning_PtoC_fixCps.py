@@ -839,7 +839,13 @@ def train(logger, config):
             # best_params = jax.device_get(params)  # best params on cpu to save memory
             best_params = s_model.only_trainable_params(params['params'])  # best params on cpu to save memory
             # best_params = jax.device_put(params, jax.devices('cpu')[0])  # best params on cpu to save memory
-            valid_metrics_fn = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10 if k > 0 else 1, key_prefix='val_')
+            valid_metrics_fn_tmp = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10 if k > 0 else 1, key_prefix='val_')
+            def valid_metrics_fn(rng, params):
+                # always compute metrics with full parameter noise
+                if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+                    params = s_model.set_lora_rho(lora_params.get('lora_rho', 0.0), lora_params.get('lora_rho_s', 0.0), params)
+                return valid_metrics_fn_tmp(rng, params)
+            
             def get_best_params(params):
                 # return jax.device_get(params)
                 # return params
@@ -927,7 +933,8 @@ def train(logger, config):
                 print(f"Using cosine rho schedule with total steps {n_total_steps}")
                 base_frequency = n_total_steps / (2*frequency)
                 def rho_sched(x, base):
-                    return base * 0.5 * (1 - jnp.cos(x / base_frequency * jnp.pi))
+                    # return base * 0.5 * (1 - jnp.cos(x / base_frequency * jnp.pi))
+                    return base * (1 - jnp.cos(x / base_frequency * jnp.pi))
                 return rho_sched
             rho_scheduler = setup_rho_schedule(num_steps, lora_params.get('rho_scheduler_frequency', 0.0))
         else:
@@ -1181,6 +1188,9 @@ def train(logger, config):
             t_space = jnp.linspace(0, 1, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # valid
+        # set lora noise for evaluation if specified
+        if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+            params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
         curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
         post_performance = post_pred_performance(logits_test, test_labels)
         logger.summary.update({f'{logger_prefix}post_pred_test_mean_{k}':v for k,v in post_performance.items()})
@@ -1224,7 +1234,13 @@ def train(logger, config):
                 if num_epochs > 0 or num_steps > 0: # train ds must be defined
                     print("Compute posterior weights on train set")
                     train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
+                    # compute weigths without noise
+                    if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+                        params = s_model.set_lora_rho(0., 0., params)
                     train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
+                    # reset lora noise if specified
+                    if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+                        params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
 
                     post_performance = post_pred_performance(logits_train, train_labels)
                     logger.summary.update({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
@@ -1453,11 +1469,12 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            # 'lora_mode': 'A(t)eB',
-                            'lora_mode': 'Arot(t)sdeBrot(t)',
-                            'lora_rho': 1.,
+                            # 'lora_mode': 'Asd(t)eB',
+                            'lora_mode': 'Arotsd(t)eB',
+                            # 'lora_mode': 'Arot(t)sdeBrot(t)',
+                            'lora_rho': .25,
                             'lora_rho_s': 1.,
-                            'rho_scheduler_frequency': 0.5,
+                            'rho_scheduler_frequency': 100.,
                             'filter_masks': 
                                 [
                                     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -1518,6 +1535,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="MLE Asd(t)eB rho_s=0. rho_w=0.", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="test_half_val_rho_frequ=100_rotsd(t)", entity="ddold", config=config)
         train(logger, config)
 

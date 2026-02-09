@@ -500,13 +500,18 @@ class SubspaceBaseModel:
                     p.B = jnp.zeros((self.k + 1,) + p.B.shape, dtype=p.B.dtype)
                     return p
                 elif (type(p) is LoRARotaEpsilonDiagscaleRotbParams):
-                        key, subkey = random.split(key)
-                        # p.A = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
-                        p.A = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
-                        key, subkey = random.split(key)
-                        # p.B = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
-                        p.B = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
-                        return p
+                    key, subkey = random.split(key)
+                    # p.A = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
+                    p.A = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.A.shape, dtype=p.A.dtype)
+                    key, subkey = random.split(key)
+                    # p.B = jax.nn.initializers.orthogonal()(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
+                    p.B = jax.nn.initializers.normal(stddev=0.01)(subkey, (self.k+1,) + p.B.shape, dtype=p.B.dtype)
+                    return p
+                elif (type(p) is LoRAAEpsilonRotdiagscaleBParams):
+                    shape_ = (self.k+1,) + p.s.shape 
+                    init_s = jax.nn.initializers.constant(value=0.0)
+                    p.s = init_s(key, shape_, dtype=p.s.dtype)
+                    return p
                 else:
                     curve_param = jnp.stack([p] * (self.k + 1))
                     curve_param = noise_fn(curve_param, key)
@@ -1272,7 +1277,9 @@ class LoRARotaEpsilonDiagscaleRotbParams(LoRAepsilonScaleDiagParams):
         scale = self.lora_alpha / self.B.shape[-1]  # Rank of the LoRA transformation
         return (w * scale).astype(self.w0.dtype) + self.w0  # Add the original parameter w0
 
-
+@register_pytree_node_class
+class LoRAAEpsilonRotdiagscaleBParams(LoRAepsilonScaleDiagParams):
+    pass
 
 
 
@@ -1438,7 +1445,7 @@ class LoRAMixin:
                         lora_params.append(LoRAepsilonABParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # used to indicate both A and B are time dependent
                     elif self.lora_mode == "A(t)eB":
                         lora_params.append(LoRAepsilonAParams(A=A, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # used to indicate both A and B are time dependent
-                    elif (self.lora_mode == "Arot(t)sdeBrot(t)"):
+                    elif (self.lora_mode == "Arot(t)sdeBrot(t)") or (self.lora_mode == "Arotsd(t)eB"):
                         # because B is identiy => Bs = 0 => defaut Lora behavior
                         rng_key, subkey = random.split(rng_key)
                         s = jax.nn.initializers.zeros(subkey, (rank,), dtype=dtype)
@@ -1448,7 +1455,10 @@ class LoRAMixin:
                         rng_key, subkey = random.split(rng_key)
                         # B = jax.nn.initializers.orthogonal()(subkey, B.shape, dtype=dtype)
                         B = jax.nn.initializers.normal(stddev=0.01)(subkey, B.shape, dtype=dtype)  # add small noise to make sure we are not exactly on the stiefel manifold at the beginning
-                        lora_params.append(LoRARotaEpsilonDiagscaleRotbParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # Store A, s and B
+                        if self.lora_mode == "Arot(t)sdeBrot(t)":
+                            lora_params.append(LoRARotaEpsilonDiagscaleRotbParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # Store A, s and B
+                        else:  # Arotsd(t)eB    
+                            lora_params.append(LoRAAEpsilonRotdiagscaleBParams(A=A, s=s, B=B, w0=p, dims=tuple(m), lora_alpha=self.lora_alpha, lora_rho_w=self.lora_rho_w, lora_rho_s=self.lora_rho_s))  # Store A, s and B
                     else:
                         raise ValueError(f"Unknown lora_mode: {self.lora_mode} || Supported modes are 'A(t)B', 'As(t)B', 'A(t)B(t)'")
                     # lora_params.append(dict(A=A, B=B))  # Store A and B
@@ -1466,7 +1476,7 @@ class LoRAMixin:
                 mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True, s_on=False)
             else:
                 mask_update = self.update_mask_for_lora(mask, params['params'], b_off=False, w0_off=True)
-        elif (self.lora_mode == "As(t)B") or (self.lora_mode == "Asd(t)B") or (self.lora_mode == "Asd(t)eB"):
+        elif (self.lora_mode == "As(t)B") or (self.lora_mode == "Asd(t)B") or (self.lora_mode == "Asd(t)eB") or (self.lora_mode == "Arotsd(t)eB"):
             mask_update = self.update_mask_for_lora(mask, params['params'], b_off=True, w0_off=True, a_off=True)
         else:
             # update the original curve mask to include LoRA parameter B into curve approach if the parameter was originally selected by the mask

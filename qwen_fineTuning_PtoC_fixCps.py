@@ -249,6 +249,15 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     # y_last = target[matching_limit:]
     # y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
+    def post_pred_performance(logits, labels):
+        # logits shape (n_samples, n_data, n_classes)
+        post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
+        post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
+        post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
+        return {f'{key_prefix}bma_ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
+                f'{key_prefix}bma_acc': post_acc,
+                f'{key_prefix}bma_ece': post_ece}
+
     def acc_fn(rng_key, params):
         # @scan_tqdm(ii, desc='Evaluating', leave=False)
         def pred(rng_key, data_idx):
@@ -282,6 +291,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
         loss = loss.transpose(1,0)
+        bma_metrics = post_pred_performance(out, target)
 
         # # compute the expected calibration error (ECE)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
@@ -296,7 +306,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             loss = jnp.sum(loss, axis=1) / x.shape[0]
             acc = jnp.sum(acc, axis=1) / x.shape[0]
 
-        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
+        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece, **bma_metrics}, out  # mean over epochs
     return acc_fn
 
 
@@ -832,8 +842,9 @@ def train(logger, config):
             logger.summary.update({'n_params_trainable': n_params})
         opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
 
-        best_loss = np.inf
-        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=jnp.float32), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_ece': jnp.array(jnp.inf, dtype=jnp.float32)}, None
+        best_val_ll = -np.inf
+        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=jnp.float32), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_ece': jnp.array(jnp.inf, dtype=jnp.float32),
+                        'val_bma_ll':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_bma_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_bma_ece': jnp.array(jnp.inf, dtype=jnp.float32)}, None
         if val:
             print("save best parameters")
             # best_params = jax.device_get(params)  # best params on cpu to save memory
@@ -843,7 +854,10 @@ def train(logger, config):
             def valid_metrics_fn(rng, params):
                 # always compute metrics with full parameter noise
                 if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                    params = s_model.set_lora_rho(lora_params.get('lora_rho', 0.0), lora_params.get('lora_rho_s', 0.0), params)
+                    # params = s_model.set_lora_rho(rho_w=lora_params.get('lora_rho', 0.0),  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
+                    params = s_model.set_lora_rho(rho_w=0.0,  rho_s=0.0, params=params)
+                    # params = s_model.set_lora_rho(rho_w=0.0,  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
+                # jax.debug.print(f"Computing validation metrics with params rho: {params['params']['layers_0']['self_attn']['q_proj']['kernel'].lora_rho_w}, rho_s: {params['params']['layers_0']['self_attn']['q_proj']['kernel'].lora_rho_s}")
                 return valid_metrics_fn_tmp(rng, params)
             
             def get_best_params(params):
@@ -949,7 +963,7 @@ def train(logger, config):
 
         # @partial(jit, donate_argnums=(0,))
         def train_batch(carry, batch_idx):
-            rng_key, params, opt_state, best_loss, best_params, update_idx = carry
+            rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
 
             x_batch = jnp.take(train_input_ids, batch_idx, axis=0)
             atten_batch = jnp.take(train_attention_mask, batch_idx, axis=0)
@@ -958,9 +972,10 @@ def train(logger, config):
             rng_key, subkey = random.split(rng_key)
             t = t_sample_fn(subkey)
             # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
-            if lora_params.get('lora_rho', 0.0) > 0.0:
+            if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
                 current_rho = rho_scheduler(update_idx, lora_params.get('lora_rho', 0.0))
                 current_rho_s = rho_scheduler(update_idx, lora_params.get('lora_rho_s', 0.0))
+                jax.debug.print(f"Update idx: {update_idx}, setting LoRA rho to {current_rho} and rho_s to {current_rho_s}")
                 params = s_model.set_lora_rho(current_rho, current_rho_s, params)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
@@ -972,8 +987,8 @@ def train(logger, config):
             metrics = jax.lax.cond((update_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
                 valid_key, params)[0], lambda x: empty_metric[0], None)
             best_params = jax.lax.cond(
-                metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
-            best_loss = jnp.minimum(best_loss, metrics['val_loss'])
+                metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
+            best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
 
             # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
             # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
@@ -986,9 +1001,9 @@ def train(logger, config):
                 gyration_radius = gyration(cp)
                 rel_center = rel_center_fn(cp)
 
-                return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length, 'lower_length': lower_length, 'mean_center': mean_center, 'gyration_radius': gyration_radius, 'rel_center': rel_center, **metrics, **logs}
+                return (rng_key, params, opt_state, best_val_ll, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length, 'lower_length': lower_length, 'mean_center': mean_center, 'gyration_radius': gyration_radius, 'rel_center': rel_center, **metrics, **logs}
             else:
-                return (rng_key, params, opt_state, best_loss, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+                return (rng_key, params, opt_state, best_val_ll, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
         @scan_tqdm(num_epochs)
         def train_epoch(carry, epoch):
@@ -1028,7 +1043,7 @@ def train(logger, config):
                 # atten_batch = atten_batch[:, max_seqlen:]
 
                 # get curve parameter
-                rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all) = carry
+                rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all) = carry
                 rng_key, subkey = random.split(rng_key)
 
                 t = random.uniform(subkey, (1,), minval=0., maxval=1.)
@@ -1059,17 +1074,17 @@ def train(logger, config):
                 # y_val = jnp.take(y_all, idx, axis=0, mode='clip')
                 # val_loss, stat, val_out = s_model.nll(params['params'], params[s_model.mutable_name] if s_model.mutable_name else {}, t, (x_val, atten_val), y_val, False)
                 # val_acc = (jnp.argmax(val_out, axis=-1) == y_val).mean()
-                # return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, 'val_loss': val_loss, 'val_acc': val_acc, **logs}
+                # return (rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, 'val_loss': val_loss, 'val_acc': val_acc, **logs}
 
                 # validate
                 rng_key, valid_key = random.split(rng_key)
                 metrics = jax.lax.cond((step % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
                     valid_key, params)[0], lambda x: empty_metric[0], None)
                 best_params = jax.lax.cond(
-                    metrics['val_loss'] < best_loss, lambda x: get_best_params(params), lambda x: best_params, None)
-                best_loss = jnp.minimum(best_loss, metrics['val_loss'])
+                    metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
+                best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
 
-                return (rng_key, params, opt_state, best_loss, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+                return (rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
 
             return _train_expert_step
@@ -1123,12 +1138,12 @@ def train(logger, config):
                 window_size = max(batch_size, window_size) # at least half batch size
                 train_expert_step = init_train_expert(window_size)
                 # start expert training loop
-                carry = (rng_key, params, opt_state, best_loss, best_params, (train_input_ids, train_attention_mask, train_labels))
+                carry = (rng_key, params, opt_state, best_val_ll, best_params, (train_input_ids, train_attention_mask, train_labels))
                 carry, metrics = jax.lax.scan(
                     train_expert_step, carry, jnp.arange(num_steps))
             elif ds_sampling == 'minibatch':
                 print(f"Start minibatch training for {num_epochs} epochs")
-                carry = (rng_key, params, opt_state, best_loss, best_params, 0) # 0 is used for update counts
+                carry = (rng_key, params, opt_state, best_val_ll, best_params, 0) # 0 is used for update counts
                 carry, metrics = jax.lax.scan(
                     train_epoch, carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training
@@ -1201,9 +1216,10 @@ def train(logger, config):
         if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
             # params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
             params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+            # params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=0.0, params=params)
         curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-        post_performance = post_pred_performance(logits_test, test_labels)
-        logger.summary.update({f'{logger_prefix}post_pred_test_mean_{k}':v for k,v in post_performance.items()})
+        # post_performance = post_pred_performance(logits_test, test_labels)
+        logger.summary.update({f'{logger_prefix}test_mean_{k}':v.mean() for k,v in curve_metric.items()})
 
         if (curve_state == ProcessState.CURVE_FITTING) or (curve_state == ProcessState.CURVE_EVAL):
             fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
@@ -1250,7 +1266,7 @@ def train(logger, config):
                     train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
 
                     post_performance = post_pred_performance(logits_train, train_labels)
-                    logger.summary.update({f'post_pred_train_mean_{k}':v for k,v in post_performance.items()})
+                    logger.summary.update({f'train_mean_{k}':v.mean() for k,v in post_performance.items()})
                     mi = mutual_information(logits_train.astype(jnp.float32))
                     logger.summary.update({'train_mutual_information': mi})
                     entrop = entropy(logits_train.astype(jnp.float32))
@@ -1323,10 +1339,9 @@ def train(logger, config):
                         m_entropy = mean_entropy(logits_test.astype(jnp.float32), weights=weight)
                         logger.summary.update({f'test_mutual_information_ppd_t{temp}': mi, f'test_mean_entropy_ppd_t{temp}': m_entropy})
 
-            entrop = entropy(logits_test.astype(jnp.float32))
-            logger.summary.update({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
-
-            if curve_sampling_mode != "combined":
+                entrop = entropy(logits_test.astype(jnp.float32))
+                logger.summary.update({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
+            else:
                 print("Using random sampling to approx. independent curves")
                 if "combined" not in curve_sampling_mode:
                     print("Using random sampling to approx. independent curves")
@@ -1342,16 +1357,16 @@ def train(logger, config):
                 logger.summary.update({f'test_mutual_information_approx': mi, f'test_mean_entropy_approx': m_entropy, 'std_entropy_approx': entrop.mean(-1).std(), 'mean_entropy_approx': entrop.mean()})
 
             # reset lora noise if specified
-            if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
-                curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-                post_performance = post_pred_performance(logits_test, test_labels)
-                logger.summary.update({f'{logger_prefix}approx_pred_test_mean_wRho_{k}':v for k,v in post_performance.items()})
+            # if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
+            #     params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
+            #     curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
+            #     post_performance = post_pred_performance(logits_test, test_labels)
+            #     logger.summary.update({f'{logger_prefix}approx_pred_test_mean_wRho_{k}':v for k,v in post_performance.items()})
 
-                mi = mutual_information(logits_test.astype(jnp.float32))
-                m_entropy = mean_entropy(logits_test.astype(jnp.float32))
-                entrop = entropy(logits_test.astype(jnp.float32))
-                logger.summary.update({f'test_mutual_information_approx_wRho_': mi, f'test_mean_entropy_approx_wRho_': m_entropy, 'std_entropy_approx_wRho_': entrop.mean(-1).std(), 'mean_entropy_approx_wRho_': entrop.mean()})
+            #     mi = mutual_information(logits_test.astype(jnp.float32))
+            #     m_entropy = mean_entropy(logits_test.astype(jnp.float32))
+            #     entrop = entropy(logits_test.astype(jnp.float32))
+            #     logger.summary.update({f'test_mutual_information_approx_wRho_': mi, f'test_mean_entropy_approx_wRho_': m_entropy, 'std_entropy_approx_wRho_': entrop.mean(-1).std(), 'mean_entropy_approx_wRho_': entrop.mean()})
 
 
 
@@ -1480,7 +1495,7 @@ if __name__ == '__main__':
             'load_params_path': False, # path to pretrained trainable parameters
             # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
             'save_params': True,
-            'eval_every_n_batch': 100,
+            'eval_every_n_batch': 20,
             'smoke_test': args.smoke_test,
             'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
             # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
@@ -1488,11 +1503,11 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            # 'lora_mode': 'Asd(t)eB',
+                            'lora_mode': 'Asd(t)eB',
                             # 'lora_mode': 'Arotsd(t)eB',
-                            'lora_mode': 'Arot(t)sdeBrot(t)',
+                            # 'lora_mode': 'Arot(t)sdeBrot(t)',
                             'lora_rho': .25,
-                            'lora_rho_s': 0.,
+                            'lora_rho_s': .5,
                             'rho_scheduler_frequency': 100.,
                             'filter_masks': 
                                 [
@@ -1507,7 +1522,7 @@ if __name__ == '__main__':
                                 # ]},  # use lora for query projection
             'curve_params': {'cp_fix': args.cp_fix,
                             'num_epochs': -1,
-                            'num_steps': 10 if args.smoke_test else 3_000,
+                            'num_steps': 10 if args.smoke_test else 5_000,
                             # 'num_steps': 5000,
                             # 'num_steps': -1,
                             'batch_size': args.batch_size,
@@ -1541,8 +1556,8 @@ if __name__ == '__main__':
                             #                                                 'momentum': 0.9, 
                             #                                                 'nesterov': True},},
                             'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                            'kwargs': {'transition_steps': 3_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                                                                            'weight_decay': 0.01,
+                                                                                            'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.12, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
+                                                                            'weight_decay': 0.0,
                                                                             },
                                                                     'freeze_other_params': True,
                                                 },
@@ -1554,6 +1569,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="test_half_val_rho_frequ=100_rotAB(t)_positive", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="test_noWD on_curve + epsilon_s 05", entity="ddold", config=config)
         train(logger, config)
 

@@ -1,10 +1,10 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Flat Lora + Tunnel
-description: "Test with open control points. k=3 and Flat-LoRA with weight noise."
+name: Flat Lora weight_decay 
+description: "Test with open control points. k=3 and Flat-LoRA with weight noise and Rotation_Tunnel "
 method: grid
 metric:
   goal: maximize
-  name: acc_val_curve
+  name: approx_pred_test_mean_ll
 parameters:
   save_params:
     value: True
@@ -13,8 +13,8 @@ parameters:
             "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
             #  "ddold/qwen_PtoC/boolq_dataset:v0",
-             "ddold/qwen_PtoC/obqa_dataset:v0",
-             "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
+            #  "ddold/qwen_PtoC/obqa_dataset:v0",
+            #  "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
             #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
              ]
   load_params_path:
@@ -42,7 +42,7 @@ parameters:
       use_lora:
         value: True
       r:
-        values: [8, 224]
+        values: [8, 64]
       lora_dtype:
         value: "float32"  # ["original", "float16", "bfloat16", "float32"]
       lora_alpha:
@@ -50,11 +50,14 @@ parameters:
       lora_mode:
         # values: ["A(t)B", "A(t)B(t)", "As(t)B", "Asd(t)B",]
         # values: ["Asd(t)B", "A(t)B(t)"]
-        values: ["A(t)eB", "Asd(t)eB" ]
+        # values: ["A(t)eB(t)", "A(t)eB", "Asd(t)eB", "Arot(t)sdeBrot(t)", "Arotsd(t)eB" ]
+        values: ["Arotsd(t)eB", "Asd(t)eB"]
       lora_rho:
-        values: [0.5, 0.1, 0.]
+        values: [0.5,]
       lora_rho_s:
-        values: [0.0, 0.1, 0.5, 1., 2.]
+        values: [0.5, 1.]
+      rho_scheduler_frequency:
+        values: [50]
       filter_masks:
         values:
           - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
@@ -70,10 +73,11 @@ parameters:
           # - [1, 1]
           # - [1, 0, 1]
           - [0, 0, 0]
-          - [0, 0, 0, 0, 0, 0]
+          # - [0, 0, 0, 0, 0, 0]
           # - [1,]
           # - [0, 0, 0, 0, 0, 0]
-          # - [1, 0, 0, 0, 1] 
+          # - [1, 0, 1, 0, 1] 
+          # - [1, 0, 1, 0, 1, 0, 1] 
       batch_size:
         values: [4,]
       natural_parameterization:
@@ -104,6 +108,7 @@ parameters:
         value: 0.
       curve_parameterization:
         value: "bezier"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
+        # value: "b-spline"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
       curve_sampling_mode:
         # value: "per_leaf"  # ["per_leaf", "combined"]
         # values: ["per_leaf", "combined"]
@@ -130,8 +135,11 @@ parameters:
             # - {name: "sgd", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, momentum: 0.9, nesterov: True}, grad_clip_norm: 100.0, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 1e-4}, grad_clip_norm: 100.0, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
-            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
             # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
+            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
+            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: True}
+            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
+            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.1}, freeze_other_params: True}
         # parameters:
         #   name:
         #     value: "sgd"
@@ -148,7 +156,7 @@ parameters:
         #   freeze_non_curve_params:
         #     value: True
   rng_seed:
-    values: [1, 20, 400, 8000]
+    values: [1,20]
 
 command:
 - ${env}

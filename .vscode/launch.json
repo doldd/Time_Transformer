@@ -4,9 +4,35 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+
         
         {
             "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            },
+            "console": "integratedTerminal",
+            "args": ["--batch-size=4", "--smoke-test", "--curve-k=5"]
+        },
+        {
+            "name": "Python Debugger: Fixed Control Points",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.99"
+            },
+            "console": "integratedTerminal",
+            "args": ["--batch-size=4", "--smoke-test", "--cp-fix", "1", "0", "1"]
+        },
+        {
+            "name": "Wandb run",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",

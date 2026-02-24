@@ -18,7 +18,7 @@ from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
 from tqdm import tqdm
-from src.utils import calibration_error as ece_fn
+from src.utils import calibration_error as ece_fn, post_pred_performance
 from copy import deepcopy
 from numpyro import distributions as dist
 
@@ -168,14 +168,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     # y_last = target[matching_limit:]
     # y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
-    def post_pred_performance(logits, labels):
-        # logits shape (n_samples, n_data, n_classes)
-        post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
-        post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
-        post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
-        return {f'{key_prefix}bma_ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
-                f'{key_prefix}bma_acc': post_acc,
-                f'{key_prefix}bma_ece': post_ece}
+    # Use shared post_pred_performance from src.utils (returns prefixed keys when key_prefix provided)
 
     def acc_fn(rng_key, params):
         # @scan_tqdm(ii, desc='Evaluating', leave=False)
@@ -210,7 +203,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
         loss = loss.transpose(1,0)
-        bma_metrics = post_pred_performance(out, target)
+        bma_metrics = post_pred_performance(out, target, key_prefix=key_prefix, num_bins=num_bins_ece)
 
         # # compute the expected calibration error (ECE)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
@@ -1107,22 +1100,7 @@ def train(logger, config):
                 length = bezier_length(cp)
                 logger.summary.update({'Curve length': length})
 
-        #*** compute test metrics with BMA ***#
-        def post_pred_performance(logits, labels, weights:bool|jnp.ndarray=False):
-            # logits shape (n_samples, n_data, n_classes)
-            print(f"weights type {type(weights)} for BMA prediction {type(weights) == bool}")
-            if type(weights) == bool:
-                post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
-                # post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes) #false because of log multiply
-            else:
-                print("Using provided weights for BMA prediction")
-                post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
-            post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
-            post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
-            return {'ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
-                           'acc': post_acc,
-                           'ece': post_ece}
- 
+        #*** compute test metrics with BMA using shared implementation in src.utils.post_pred_performance ***#
         # plot likelihood and acc along curve
         t_space = jnp.linspace(0, 1, 20)
         if smoke_test or k == 0:

@@ -5,6 +5,7 @@ from scipy.special import binom
 import matplotlib.pyplot as plt
 from jax import numpy as jnp
 import jax
+from numpyro import distributions as dist
 # from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
 # from src.subspace_curve import OrthoSpan, pytree_to_matrix
 # import arviz as az
@@ -347,3 +348,31 @@ def calibration_error(logits, labels, num_bins):
 
     ece, _ = jax.lax.scan(body_fun, 0.0, (bin_lowers, bin_uppers))
     return ece
+
+def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_prefix: str|None=None, num_bins: int=15):
+    """Compute Bayesian model averaging predictive metrics from sampled logits.
+
+    Args:
+        logits: array shape (n_samples, n_data, n_classes)
+        labels: array shape (n_data,)
+        weights: False or array of shape (n_samples,) for weighted logsumexp
+        key_prefix: if provided, prefix returned metric keys with this string
+        num_bins: bins for ECE computation
+
+    Returns:
+        dict with keys either ('ll','acc','ece') or with prefix '{key_prefix}bma_ll', etc.
+    """
+    if isinstance(weights, bool):
+        # treating True as uniform average
+        post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])
+    else:
+        post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
+
+    post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
+    post_ece = calibration_error(post_predict_logits, labels, num_bins)
+    ll = dist.Categorical(logits=post_predict_logits).log_prob(labels).mean()
+
+    if key_prefix:
+        return {f'{key_prefix}bma_ll': ll, f'{key_prefix}bma_acc': post_acc, f'{key_prefix}bma_ece': post_ece}
+    else:
+        return {'ll': ll, 'acc': post_acc, 'ece': post_ece}

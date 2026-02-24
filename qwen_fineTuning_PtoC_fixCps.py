@@ -138,98 +138,17 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
 
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
-
-# def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
-#     if t_sample_fn is None:
-#         if use_linspace:
-#             get_t = lambda key: jnp.linspace(0, 1., n_samples)
-#         else:
-#             get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
-#     else:
-#         if use_linspace:
-#             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
-#         def tree_per_sample_fn(key):
-#             keys = jax.random.split(key, n_samples)
-#             return [t_sample_fn(k) for k in keys]
-#         get_t = tree_per_sample_fn
-#     ii = len(x) // batch_size
-    
-#     x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-#     x_last = x[matching_limit:]
-#     x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-#     att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-#     att_last = attention_mask[matching_limit:]
-#     att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-
-#     y_all = target[:matching_limit]  # drop non matching batch size
-#     y_last = target[matching_limit:]
-#     y_ = es('(ib)...->ib...', y_all, b=batch_size)
-
-#     def acc_fn(rng_key, params):
-#         # @scan_tqdm(ii, desc='Evaluating', leave=False)
-#         def pred(key, data):
-#             x_batch, atten_batch, y_batch = data
-#             # # turn off leading padding tokens in batch for faster evaluation
-#             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-#             # atten_batch = atten_batch[:, max_seqlen:]
-
-#             # @jax.jit
-#             def eval(t):
-#                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
-#                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-#                 return loss*batch_size, acc, out  # sum over batch
-#                 # return loss*batch_size, acc  # sum over batch
-            
-#             key, subkey = random.split(key)
-
-#             # draw samples to approximate curve performance
-#             t = get_t(subkey)
-#             loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
-#             # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
-
-#             if average:
-#                 # mean over samples
-#                 return key, (jnp.sum(loss), jnp.sum(acc), out)
-#             else:
-#                 return key, (loss, acc, out)  # no mean over samples
-
-#         # shape (n_data, draws, output_dim)
-#         rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
-#         # compute loss of last irregular batch
-#         if len(x_last) > 0:
-#             rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
-#             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-#             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
-#             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
-#         else:
-#             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
-
-#         # # compute the expected calibration error (ECE)
-#         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
-
-#         if average:
-#             ece = jnp.mean(ece)
-#             loss = loss.sum() / (n_samples * x.shape[0])
-#             acc = acc.sum() / (n_samples * x.shape[0])
-#         else:
-#             loss = jnp.sum(loss, axis=0) / x.shape[0]
-#             acc = jnp.sum(acc, axis=0) / x.shape[0]
-
-#         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
-#     return acc_fn
-
 def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
     if t_sample_fn is None:
         if use_linspace:
             get_t = lambda key: jnp.linspace(0, 1., n_samples)
         else:
-            get_t = lambda key: jax.random.uniform(key, (n_samples,), minval=0., maxval=1.)
+            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
         # get_t = partial(t_sample_fn, n_samples=n_samples)
-        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(jax.random.split(k, n_samples))
+        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(random.split(k, n_samples))
     ii = len(x) // batch_size
     
     idx = jnp.arange(len(x))
@@ -265,13 +184,13 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             att_m_batch = attention_mask.at[data_idx].get()
             y_batch = target.at[data_idx].get()
 
-            rng_key, key_ = jax.random.split(rng_key)
+            rng_key, key_ = random.split(rng_key)
             t_tree = get_t(key_)  # shape (n_samples,)
-            # keys = jax.random.split(key_, n_samples)
+            # keys = random.split(key_, n_samples)
             
             def single_pred(key, t):
                 # t is either scalar or tree of shape ()
-                key, subkey = jax.random.split(key)
+                key, subkey = random.split(key)
                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=subkey)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
                 return key, (loss*batch_size, out)
             
@@ -343,14 +262,14 @@ def mutual_information(logits, weights:np.ndarray|bool=False):
     Returns:
         mi: float mutual information averaged over each data point
     """
-    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
-    if use_weigts:
+    if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
     else:
         avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
     entropy_pred = -jnp.sum(avg_probs * jnp.log(avg_probs + 1e-12), axis=-1)  # (n_data,)
-    if use_weigts:
+    if use_weights:
         expected_nentropy = jnp.sum(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1) * weights[:, None], axis=0)  # (n_data,)
     else:
         expected_nentropy = jnp.mean(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1), axis=0)  # (n_data,)
@@ -365,9 +284,9 @@ def mean_entropy(logits, weights:np.ndarray|bool=False):
     Returns:
         entropy: float predictive entropy averaged over each data point
     """
-    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
-    if use_weigts:
+    if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
     else:
         avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
@@ -471,7 +390,7 @@ def train(logger, config):
             print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
 
             # Split data (simple train/val split) # we dont use validate data
-            n_train = int(np.ceil((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
+            n_train = int(np.floor((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
             train_input_ids = input_ids[perm_idx][:n_train]
             train_attention_mask = attention_mask[perm_idx][:n_train]
             train_labels = labels[perm_idx][:n_train]
@@ -599,7 +518,7 @@ def train(logger, config):
 
 
         # initialize curve parameter with pretrained point parameter
-        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*jax.random.normal(key, p.shape, dtype=p.dtype))
+        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*random.normal(key, p.shape, dtype=p.dtype))
 
         # set train mask according to config
         # Only update mask for LoRA-capable subspaces
@@ -635,7 +554,7 @@ def train(logger, config):
             struct = jax.tree.structure(only_curves)
 
             def t_sample_fn(key):
-                t_flatt = jax.random.uniform(key, (num_curve_leaves,), minval=0., maxval=1.)
+                t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=1.)
                 t_tree = jax.tree.unflatten(struct, t_flatt)
                 t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
                 return t_tree
@@ -1007,7 +926,7 @@ def train(logger, config):
         def train_epoch(carry, epoch):
             rng_key = carry[0]
             rng_key, subkey = random.split(rng_key)
-            shuffel_idx = jax.random.permutation(subkey, train_labels.shape[0])
+            shuffel_idx = random.permutation(subkey, train_labels.shape[0])
             shuffel_idx = es('(ib)->ib', shuffel_idx, b=batch_size)
             # x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
             # x_atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
@@ -1049,7 +968,7 @@ def train(logger, config):
                 # get batch from data
                 pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
                 rng_key, subkey = random.split(rng_key)
-                idx = jax.random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
+                idx = random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
                 idx %= x_all.shape[0] # wrap around
                 x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
                 atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
@@ -1098,7 +1017,7 @@ def train(logger, config):
             if ds_sampling == 'expert':
                 print(f"Start sorted expert training for {num_steps}")
                 if sort_mode == 'Random':
-                    order = jax.random.permutation(rng_key, train_input_ids.shape[0])
+                    order = random.permutation(rng_key, train_input_ids.shape[0])
                 elif sort_mode:
                     distance = 1 - cosine_sim
                     if sort_mode == 'Hierarchical':

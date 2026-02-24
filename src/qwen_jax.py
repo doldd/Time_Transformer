@@ -1,7 +1,6 @@
 # JAX/Flax Implementation of Qwen2 Model
 # Based on HuggingFace Transformers Qwen2 implementation
 
-from fileinput import filename
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -58,7 +57,6 @@ def repeat_kv(hidden_states, n_rep):
     if n_rep == 1:
         return hidden_states
 
-    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
     # Expand and reshape
     hidden_states = jnp.repeat(hidden_states, n_rep, axis=1)
     return hidden_states
@@ -149,18 +147,16 @@ class QwenAttention(nn.Module):
     attention_dropout: float = 0.0
     rope_theta: float = 10000.0
 
-    def setup(self):
-        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
-
-        # Rotary embedding
-        self.rotary_emb = RotaryEmbedding(
-            head_dim=self.head_dim,
-            rope_theta=self.rope_theta
-        )
-
     @nn.compact
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, train=True):
+        num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        scaling = self.head_dim ** -0.5
+        rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            rope_theta=self.rope_theta,
+            name='rotary_emb',
+        )
+
         batch_size, seq_len, _ = hidden_states.shape
 
         # Linear projections (Qwen2 uses bias=True for q,k,v and bias=False for o)
@@ -186,17 +182,17 @@ class QwenAttention(nn.Module):
         if position_ids is None:
             position_ids = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
 
-        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        cos, sin = rotary_emb(hidden_states, position_ids)
         query_states = apply_rotary_emb(query_states, cos, sin)
         key_states = apply_rotary_emb(key_states, cos, sin)
 
         # Repeat k,v for grouped query attention
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
 
         # Compute attention scores
         attn_weights = jnp.matmul(query_states, jnp.transpose(
-            key_states, (0, 1, 3, 2))) * self.scaling
+            key_states, (0, 1, 3, 2))) * scaling
 
         # Always apply causal mask
         causal_mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=bool), k=1)
@@ -274,50 +270,6 @@ class QwenDecoderLayer(nn.Module):
         return hidden_states
 
 
-# class QwenModel(nn.Module):
-#     """Qwen transformer model (JAX version)"""
-#     vocab_size: int
-#     hidden_size: int
-#     num_hidden_layers: int
-#     num_attention_heads: int
-#     num_key_value_heads: int
-#     intermediate_size: int
-#     hidden_act: str = "silu"
-#     max_position_embeddings: int = 32768
-#     rms_norm_eps: float = 1e-6
-#     attention_dropout: float = 0.0
-#     rope_theta: float = 10000.0
-
-#     @nn.compact
-#     def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True):
-#         # Token embeddings
-#         hidden_states = nn.Embed(
-#             num_embeddings=self.vocab_size,
-#             features=self.hidden_size,
-#             name='embed_tokens'
-#         )(input_ids)
-
-#         # Apply transformer layers
-#         for i in range(self.num_hidden_layers):
-#             hidden_states = QwenDecoderLayer(
-#                 hidden_size=self.hidden_size,
-#                 num_attention_heads=self.num_attention_heads,
-#                 num_key_value_heads=self.num_key_value_heads,
-#                 intermediate_size=self.intermediate_size,
-#                 hidden_act=self.hidden_act,
-#                 rms_norm_eps=self.rms_norm_eps,
-#                 attention_dropout=self.attention_dropout,
-#                 rope_theta=self.rope_theta,
-#                 name=f'layers_{i}'
-#             )(hidden_states, attention_mask, position_ids, train)
-
-#         # Final layer norm
-#         hidden_states = RMSNorm(eps=self.rms_norm_eps,
-#                                 name='norm')(hidden_states)
-
-#         return hidden_states
-
-
 class QwenForCausalLM(nn.Module):
     """Qwen model for causal language modeling (JAX version)"""
     vocab_size: int
@@ -335,72 +287,32 @@ class QwenForCausalLM(nn.Module):
 
     @nn.compact
     def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True):
-        # If using tied embeddings, create a shared embedding layer
+        embed_layer = nn.Embed(
+            num_embeddings=self.vocab_size,
+            features=self.hidden_size,
+            name='embed_tokens',
+        )
+        hidden_states = embed_layer(input_ids)
+
+        for i in range(self.num_hidden_layers):
+            hidden_states = QwenDecoderLayer(
+                hidden_size=self.hidden_size,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                intermediate_size=self.intermediate_size,
+                hidden_act=self.hidden_act,
+                rms_norm_eps=self.rms_norm_eps,
+                attention_dropout=self.attention_dropout,
+                rope_theta=self.rope_theta,
+                name=f'layers_{i}',
+            )(hidden_states, attention_mask, position_ids, train)
+
+        hidden_states = RMSNorm(eps=self.rms_norm_eps, name='norm')(hidden_states)
+
         if self.tie_word_embeddings:
-            # Create shared embedding layer
-            embed_layer = nn.Embed(
-                num_embeddings=self.vocab_size,
-                features=self.hidden_size,
-                name='embed_tokens'
-            )
-
-            # Get embeddings for input tokens
-            hidden_states = embed_layer(input_ids)
-
-            # Apply transformer layers
-            for i in range(self.num_hidden_layers):
-                hidden_states = QwenDecoderLayer(
-                    hidden_size=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    intermediate_size=self.intermediate_size,
-                    hidden_act=self.hidden_act,
-                    rms_norm_eps=self.rms_norm_eps,
-                    attention_dropout=self.attention_dropout,
-                    rope_theta=self.rope_theta,
-                    name=f'layers_{i}'
-                )(hidden_states, attention_mask, position_ids, train)
-
-            # Final layer norm
-            hidden_states = RMSNorm(
-                eps=self.rms_norm_eps, name='norm')(hidden_states)
-
-            # Use the same embedding weights for output projection (transposed)
-            embed_weights = embed_layer.embedding  # (vocab_size, hidden_size)
-            # -> (batch, seq, vocab)
-            logits = jnp.dot(hidden_states, embed_weights.T)
+            logits = jnp.dot(hidden_states, embed_layer.embedding.T)
         else:
-            # Create shared embedding layer
-            embed_layer = nn.Embed(
-                num_embeddings=self.vocab_size,
-                features=self.hidden_size,
-                name='embed_tokens'
-            )
-
-            # Get embeddings for input tokens
-            hidden_states = embed_layer(input_ids)
-
-            # Apply transformer layers
-            for i in range(self.num_hidden_layers):
-                hidden_states = QwenDecoderLayer(
-                    hidden_size=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    intermediate_size=self.intermediate_size,
-                    hidden_act=self.hidden_act,
-                    rms_norm_eps=self.rms_norm_eps,
-                    attention_dropout=self.attention_dropout,
-                    rope_theta=self.rope_theta,
-                    name=f'layers_{i}'
-                )(hidden_states, attention_mask, position_ids, train)
-
-            # Final layer norm
-            hidden_states = RMSNorm(
-                eps=self.rms_norm_eps, name='norm')(hidden_states)
-
-            # Separate lm_head weights
-            logits = nn.Dense(self.vocab_size, use_bias=False,
-                              name='lm_head')(hidden_states)
+            logits = nn.Dense(self.vocab_size, use_bias=False, name='lm_head')(hidden_states)
 
         return logits
 

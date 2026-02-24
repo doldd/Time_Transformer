@@ -258,16 +258,6 @@ class OrthoSpan:
         return (p - self.mu) @ self.pi_inv
     
 
-# class OrthoSpanQR(OrthoSpan):
-#     def __init__(self, cp):
-#         subspace_dim = cp.shape[0] - 1
-#         self.mu = cp.mean(0)
-#         cp -= self.mu
-#         Q, R = jnp.linalg.qr(cp)
-#         self.pi = self.s[:subspace_dim, None] * vh[:subspace_dim]
-#         self.pi_inv = vh[:subspace_dim].T @ jnp.diag(1/self.s[:subspace_dim])
-
-
 class BezierTspaceUnifrom(dist.Uniform):
     def __init__(self, d_bezier, validate_args=None):
         self.d_bezier = d_bezier
@@ -992,7 +982,6 @@ class EntropyMixin:
         print("Using Entropy Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
-        self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     # @partial(jit, static_argnums=(0,))
@@ -1001,9 +990,7 @@ class EntropyMixin:
         nll, state, out = self.nll(joind_param, state, t, x, y, train=True, key=key)
         probs = jax.nn.softmax(out, axis=-1)
         n_entropy = jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1).mean()
-        loss = nll.mean() + self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
-        # loss = self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
-        self.last_t = t
+        loss = nll.mean() + self.entropy_weight * n_entropy
         if self.weight_decay != 0.:
             loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                     for w in jax.tree.leaves(params))
@@ -1014,7 +1001,6 @@ class EntropyMixin2:
         print("Using Entropy Mixin 2 with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
-        self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     # @partial(jit, static_argnums=(0,))
@@ -1027,9 +1013,7 @@ class EntropyMixin2:
         n_mask = jnp.argmax(probs, axis=-1) != y  # shape (n_data,)
         n_mask = n_mask.astype(probs.dtype)
         n_entropy = jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1)
-        loss = nll.mean() + (self.entropy_weight * n_entropy * n_mask).mean()  # * jnp.abs(t - self.last_t)
-        # loss = self.entropy_weight * n_entropy # * jnp.abs(t - self.last_t)
-        self.last_t = t
+        loss = nll.mean() + (self.entropy_weight * n_entropy * n_mask).mean()
         if self.weight_decay != 0.:
             loss = loss + sum(self.l2_loss(w, alpha=self.weight_decay)
                                     for w in jax.tree.leaves(params))
@@ -1040,7 +1024,6 @@ class JensenShannonMixin:
         print("Using Jensen-Shannon Mixin with weight:", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
-        self.last_t = 0.
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(3,))
     # @partial(jit, static_argnums=(0,))

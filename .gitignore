@@ -177,3 +177,4 @@ jax_cache/
 memory_profile/
 meta-llama/
 model_exports/
+heatmap_frames*

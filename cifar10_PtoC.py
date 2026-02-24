@@ -344,7 +344,6 @@ def single_run(logger, config, n_samples_nuts=None):
                 return jnp.einsum('tj,j...->t...', coeff, cp_diff) * n
             return clousure
 
-        @jit
         def bezier_length(cp):
             t = jnp.linspace(0, 1, 1000)
             d_bezier = get_d_bezier(t)
@@ -352,26 +351,21 @@ def single_run(logger, config, n_samples_nuts=None):
             length = jax.scipy.integrate.trapezoid(d_t, t)
             return length
         
-        @jit
         def lower_bound(cp):
             # get the length of the line between the first and last control
             return jnp.linalg.norm(cp[-1]-cp[0])
         
-        @jit
         def upper_bound(cp):
             # get the length of the line between each control point
             return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
 
-        @jit 
         def mass_center(cp):
             return jnp.linalg.norm(cp.mean(axis=0))
         
-        @jit
         def gyration(cp):
             mc = cp.mean(0)
             return jnp.linalg.norm(cp - mc, axis=1).mean()
         
-        @jit
         def mean_curvature2(cp):
             tt = jnp.linspace(0, 1, 10)
             _, d_bezier = bezier_curve(cp.shape[0], cp)
@@ -397,7 +391,6 @@ def single_run(logger, config, n_samples_nuts=None):
         
         def init_rel_center(cp):
             mean_center_t0 = cp.mean(axis=0)
-            @jit
             def rel_center(cp):
                 return jnp.linalg.norm(cp.mean(axis=0) - mean_center_t0)
             return rel_center

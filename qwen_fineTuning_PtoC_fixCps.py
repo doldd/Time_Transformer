@@ -857,7 +857,6 @@ def train(logger, config):
                     # params = s_model.set_lora_rho(rho_w=lora_params.get('lora_rho', 0.0),  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
                     params = s_model.set_lora_rho(rho_w=0.0,  rho_s=0.0, params=params)
                     # params = s_model.set_lora_rho(rho_w=0.0,  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
-                # jax.debug.print(f"Computing validation metrics with params rho: {params['params']['layers_0']['self_attn']['q_proj']['kernel'].lora_rho_w}, rho_s: {params['params']['layers_0']['self_attn']['q_proj']['kernel'].lora_rho_s}")
                 return valid_metrics_fn_tmp(rng, params)
             
             def get_best_params(params):
@@ -975,7 +974,6 @@ def train(logger, config):
             if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
                 current_rho = rho_scheduler(update_idx, lora_params.get('lora_rho', 0.0))
                 current_rho_s = rho_scheduler(update_idx, lora_params.get('lora_rho_s', 0.0))
-                jax.debug.print(f"Update idx: {update_idx}, setting LoRA rho to {current_rho} and rho_s to {current_rho_s}")
                 params = s_model.set_lora_rho(current_rho, current_rho_s, params)
             loss, params, opt_state, (grad_, logs) = s_model.train_step(
                 subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)

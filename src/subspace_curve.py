@@ -1085,7 +1085,7 @@ class LoraAbstractParams:
         self.A = A
         self.B = B
         self.w0 = w0
-        self.dims = dims # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes (First axis is for B second for A)
+        self.dims = tuple(int(d) for d in dims) # tuple of indices where the LoRA parameters are applied e.g. (0, 1) for the first two axes (First axis is for B second for A)
         self.lora_alpha = lora_alpha  # Scaling factor for LoRA, can be adjusted as needed
         self.lora_rho_w = lora_rho_w
 
@@ -1728,10 +1728,12 @@ def matrix_to_pytree(vec, subspace_params):
     return jax.tree.unflatten(structure, flatten_leafs)
 
 
-def filter_mask(mask, *key_names, as_curve=False, BoolschenOperator=all):
+def filter_mask(mask, *key_names, as_curve: bool|np.ndarray=False, BoolschenOperator=all):
     """Convert a mask to a no-curve mask according key_name. Perfomrs boolschen AND for all key_names or OR with BoolschenOperator=any.
        Note: Function opperates in-place.
-       BoolschenOperator can be used to change the behavior of the filter, e.g. to use `any` instead of `all`."""
+       BoolschenOperator can be used to change the behavior of the filter, e.g. to use `any` instead of `all`.
+       as_curve can be bool or np.array (but not pytree or jnp.array as mask)
+       """
     if len(key_names) == 0:
         return mask
     

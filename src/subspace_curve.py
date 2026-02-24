@@ -15,10 +15,13 @@ from copy import deepcopy
 from flax.core import freeze, unfreeze
 from jax.tree_util import register_pytree_node_class
 import math
+import logging
 
+logger = logging.getLogger(__name__)
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
-           'vec_to_pytree', 'bezier_curve', 'UniformTSubspace', 'UniformTCategory']
+           'vec_to_pytree', 'bezier_curve', 'segmented_bezier_coeff_fn',
+           'UniformTSubspace', 'UniformTCategory']
 
 def tree_broadcast(prefix_tree: Any, full_tree: Any,
                    is_leaf: Callable[[Any], bool] | None = None
@@ -112,6 +115,79 @@ def bezier_curve(num_bends, cp):
 
     f.defjvp(f_jvp)
     return f, derivative_bezier
+
+def segmented_bezier_coeff_fn(num_bends, segment_degree) -> Callable:
+    """Piecewise Bézier coefficient function with non-overlapping segments.
+
+    Connects *num_bends* control points through consecutive Bézier segments
+    of degree *segment_degree*.  Each segment uses (segment_degree + 1)
+    control points, and consecutive segments share only their boundary CP
+    (stride = segment_degree).
+
+    **Open curve** (odd-style): when ``(num_bends - 1) % segment_degree == 0``,
+    e.g. 5 CPs / degree 2 → segments [0,1,2], [2,3,4] → 2 segments.
+
+    **Closed loop** (even-style): when ``num_bends % segment_degree == 0``,
+    e.g. 6 CPs / degree 2 → segments [0,1,2], [2,3,4], [4,5,0] → 3 segments.
+    The last segment wraps back to the first CP.
+
+    The global parameter *t* lives in ``[0, num_segments]``.
+
+    Args:
+        num_bends:      Total number of control points (k + 1).
+        segment_degree: Polynomial degree of each Bézier segment
+                        (e.g. 2 → quadratic).
+
+    Returns:
+        A callable  ``t  →  coefficients``  that returns an array of shape
+        ``(num_bends,)`` whose entries sum to 1.
+    """
+    is_open = (num_bends - 1) % segment_degree == 0
+    if is_open:
+        num_segments = (num_bends - 1) // segment_degree
+    else:
+        assert num_bends % segment_degree == 0, (
+            f"num_bends={num_bends} is neither compatible with open curve "
+            f"((n-1) % d == 0) nor closed loop (n % d == 0) for degree {segment_degree}"
+        )
+        num_segments = num_bends // segment_degree
+
+    assert num_segments >= 1, (
+        f"Need at least {segment_degree + 1} control points for degree "
+        f"{segment_degree}, got {num_bends}"
+    )
+
+    # Bézier basis for a single segment of the given degree
+    seg_coeff_fn = bezier_coeff_fn(segment_degree + 1)
+
+    # Precompute CP indices for each segment: shape (num_segments, segment_degree+1)
+    seg_indices = jnp.array([
+        [(i * segment_degree + j) % num_bends for j in range(segment_degree + 1)]
+        for i in range(num_segments)
+    ])  # (num_segments, segment_degree+1)
+    
+    def wrapper(t):
+        # Determine which segment we are in
+        segment_idx = jnp.floor(t).astype(jnp.int32)
+        segment_idx = jnp.clip(segment_idx, 0, num_segments - 1)
+        local_t = t - segment_idx.astype(t.dtype)  # ∈ [0, 1]
+        local_t = jnp.clip(local_t, 0.0, 1.0)
+
+        # Local Bézier coefficients (length: segment_degree + 1)
+        local_coeffs = seg_coeff_fn(local_t)
+
+        # Get CP indices for this segment via dynamic indexing
+        cp_indices = seg_indices[segment_idx]  # (segment_degree+1,)
+
+        # Scatter local coefficients into global coefficient vector
+        full_coeffs = jnp.zeros(num_bends, dtype=local_coeffs.dtype)
+        full_coeffs = full_coeffs.at[cp_indices].add(local_coeffs)
+        return full_coeffs
+
+    wrapper.num_segments = num_segments
+    wrapper.is_open = is_open
+    return wrapper
+
 
 # B-Spline basis function using Cox-de Boor recursion formula
 def bspline_basis(i, p, knots, t):
@@ -265,7 +341,7 @@ class BezierTspaceUnifrom(dist.Uniform):
         bezier_grad = jax.vmap(d_bezier)(tt)
         length = jnp.trapezoid(jnp.linalg.norm(bezier_grad, axis=-1), tt)
         self.total_length = length
-        print("Total length: ", length)
+        logger.debug("Total length: %s", length)
         super(BezierTspaceUnifrom, self).__init__(validate_args=validate_args)
 
     @staticmethod
@@ -331,17 +407,28 @@ class SubspaceBaseModel:
 
     """
 
-    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier'):
+    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier', curve_segment: int | bool = False):
         self.model = model
         self.k = k
-        if 'b-spline' in curve_parameterization:
-            print("Using B-Spline curve parameterization")
+        if curve_segment:
+            segment_degree = int(curve_segment)
+            self.bezier = segmented_bezier_coeff_fn(k + 1, segment_degree)
+            num_segments = self.bezier.num_segments
+            is_open = self.bezier.is_open
+            logger.info(f"Using segmented Bézier ({'open' if is_open else 'closed'}): "
+                  f"{k + 1} CPs, degree {segment_degree}, "
+                  f"{num_segments} segments, t ∈ [0, {num_segments}]")
+            self.t_max = float(num_segments)
+        elif 'b-spline' in curve_parameterization:
+            logger.info("Using B-Spline curve parameterization")
             degree = 2
             knots = open_uniform_knots(k+1, degree)
             self.bezier = bspline_coeff_fn(k+1, degree, knots)
+            self.t_max = 1.0
         else:
-            print("Using Bezier curve parameterization")
+            logger.info("Using Bezier curve parameterization")
             self.bezier = bezier_coeff_fn(k + 1)
+            self.t_max = 1.0
         self.weight_decay = weight_decay
         self.perm_spec = perm_spec
         self.mutable_name = mutuable_param_name
@@ -371,7 +458,7 @@ class SubspaceBaseModel:
                                                 for k, v in flat_params.items()})
 
         for i, p in enumerate(params_list[1:]):
-            print(f'Remove permutation from k {i+1}')
+            logger.info("Remove permutation from k %d", i + 1)
             key, perm_key = random.split(key)
             final_permutation = weight_matching(perm_key, self.perm_spec,
                                                 flatten_params(params_list[0]), flatten_params(p))
@@ -423,42 +510,9 @@ class SubspaceBaseModel:
             - The mask used for curve parameters is stored in `self.curve_mask`.
         """
         assert ('params' in params) and len(params.keys())==1, "Point must contain 'params' key and no other keys."
-        # curve_params = [deepcopy(point['params']) for _ in range(self.k+1)]
-        # # add noise to the parameters
-        # param, struct = jax.tree.flatten(curve_params)
-        # keys = random.split(key, len(param))
-        # def apply_noise(p, key, jitter):
-        #     # Flax kernel has shape [inC, outC]. Scale noise with sqrt(2/fan_in)
-        #     return p+jitter*jax.random.normal(key, p.shape, dtype=p.dtype)*jnp.sqrt(jnp.array(2/p.shape[0], dtype=p.dtype))
-        # noise_params = [apply_noise(p, key, jitter=jitter) for p, key in zip(param, keys)]
-        # curve_params = jax.tree.unflatten(struct, noise_params)
         
         if self.perm_spec:
             raise ValueError("Permutation specification is not supported in init_params_from_point method.")
-        #     curve_params = self.remove_permutation(key, curve_params)
-        # curve_params = jax.tree.map(lambda *x: jnp.stack(x), *curve_params)
-
-        # # revert all non-curve parameters to the original point
-        # curve_params = jax.tree.map(
-        #     lambda p, m, o: p if m else o, curve_params, mask, point['params'])
-        # all_params = deepcopy(point)
-        # all_params['params'] = curve_params
-
-        # def make_curve(m, p, key):
-        #     if m:
-        #         curve_param = jnp.stack([p] * (self.k + 1))
-        #         curve_param = noise_fn(curve_param, key)
-        #         return curve_param
-        #     else:
-        #         return p
-
-        # mf, struct = jax.tree.flatten(mask)
-        # rng_keys = random.split(key, len(mf))
-        # rng_keys = jax.tree.unflatten(struct, rng_keys)
-        # all_params = jax.tree.map(make_curve, mask, point['params'], rng_keys)
-
-        # self.curve_mask = mask
-        # return {'params': all_params}
     
         # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
         def make_curve(m, p, key):
@@ -834,7 +888,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         params = super().init_params(key, x, mask)
         # initialize log scale
         params['params']['log_scale'] = self.init_log_scale
-        print(self.curve_mask)
+        logger.debug("curve_mask: %s", self.curve_mask)
         self.curve_mask['log_scale'] = False  # mask log_scale parameter as non curve parameter
         return params
 
@@ -910,7 +964,7 @@ class QuantileSubspace(SubspaceBaseModel):
 
 class RepulsiveMixin:
     def __init__(self, gravity=0.0, energy_weakening=0.1, regularizer="force", **kwargs):
-        print("Using Repulsive Mixin with regularizer:", regularizer)
+        logger.info("Using Repulsive Mixin with regularizer: %s", regularizer)
         super().__init__(**kwargs)
         self.gravity = gravity
         self.energy_weakening = energy_weakening
@@ -979,7 +1033,7 @@ class RepulsiveMixin:
 
 class EntropyMixin:
     def __init__(self, entropy_weight=0.0, **kwargs):
-        print("Using Entropy Mixin with weight:", entropy_weight)
+        logger.info("Using Entropy Mixin with weight: %s", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
 
@@ -998,7 +1052,7 @@ class EntropyMixin:
 
 class EntropyMixin2:
     def __init__(self, entropy_weight=0.0, **kwargs):
-        print("Using Entropy Mixin 2 with weight:", entropy_weight)
+        logger.info("Using Entropy Mixin 2 with weight: %s", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
 
@@ -1021,7 +1075,7 @@ class EntropyMixin2:
     
 class JensenShannonMixin:
     def __init__(self, entropy_weight=0.0, **kwargs):
-        print("Using Jensen-Shannon Mixin with weight:", entropy_weight)
+        logger.info("Using Jensen-Shannon Mixin with weight: %s", entropy_weight)
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
 
@@ -1286,7 +1340,10 @@ class LoRAMixin:
     """
 
     def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", lora_rho: float=.0, lora_rho_s: float=.0, **kwargs):
-        print(f"Using LoRA Mixin with rank={r}, dtype={lora_dtype}, alpha={lora_alpha}, mode={lora_mode}, rho={lora_rho}, rho_s={lora_rho_s}")
+        logger.info(
+            "Using LoRA Mixin with rank=%s, dtype=%s, alpha=%s, mode=%s, rho=%s, rho_s=%s",
+            r, lora_dtype, lora_alpha, lora_mode, lora_rho, lora_rho_s,
+        )
         super().__init__(**kwargs)
         self.r = r
         self.lora_mask = lora_mask
@@ -1298,7 +1355,10 @@ class LoRAMixin:
         self.lora_rho_s = lora_rho_s
         if 'e' in lora_mode:
             if lora_rho_s == 0.:
-                print(f"Using LoRA mode {lora_mode} with lora_rho_s=0 makes no sense and is equivalent to {lora_mode.replace('e', '')}.")
+                logger.warning(
+                    "Using LoRA mode %s with lora_rho_s=0 makes no sense and is equivalent to %s.",
+                    lora_mode, lora_mode.replace('e', ''),
+                )
 
     def get_dtype(self, param):
         if self.lora_dtype == "original":

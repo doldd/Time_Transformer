@@ -138,12 +138,14 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
 
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
-def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
+def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None, t_max=None):
+    if t_max is None:
+        t_max = getattr(model, 't_max', 1.0)
     if t_sample_fn is None:
         if use_linspace:
-            get_t = lambda key: jnp.linspace(0, 1., n_samples)
+            get_t = lambda key: jnp.linspace(0, t_max, n_samples)
         else:
-            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
+            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=t_max)
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
@@ -365,8 +367,10 @@ def train(logger, config):
                          dataset_sampling: dict = None,
                          val_percentage: float = 0.0,
                          curve_parameterization = 'bezier',
+                         curve_segment: int | bool = False,
                          curve_sampling_mode: str = 'combined', # 'combined', 'per_leave'
                          logger_prefix: str = '',
+                         _cached_s_model=None,
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
@@ -463,6 +467,7 @@ def train(logger, config):
                                                                    natural_parameterization=natural_parameterization,
                                                                    mutuable_param_name=False,
                                                                    curve_parameterization=curve_parameterization,
+                                                                   curve_segment=curve_segment,
                                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
                                                                    entropy_weight=entropy_maxim,)
                 else:
@@ -473,6 +478,7 @@ def train(logger, config):
                                                             natural_parameterization=natural_parameterization,
                                                             mutuable_param_name=False,
                                                             curve_parameterization=curve_parameterization,
+                                                            curve_segment=curve_segment,
                                                             gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 if entropy_maxim > 0.0:
@@ -483,6 +489,7 @@ def train(logger, config):
                                                       natural_parameterization=natural_parameterization,
                                                       mutuable_param_name=False,
                                                       curve_parameterization=curve_parameterization,
+                                                      curve_segment=curve_segment,
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
@@ -493,6 +500,7 @@ def train(logger, config):
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
+                                                   curve_segment=curve_segment,
                                                    )
         else:
             if regularizer:
@@ -501,14 +509,19 @@ def train(logger, config):
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
+                                                   curve_segment=curve_segment,
                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
                                            perm_spec=perm_spec,
                                            natural_parameterization=natural_parameterization,
                                            curve_parameterization=curve_parameterization,
+                                           curve_segment=curve_segment,
                                            mutuable_param_name=False)
 
+        # Reuse cached s_model to avoid JAX retrace on each CP pretraining iteration
+        if _cached_s_model is not None:
+            s_model = _cached_s_model
 
         # initialize curve parameter with pretrained point parameter
         params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*random.normal(key, p.shape, dtype=p.dtype))
@@ -533,6 +546,7 @@ def train(logger, config):
                         return p
                     params['params'] = jax.tree.map(map_fn, s_model.curve_mask, params['params'], p)
 
+        t_max = getattr(s_model, 't_max', 1.0)
         if curve_sampling_mode == 'per_leave':
             print("Using per-leave curve sampling")
             # num_leaves_parameter = len(jax.tree.leaves(s_model.curve_mask))
@@ -547,13 +561,13 @@ def train(logger, config):
             struct = jax.tree.structure(only_curves)
 
             def t_sample_fn(key):
-                t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=1.)
+                t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=t_max)
                 t_tree = jax.tree.unflatten(struct, t_flatt)
                 t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
                 return t_tree
         else:
             def t_sample_fn(key):
-                return random.uniform(key, (1,), minval=0., maxval=1.)
+                return random.uniform(key, (1,), minval=0., maxval=t_max)
 
 
         artifact_weights_use = False
@@ -1102,9 +1116,9 @@ def train(logger, config):
 
         #*** compute test metrics with BMA using shared implementation in src.utils.post_pred_performance ***#
         # plot likelihood and acc along curve
-        t_space = jnp.linspace(0, 1, 20)
+        t_space = jnp.linspace(0, s_model.t_max, 20)
         if smoke_test or k == 0:
-            t_space = jnp.linspace(0, 1, 3)
+            t_space = jnp.linspace(0, s_model.t_max, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # valid
         # set lora noise off for evaluation if specified
@@ -1278,18 +1292,24 @@ def train(logger, config):
 
     params = None
     cp_fix = config['curve_params'].pop('cp_fix')
+    deg_segments = config['curve_params'].get('curve_segment', False)
 
     # pretrain fixed control points 
     if np.sum(cp_fix) > 0:
         curve_state = ProcessState.PRETRAINING
+        if deg_segments:
+            all_segments_fixed_endpoints = np.all([deg_segments == i for i in np.diff(np.argwhere(np.array(cp_fix) == 1).flatten())])
+            assert all_segments_fixed_endpoints, "In curve segment mode, fixed control points must be consecutive and include endpoints, e.g. [1,0,1,0,1] with deg 2."
         if config.get('lora_params', None) is not None and np.sum(cp_fix) < len(cp_fix):
             assert (config['lora_params']['lora_mode'] == 'A(t)B(t)') or config['lora_params']['lora_mode'] == 'A(t)eB(t)', "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for subspace curves with fixed control points" 
         train_params = []
+        _cached_pretrain_model = None
         print("Pretraining fixed control points")
         for i, fixed in enumerate(cp_fix):
             if fixed:
                 print(f"Training cp member {i}")
                 config['curve_params']['k'] = 0 
+                config['curve_params']['curve_segment'] = False 
 
                 if params is not None:
                     del params  # free memory
@@ -1297,7 +1317,9 @@ def train(logger, config):
                     rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                     lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                     smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
+                    _cached_s_model=_cached_pretrain_model,
                     logger_prefix=f'cp_fixed_{i}_')
+                _cached_pretrain_model = s_model  # reuse same instance to avoid JAX retrace
                 train_params.append(s_model.only_trainable_params(params['params']))
                 rng_key, _ = random.split(rng_key)
             else:
@@ -1311,6 +1333,7 @@ def train(logger, config):
             print("Saved pretrained parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
     else:
+        assert config['curve_params'].get('curve_segment', False) is False, "Curve segment mode does not make sense if no control points are fixed. (control points of shared segments would get more gradient upgraded)" 
         train_params = False
     if params is not None:
         del params  # free memory
@@ -1320,6 +1343,7 @@ def train(logger, config):
     if len(cp_fix) > 1:
         print("Training curve model")
         config['curve_params']['k'] = len(cp_fix)-1
+        config['curve_params']['curve_segment'] = deg_segments 
         if len(cp_fix) == np.sum(cp_fix): # all control points are fixed e.g. [1,1] but we check linear mode connection
             curve_state = ProcessState.CURVE_EVAL
         else:
@@ -1398,7 +1422,7 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'Asd(t)eB',
+                            'lora_mode': 'A(t)B(t)',
                             # 'lora_mode': 'Arotsd(t)eB',
                             # 'lora_mode': 'Arot(t)sdeBrot(t)',
                             'lora_rho': .25,
@@ -1432,6 +1456,7 @@ if __name__ == '__main__':
                             'val_percentage' : 0.1,
                             'curve_parameterization': 'bezier',
                             'curve_sampling_mode': 'combined_noBMA', # 'per_leave' or 'combined'
+                            'curve_segment': 2, # if int only train on curve segment of degeree curve_segment between fixed control points, if False train on whole curve
                             # 'curve_sampling_mode': 'per_leave', # 'per_leave' or 'combined'
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],

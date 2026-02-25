@@ -352,7 +352,7 @@ def calibration_error(logits, labels, num_bins):
     ece, _ = jax.lax.scan(body_fun, 0.0, (bin_lowers, bin_uppers))
     return ece
 
-def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_prefix: str|None=None, num_bins: int=15):
+def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_prefix: str="", num_bins: int=15):
     """Compute Bayesian model averaging predictive metrics from sampled logits.
 
     Args:
@@ -375,10 +375,7 @@ def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_p
     post_ece = calibration_error(post_predict_logits, labels, num_bins)
     ll = dist.Categorical(logits=post_predict_logits).log_prob(labels).mean()
 
-    if key_prefix:
-        return {f'{key_prefix}bma_ll': ll, f'{key_prefix}bma_acc': post_acc, f'{key_prefix}bma_ece': post_ece}
-    else:
-        return {'ll': ll, 'acc': post_acc, 'ece': post_ece}
+    return {f'{key_prefix}ll': ll, f'{key_prefix}acc': post_acc, f'{key_prefix}ece': post_ece}
 
 
 # ---------------------------------------------------------------------------

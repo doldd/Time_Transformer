@@ -756,8 +756,8 @@ class SubspaceBaseModel:
                                  for w in jax.tree.leaves(params['params'])), state
 
     # @partial(jit, static_argnums=(0, 7))
-    # @partial(jit, static_argnums=(0, 7), donate_argnums=(3,6))
     # @profile
+    @partial(jit, static_argnums=(0, 7), donate_argnums=(3,6))
     def train_step(self, key, t, params, x, y, opt_state, optimizer):
         """
         Performs a single training step.

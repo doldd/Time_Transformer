@@ -371,6 +371,8 @@ def train(logger, config):
                          curve_sampling_mode: str = 'combined', # 'combined', 'per_leave'
                          logger_prefix: str = '',
                          _cached_s_model=None,
+                         _cached_optimizer=None,
+                         _cached_scan_jit=None,
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
@@ -760,6 +762,9 @@ def train(logger, config):
         # if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
         #     opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
         optimizer = optax.chain(*opt_chain_list)
+        # Reuse cached optimizer to avoid JAX retrace (static_argnums=(0,7) on train_step)
+        if _cached_optimizer is not None:
+            optimizer = _cached_optimizer
 
         only_train_params = s_model.only_trainable_params(params['params'])
         n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
@@ -1063,13 +1068,19 @@ def train(logger, config):
                 train_expert_step = init_train_expert(window_size)
                 # start expert training loop
                 carry = (rng_key, params, opt_state, best_val_ll, best_params, (train_input_ids, train_attention_mask, train_labels))
-                carry, metrics = jax.lax.scan(
-                    train_expert_step, carry, jnp.arange(num_steps))
+                if _cached_scan_jit is None:
+                    @jit
+                    def _cached_scan_jit(carry, xs):
+                        return jax.lax.scan(train_expert_step, carry, xs)
+                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_steps))
             elif ds_sampling == 'minibatch':
                 print(f"Start minibatch training for {num_epochs} epochs")
                 carry = (rng_key, params, opt_state, best_val_ll, best_params, 0) # 0 is used for update counts
-                carry, metrics = jax.lax.scan(
-                    train_epoch, carry, jnp.arange(num_epochs))
+                if _cached_scan_jit is None:
+                    @jit
+                    def _cached_scan_jit(carry, xs):
+                        return jax.lax.scan(train_epoch, carry, xs)
+                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training
             else:
                 raise ValueError(f"Unknown dataset_sampling method {ds_sampling} given. Choose either 'expert' or 'minibatch'.")
@@ -1286,7 +1297,7 @@ def train(logger, config):
         #             'post_pred_acc': post_acc,
         #             'post_pred_ece': post_ece,
         #             })
-        return rng_key, s_model, params, last_trainable_params
+        return rng_key, s_model, params, last_trainable_params, optimizer, _cached_scan_jit
 
 
 
@@ -1304,6 +1315,8 @@ def train(logger, config):
             assert (config['lora_params']['lora_mode'] == 'A(t)B(t)') or config['lora_params']['lora_mode'] == 'A(t)eB(t)', "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for subspace curves with fixed control points" 
         train_params = []
         _cached_pretrain_model = None
+        _cached_pretrain_optimizer = None
+        _cached_pretrain_scan = None
         print("Pretraining fixed control points")
         for i, fixed in enumerate(cp_fix):
             if fixed:
@@ -1313,13 +1326,17 @@ def train(logger, config):
 
                 if params is not None:
                     del params  # free memory
-                rng_key, s_model, params, _ = train_curve_inner(
+                rng_key, s_model, params, _, _pretrain_opt, _pretrain_scan = train_curve_inner(
                     rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                     lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                     smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
                     _cached_s_model=_cached_pretrain_model,
+                    _cached_optimizer=_cached_pretrain_optimizer,
+                    _cached_scan_jit=_cached_pretrain_scan,
                     logger_prefix=f'cp_fixed_{i}_')
-                _cached_pretrain_model = s_model  # reuse same instance to avoid JAX retrace
+                _cached_pretrain_model = s_model      # reuse same instance to avoid JAX retrace
+                _cached_pretrain_optimizer = _pretrain_opt  # reuse same optimizer object
+                _cached_pretrain_scan = _pretrain_scan  # reuse compiled scan (no retrace/recompile)
                 train_params.append(s_model.only_trainable_params(params['params']))
                 rng_key, _ = random.split(rng_key)
             else:
@@ -1348,7 +1365,7 @@ def train(logger, config):
             curve_state = ProcessState.CURVE_EVAL
         else:
             curve_state = ProcessState.CURVE_FITTING
-        rng_key, s_model, params, last_trainable_params = train_curve_inner(
+        rng_key, s_model, params, last_trainable_params, _, _ = train_curve_inner(
                 rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                 lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                 smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 

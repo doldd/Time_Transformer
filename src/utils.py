@@ -6,12 +6,15 @@ import matplotlib.pyplot as plt
 from jax import numpy as jnp
 import jax
 from numpyro import distributions as dist
+from copy import deepcopy
+from flax.core import unfreeze
 # from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
 # from src.subspace_curve import OrthoSpan, pytree_to_matrix
 # import arviz as az
 
 __all__ = ['bezier_length', 'lower_bound', 'upper_bound',
-           'plot_subspace', 'get_cp_w', 'get_data']
+           'plot_subspace', 'get_cp_w', 'get_data',
+           'init_model', 'load_checkpoint_new', 'load_fn']
 
 
 # https://jwalton.info/Embed-Publication-Matplotlib-Latex/
@@ -376,3 +379,166 @@ def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_p
         return {f'{key_prefix}bma_ll': ll, f'{key_prefix}bma_acc': post_acc, f'{key_prefix}bma_ece': post_ece}
     else:
         return {'ll': ll, 'acc': post_acc, 'ece': post_ece}
+
+
+# ---------------------------------------------------------------------------
+# Model init / checkpoint helpers (for Qwen LoRA subspace experiments)
+# ---------------------------------------------------------------------------
+
+def init_model(config, unique_target_ids):
+    """Initialize a LoRAEntropyCategorySubspace model from a wandb run config.
+
+    Args:
+        config: dict – wandb run config (may be mutated in-place for model_path).
+        unique_target_ids: array of unique target token ids for the classifier head.
+
+    Returns:
+        s_model: initialised subspace model.
+        params: initialised parameter pytree.
+    """
+    # Import here to avoid circular / heavy imports at module load time
+    from qwen_fineTuning_PtoC import QwenTextClassificationWrapper
+    from src.subspace_curve import filter_mask, LoRAEntropyCategorySubspace
+
+    if config['net_kwargs']['model_path'].startswith('ddold/'):
+        import wandb
+        api = wandb.Api()
+        model_artifact = api.artifact(config['net_kwargs']['model_path'], type='model')
+        config['net_kwargs']['model_path'] = model_artifact.download()
+
+    model = QwenTextClassificationWrapper(**config['net_kwargs'], target_token_ids=unique_target_ids)
+    params = unfreeze(model.init(None, None))
+
+    curve_mask = jax.tree.map(lambda x: False, params['params'])
+    if config['curve_params']['k'] > 0:
+        for f in config['curve_params']['filter_masks']:
+            curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+
+    optimizer_conf = config['curve_params']['optimizer_conf']
+    lora_params = config.get('lora_params', None)
+    filter_masks = config['curve_params']['filter_masks']
+    if "freeze_other_params" in optimizer_conf and optimizer_conf["freeze_other_params"]:
+        train_mask = jax.tree.map(lambda x: False, params['params'])
+        for f in filter_masks:
+            train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+        if lora_params and lora_params['use_lora']:
+            for f in lora_params['filter_masks']:
+                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
+    else:
+        train_mask = jax.tree.map(lambda x: True, params['params'])
+
+    lora_mask = jax.tree.map(lambda x: False, params['params'])
+    if lora_params and lora_params['use_lora']:
+        for f in lora_params['filter_masks']:
+            lora_mask = filter_mask(lora_mask, *f['keys'], as_curve=np.array(f['dims']), BoolschenOperator=eval(f['op']))
+
+    curve_pps = deepcopy(config['curve_params'])
+    curve_pps.pop('cp_fix')
+    s_model = LoRAEntropyCategorySubspace(
+        lora_mask=lora_mask,
+        r=lora_params['r'],
+        lora_dtype=lora_params['lora_dtype'],
+        lora_alpha=lora_params['lora_alpha'],
+        lora_mode=lora_params.get('lora_mode', 'A(t)B'),
+        lora_rho=lora_params.get('lora_rho', 0.0),
+        lora_rho_s=lora_params.get('lora_rho_s', 0.0),
+        model=model,
+        **curve_pps,
+    )
+
+    init_key = jax.random.PRNGKey(config.get('rng_seed', 1))
+    params = s_model.init_params_from_point(
+        init_key, params, curve_mask,
+        noise_fn=lambda p, key: p + config['curve_params']['jitter_multiplier'] * jax.random.normal(key, p.shape, dtype=p.dtype),
+    )
+
+    if lora_params and lora_params['use_lora']:
+        train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True)
+    s_model.set_train_mask(train_mask)
+    return s_model, params
+
+
+def load_fn(m, p, pl):
+    """Merge a loaded parameter into the current pytree leaf based on the train mask."""
+    if m:
+        assert p.shape == pl.shape, f"Shape mismatch: current {p.shape} vs loaded {pl.shape}"
+        return pl
+    return p
+
+
+def load_checkpoint_new(run, params, s_model):
+    """Load trainable parameters from a wandb run artifact into the model parameters.
+
+    Args:
+        run: wandb run object containing the artifacts.
+        params: current model parameters (flax format).
+        s_model: subspace model (provides train_mask).
+
+    Returns:
+        params, bma_weights, trainable_params, init_trainable_params,
+        pretrained_params, last_trainable_params
+    """
+    from src.subspace_curve import LoraAbstractParams
+
+    def load_art(load_run):
+        artifact_use, artifact_weights_use = False, False
+        print(f"Found run: {load_run.name} ({load_run.id})")
+        for art_l in load_run.logged_artifacts():
+            if art_l.type == "pytree" and art_l.name.startswith("params"):
+                print(f"Downloading params from {art_l.name}")
+                artifact_use = art_l
+            if art_l.type == "npz" and art_l.name.startswith("bma_weights"):
+                print(f"Downloading bma_weights from {art_l.name}")
+                artifact_weights_use = art_l
+        return artifact_use, artifact_weights_use
+
+    artifact_use, artifact_weights_use = load_art(run)
+
+    trainable_params = False
+    init_trainable_params = False
+    pretrained_params = False
+    last_trainable_params = False
+
+    for f in artifact_use.files():
+        if 'trainable_params' in f.name:
+            if 'init' in f.name:
+                init_trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
+                print(f"Loaded init_trainable_params from {f.name}")
+            elif 'last' in f.name:
+                last_trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
+                print(f"Loaded last_trainable_params from {f.name}")
+            else:
+                trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
+                print(f"Loaded trainable_params from {f.name}")
+                assert len(set(trainable_params.keys()) - set(params['params'].keys())) == 0, \
+                    "Loaded trainable_params do not match model params"
+        elif 'pretrained_params' in f.name:
+            pretrained_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True)
+            print(f"Loaded pretrained_params from {f.name}")
+
+    assert trainable_params, f"trainable_params not found in artifact {artifact_use.name}"
+
+    try:
+        params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
+    except Exception as e:
+        if "lora_rho_w" in str(e):
+            lora_rho_default = run.config.get('lora_params', {}).get('lora_rho', 0.0)
+
+            def set_rho_zero(p):
+                if isinstance(p, LoraAbstractParams):
+                    p.lora_rho_w = lora_rho_default
+                return p
+
+            trainable_params = jax.tree.map(set_rho_zero, trainable_params, is_leaf=lambda p: isinstance(p, LoraAbstractParams))
+            params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
+        else:
+            print(f"\033[91mError loading trainable parameters: {e}\033[0m")
+
+    bma_weights = False
+    if artifact_weights_use:
+        for f in artifact_weights_use.files():
+            if 'weights' in f.name:
+                bma_weights = np.load(artifact_weights_use.get_entry(f.name).download(), allow_pickle=True)
+                print(f"Loaded bma_weights from {f.name}")
+
+    return params, bma_weights, trainable_params, init_trainable_params, pretrained_params, last_trainable_params

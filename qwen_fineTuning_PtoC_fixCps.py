@@ -368,6 +368,7 @@ def train(logger, config):
                          val_percentage: float = 0.0,
                          curve_parameterization = 'bezier',
                          curve_segment: int | bool = False,
+                         indepent_connected: bool = False,
                          curve_sampling_mode: str = 'combined', # 'combined', 'per_leave'
                          logger_prefix: str = '',
                          _cached_s_model=None,
@@ -470,6 +471,7 @@ def train(logger, config):
                                                                    mutuable_param_name=False,
                                                                    curve_parameterization=curve_parameterization,
                                                                    curve_segment=curve_segment,
+                                                                   indepent_connected=indepent_connected,
                                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
                                                                    entropy_weight=entropy_maxim,)
                 else:
@@ -481,6 +483,7 @@ def train(logger, config):
                                                             mutuable_param_name=False,
                                                             curve_parameterization=curve_parameterization,
                                                             curve_segment=curve_segment,
+                                                            indepent_connected=indepent_connected,
                                                             gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 if entropy_maxim > 0.0:
@@ -492,6 +495,7 @@ def train(logger, config):
                                                       mutuable_param_name=False,
                                                       curve_parameterization=curve_parameterization,
                                                       curve_segment=curve_segment,
+                                                      indepent_connected=indepent_connected,
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
@@ -503,6 +507,7 @@ def train(logger, config):
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
                                                    curve_segment=curve_segment,
+                                                   indepent_connected=indepent_connected,
                                                    )
         else:
             if regularizer:
@@ -512,6 +517,7 @@ def train(logger, config):
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
                                                    curve_segment=curve_segment,
+                                                   indepent_connected=indepent_connected,
                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
@@ -519,6 +525,7 @@ def train(logger, config):
                                            natural_parameterization=natural_parameterization,
                                            curve_parameterization=curve_parameterization,
                                            curve_segment=curve_segment,
+                                           indepent_connected=indepent_connected,
                                            mutuable_param_name=False)
 
         # Reuse cached s_model to avoid JAX retrace on each CP pretraining iteration
@@ -1303,7 +1310,9 @@ def train(logger, config):
 
     params = None
     cp_fix = config['curve_params'].pop('cp_fix')
+    print(f"Control point fixed list: {cp_fix}")
     deg_segments = config['curve_params'].get('curve_segment', False)
+    indep_connected = config['curve_params'].get('indepent_connected', False)
 
     # pretrain fixed control points 
     if np.sum(cp_fix) > 0:
@@ -1350,7 +1359,7 @@ def train(logger, config):
             print("Saved pretrained parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
     else:
-        assert config['curve_params'].get('curve_segment', False) is False, "Curve segment mode does not make sense if no control points are fixed. (control points of shared segments would get more gradient upgraded)" 
+        # assert config['curve_params'].get('curve_segment', False) is False, "Curve segment mode does not make sense if no control points are fixed. (control points of shared segments would get more gradient upgraded)" 
         train_params = False
     if params is not None:
         del params  # free memory
@@ -1361,6 +1370,10 @@ def train(logger, config):
         print("Training curve model")
         config['curve_params']['k'] = len(cp_fix)-1
         config['curve_params']['curve_segment'] = deg_segments 
+        if np.sum(cp_fix) == 0:
+            print("No fixed control points, training full curve with all control points free.")
+            if deg_segments:
+                assert indep_connected == True, "In curve segment mode with no fixed control points, curve optimzation only makes sense if all segments are independently connected (e.g. each segment doesn't optimize its last cp) to avoid optimization issues with shared control points between segments."
         if len(cp_fix) == np.sum(cp_fix): # all control points are fixed e.g. [1,1] but we check linear mode connection
             curve_state = ProcessState.CURVE_EVAL
         else:
@@ -1403,8 +1416,6 @@ if __name__ == '__main__':
     parser.add_argument("--smoke-test", action="store_true", help="Run a quick smoke test with reduced epochs (2) and batch iterations (3).")
 
     args = parser.parse_args()
-    print(f"Fixed control points: {args.cp_fix}")
-
     
     print("Curve training")
     if args.use_sweep:

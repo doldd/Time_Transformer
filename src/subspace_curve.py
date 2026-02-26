@@ -116,7 +116,7 @@ def bezier_curve(num_bends, cp):
     f.defjvp(f_jvp)
     return f, derivative_bezier
 
-def segmented_bezier_coeff_fn(num_bends, segment_degree) -> Callable:
+def segmented_bezier_coeff_fn(num_bends, segment_degree, indepent_connected: bool = False) -> Callable:
     """Piecewise Bézier coefficient function with non-overlapping segments.
 
     Connects *num_bends* control points through consecutive Bézier segments
@@ -170,11 +170,22 @@ def segmented_bezier_coeff_fn(num_bends, segment_degree) -> Callable:
         # Determine which segment we are in
         segment_idx = jnp.floor(t).astype(jnp.int32)
         segment_idx = jnp.clip(segment_idx, 0, num_segments - 1)
+        segment_idx = jnp.squeeze(segment_idx)  # ensure scalar for jax.lax.cond
         local_t = t - segment_idx.astype(t.dtype)  # ∈ [0, 1]
         local_t = jnp.clip(local_t, 0.0, 1.0)
 
         # Local Bézier coefficients (length: segment_degree + 1)
         local_coeffs = seg_coeff_fn(local_t)
+        if indepent_connected:
+            if is_open:
+                # For open curve, don't zero out the last CP of the last segment
+                local_coeffs = jax.lax.cond(
+                    segment_idx == num_segments - 1,
+                    lambda: local_coeffs,
+                    lambda: local_coeffs.at[-1].set(0.)
+                )
+            else:
+                local_coeffs = local_coeffs.at[-1].set(0.)  # 
 
         # Get CP indices for this segment via dynamic indexing
         cp_indices = seg_indices[segment_idx]  # (segment_degree+1,)
@@ -407,12 +418,12 @@ class SubspaceBaseModel:
 
     """
 
-    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier', curve_segment: int | bool = False):
+    def __init__(self, model, k, weight_decay:float=0., perm_spec: PermutationSpec = False, natural_parameterization=False, mutuable_param_name: str | bool = False, curve_parameterization='bezier', curve_segment: int | bool = False, indepent_connected: bool = False):
         self.model = model
         self.k = k
         if curve_segment:
             segment_degree = int(curve_segment)
-            self.bezier = segmented_bezier_coeff_fn(k + 1, segment_degree)
+            self.bezier = segmented_bezier_coeff_fn(k + 1, segment_degree, indepent_connected=indepent_connected)
             num_segments = self.bezier.num_segments
             is_open = self.bezier.is_open
             logger.info(f"Using segmented Bézier ({'open' if is_open else 'closed'}): "

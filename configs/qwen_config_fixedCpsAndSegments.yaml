@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Lora Bezier Segment 
+name: Lora Bezier Segment open
 description: "Test with fixed control points and bezier segments (non smooth traversion from one to next segment (Approach 2 (easy)). E.g. [1,0,1,0,1] wiht two independent segments. "
 method: grid
 metric:
@@ -51,8 +51,8 @@ parameters:
         # values: ["A(t)B", "A(t)B(t)", "As(t)B", "Asd(t)B",]
         # values: ["Asd(t)B", "A(t)B(t)"]
         # values: ["A(t)eB(t)", "A(t)eB", "Asd(t)eB", "Arot(t)sdeBrot(t)", "Arotsd(t)eB" ]
-        # values: ["Arotsd(t)eB", "Asd(t)eB"]
-        values: ["A(t)B(t)",]
+        values: ["Arotsd(t)eB", "Asd(t)eB"]
+        # values: ["A(t)B(t)",]
       lora_rho:
         values: [0.5,]
       lora_rho_s:
@@ -73,8 +73,9 @@ parameters:
         values: 
           # - [1, 1]
           # - [1, 0, 1]
-          - [1, 0, 1, 0, 1]
-          - [1, 0, 1, 0, 1, 0, 1, 0, 1]
+          # - [1, 0, 1, 0, 1]
+          # - [1, 0, 1, 0, 1, 0, 1, 0, 1]
+          - [0, 0, 0, 0, 0, 0, 0, 0, 0]
           # - [0, 0, 0, 0, 0, 0]
           # - [1,]
           # - [0, 0, 0, 0, 0, 0]
@@ -117,6 +118,8 @@ parameters:
         values: ["combined_noBMA"]
       curve_segment:
         value: 2
+      indepent_connected:
+        value: True
 
       filter_masks:
         values: 

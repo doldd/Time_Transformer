@@ -4,6 +4,7 @@ Following the PtoC (Point-to-Curve) pattern from other models
 """
 
 import os
+import logging
 import argparse
 import numpy as np
 import jax
@@ -25,12 +26,11 @@ from numpyro import distributions as dist
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
 from src.subspace_curve import (
-    masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn,
-    LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace, LoRAEntropyCategorySubspace, LoRAJSDCategorySubspace, LoRARepulsiveEntropyCategorySubspace
+    masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn, get_subspace_model
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
-from enum import Enum
+from dataclasses import dataclass
 import time
 
 # Set environment variables
@@ -38,11 +38,118 @@ os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # import sys
 # sys.setrecursionlimit(200)
 
-class ProcessState(Enum):
-    PRETRAINING = 1
-    CURVE_FITTING = 2
-    CURVE_EVAL = 3
-    ERROR = 0
+@dataclass
+class DataSplits:
+    """All dataset arrays for train / val / test splits.
+
+    ``has_train`` and ``has_val`` are derived automatically so they never
+    go out of sync with the actual data arrays.
+    """
+    train_input_ids: jnp.ndarray | None = None
+    train_attention_mask: jnp.ndarray | None = None
+    train_labels: jnp.ndarray | None = None
+    val_input_ids: jnp.ndarray | None = None
+    val_attention_mask: jnp.ndarray | None = None
+    val_labels: jnp.ndarray | None = None
+    test_input_ids: jnp.ndarray | None = None
+    test_attention_mask: jnp.ndarray | None = None
+    test_labels: jnp.ndarray | None = None
+
+    @property
+    def has_train(self) -> bool:
+        return self.train_input_ids is not None
+
+    @property
+    def has_val(self) -> bool:
+        return self.val_input_ids is not None
+
+    def get(self, name: str) -> tuple[jnp.ndarray | None, jnp.ndarray | None, jnp.ndarray | None]:
+        """Return ``(input_ids, attention_mask, labels)`` for *name* or ``None``."""
+        mapping = {
+            'train': (self.train_input_ids, self.train_attention_mask, self.train_labels),
+            'val':   (self.val_input_ids,   self.val_attention_mask,   self.val_labels),
+            'test':  (self.test_input_ids,  self.test_attention_mask,  self.test_labels),
+        }
+        return mapping.get(name, (None, None, None))
+
+
+def _empty_val_metric():
+    """Sentinel validation metrics used when no validation data is available."""
+    return ({
+        'val_loss': jnp.array(jnp.inf, dtype=jnp.float32),
+        'val_acc': jnp.array(-jnp.inf, dtype=jnp.float32),
+        'val_ece': jnp.array(jnp.inf, dtype=jnp.float32),
+        'val_bma_ll': jnp.array(-jnp.inf, dtype=jnp.float32),
+        'val_bma_acc': jnp.array(-jnp.inf, dtype=jnp.float32),
+        'val_bma_ece': jnp.array(jnp.inf, dtype=jnp.float32),
+    }, None)
+
+
+@dataclass
+class TrainHyperparams:
+    """Parsed hyperparameters for the training pipeline.
+
+    Constructed by ``_parse_hyperparams`` after data loading; consumed by
+    every stage function so they don't need the raw *config* dict.
+    """
+    cp_fix: list
+    batch_size: int
+    batch_size_eval: int
+    eval_every_n_batch: int
+    num_epochs: int
+    num_steps: int
+    save_params: bool
+    smoke_test: bool
+    lora_params: dict | None
+    lora_rho: float
+    lora_rho_s: float
+    dataset_sampling: dict
+    ds_sampling: str
+    curve_sampling_mode: str
+    temperature: list
+    lr_schedule: object
+    deg_segments: int | bool
+    indep_connected: bool
+    unique_target_ids: jnp.ndarray
+    net_kwargs: dict
+    curve_params: dict  # remaining curve_params (cp_fix already popped)
+
+    @property
+    def eval_common(self) -> dict:
+        """Shared kwargs for ``_run_eval_phase`` (excludes per-call args)."""
+        return dict(
+            batch_size_eval=self.batch_size_eval,
+            curve_sampling_mode=self.curve_sampling_mode,
+            temperature=self.temperature,
+            smoke_test=self.smoke_test,
+            lora_rho=self.lora_rho,
+            lora_rho_s=self.lora_rho_s,
+        )
+
+
+@dataclass
+class TrainingEnv:
+    """Reusable training environment objects created by ``_setup_training_env``.
+
+    For k=0 pretraining ``base_params`` holds a pristine parameter copy so
+    each control-point iteration can re-initialise from it.  For k>0 it is
+    ``None``.
+    """
+    s_model: object
+    params: dict
+    base_params: dict | None
+    curve_mask: object
+    train_mask: object
+    optimizer: object
+    opt_state: object
+    t_sample_fn: object
+    rho_scheduler: object
+    valid_metrics_fn: object
+    empty_metric: tuple
+    get_best_params: object
+    cosine_sim: jnp.ndarray | None
+    n_trainable: int
+
 
 # jax.config.update("jax_log_compiles", True)
 
@@ -157,18 +264,6 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     idx_ = idx[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
     idx_ = es('(ib)...->ib...', idx_, b=batch_size)
     idx_last = idx[matching_limit:]
-
-    # x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-    # x_last = x[matching_limit:]
-    # x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-    # att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-    # att_last = attention_mask[matching_limit:]
-    # att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-
-    # y_all = target[:matching_limit]  # drop non matching batch size
-    # y_last = target[matching_limit:]
-    # y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
     # Use shared post_pred_performance from src.utils (returns prefixed keys when key_prefix provided)
 
@@ -294,6 +389,1519 @@ def entropy(logits):
     return entropies  # (n_samples, n_data)
 
 
+# ---------------------------------------------------------------------------
+# Curve geometry helpers (pure functions used by the training loop)
+# ---------------------------------------------------------------------------
+
+def _bezier_length(cp):
+    """Compute arc length of a Bézier curve defined by control points *cp*."""
+    k = cp.shape[0] - 1
+    t = jnp.linspace(0, 1, 1000)
+    bezier_coeff_inv = bezier_coeff_fn(k)
+    coeff = jax.vmap(bezier_coeff_inv)(t)
+    cp_diff = cp[1:] - cp[:-1]
+
+    def _d_length_t(cp_diff, c):
+        d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * k)
+        return cp_diff, d_t
+
+    _, d_t = jax.lax.scan(_d_length_t, cp_diff, coeff)
+    return jax.scipy.integrate.trapezoid(d_t, t)
+
+
+def _bezier_lower_bound(cp):
+    """Chord length between first and last control point."""
+    return jnp.linalg.norm(cp[-1] - cp[0])
+
+
+def _bezier_upper_bound(cp):
+    """Sum of segment lengths of the control polygon."""
+    return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
+
+
+def _bezier_mass_center(cp):
+    """Norm of the mass centre of control points."""
+    return jnp.linalg.norm(cp.mean(axis=0))
+
+
+def _bezier_gyration(cp):
+    """Mean distance of control points from their centre of mass."""
+    mc = cp.mean(0)
+    return jnp.linalg.norm(cp - mc, axis=1).mean()
+
+
+def _bezier_mean_curvature(cp):
+    """Integrated mean curvature of the Bézier curve defined by *cp*."""
+    tt = jnp.linspace(0, 1, 10)
+    _, d_bezier = bezier_curve(cp.shape[0], cp)
+
+    def _single(t):
+        grad_ = d_bezier(t)
+        second_dev = jax.jacrev(d_bezier)(t).squeeze()
+        norm_r_prime_sq = jnp.dot(grad_, grad_)
+        norm_r_double_prime_sq = jnp.dot(second_dev, second_dev)
+        dot_r_prime_double_prime = jnp.dot(grad_, second_dev)
+        numerator = jnp.sqrt(
+            norm_r_prime_sq * norm_r_double_prime_sq - dot_r_prime_double_prime**2)
+        denominator = norm_r_prime_sq ** (3 / 2)
+        return numerator / denominator
+
+    curvature = jax.vmap(_single)(tt)
+    return jax.scipy.integrate.trapezoid(curvature, tt)
+
+
+def _bezier_rel_center(cp, initial_center):
+    """Distance of the current mass centre from *initial_center*."""
+    return jnp.linalg.norm(cp.mean(axis=0) - initial_center)
+
+
+def _plot_curve_along_t(t_space, loss, acc, ece, title='Curve Predictive',
+                        loss_label='test_ll', acc_label='test acc',
+                        ece_label='test ece'):
+    """Create a triple-axis plot of loss / accuracy / ECE along curve parameter *t*.
+
+    Returns the matplotlib *Figure*.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
+    ax.plot(t_space, -loss, label=loss_label, c=plt.get_cmap('tab10')(0))
+    ax2 = ax.twinx()
+    ax2.plot(t_space, acc, label=acc_label,
+             c=plt.get_cmap('tab10')(1), linestyle='--')
+    ax3 = ax.twinx()
+    ax3.spines['right'].set_position(('outward', 40))
+    ax3.set_frame_on(True)
+    ax3.patch.set_visible(False)
+    ax3.plot(t_space, ece, label=ece_label,
+             c=plt.get_cmap('tab10')(2), linestyle=':')
+    ax.set_xlabel('t')
+    ax.set_ylabel('mean log likelihood')
+    ax2.set_ylabel('Accuracy')
+    ax3.set_ylabel('ECE')
+    ax.set_title(title)
+    lines, lab1 = ax.get_legend_handles_labels()
+    lines2, lab2 = ax2.get_legend_handles_labels()
+    lines3, lab3 = ax3.get_legend_handles_labels()
+    ax.legend(lines + lines2 + lines3, lab1 + lab2 + lab3,
+              loc='best', fontsize='small')
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Evaluation pipeline – compute logits per dataset, then apply metrics
+# ---------------------------------------------------------------------------
+
+_EVAL_METRICS: dict = {}
+
+
+def _register_eval_metric(fn):
+    """Decorator: register an evaluation metric by function name (strips ``_eval_`` prefix)."""
+    name = fn.__name__
+    if name.startswith('_eval_'):
+        name = name[len('_eval_'):]
+    _EVAL_METRICS[name] = fn
+    return fn
+
+
+# --- Individual metric functions ---------------------------------------------------
+# Each receives keyword arguments from the orchestrator and may read/write *ctx*.
+
+@_register_eval_metric
+def _eval_summary(*, base_metrics, logger, logger_prefix='', **_kw):
+    """Log the mean of every base metric to ``logger.summary``."""
+    logger.summary.update({
+        f'{logger_prefix}{mk}_mean': v.mean()
+        for mk, v in base_metrics.items()
+    })
+
+
+@_register_eval_metric
+def _eval_post_pred(*, logits, labels, logger, key_prefix, ctx, weight_key=None, **_kw):
+    """BMA post-predictive performance (uniform or weighted via *weight_key*)."""
+    weights = ctx.get(weight_key, False) if weight_key else False
+    pp = post_pred_performance(logits, labels, weights=weights)
+    logger.summary.update({f'{key_prefix}{mk}': v for mk, v in pp.items()})
+
+
+@_register_eval_metric
+def _eval_plot_curve(*, base_metrics, key_prefix, t_space, logger,
+                     plot_title=None, **_kw):
+    """Plot loss / accuracy / ECE along the curve parameter *t*."""
+    if t_space is None:
+        logging.warning("plot_curve requires linspace sampling — skipping.")
+        return
+    fig = _plot_curve_along_t(
+        t_space,
+        base_metrics[key_prefix + 'loss'],
+        base_metrics[key_prefix + 'acc'],
+        base_metrics[key_prefix + 'ece'],
+        title=plot_title or f'{key_prefix}set')
+    logger.log({f'Curve Predictive {plot_title or key_prefix}': wandb.Image(fig)})
+
+
+@_register_eval_metric
+def _eval_entropy_along_curve(*, logits, logger, key_prefix, **_kw):
+    """Compute std / mean of per-sample entropy along the curve."""
+    entrop = entropy(logits.astype(jnp.float32))
+    logger.summary.update({
+        f'{key_prefix}std_entropy_along_curve': entrop.mean(-1).std(),
+        f'{key_prefix}mean_entropy_along_curve': entrop.mean(),
+    })
+
+
+@_register_eval_metric
+def _eval_mutual_info(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
+    """Mutual information across curve samples (optionally weighted)."""
+    weights = ctx.get(weight_key, False) if weight_key else False
+    mi = mutual_information(logits.astype(jnp.float32), weights=weights)
+    logger.summary.update({f'{key_prefix}mutual_information': mi})
+
+
+@_register_eval_metric
+def _eval_mean_entropy(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
+    """Predictive entropy of the BMA mixture (optionally weighted)."""
+    weights = ctx.get(weight_key, False) if weight_key else False
+    me = mean_entropy(logits.astype(jnp.float32), weights=weights)
+    logger.summary.update({f'{key_prefix}mean_entropy': me})
+
+
+@_register_eval_metric
+def _eval_compute_posterior_weights(*, base_metrics, key_prefix, logger,
+                                    temperature, t_space, ctx, **_kw):
+    """Derive posterior weights from the per-sample loss and cache in *ctx*.
+
+    Also saves a wandb ``bma_weights`` artifact.
+    """
+    print("Temperature:", temperature)
+
+    def _compute_weights(log_like, t):
+        log_post = log_like / t
+        log_post -= jax.scipy.special.logsumexp(log_post)
+        return jnp.exp(log_post)
+
+    log_like = -base_metrics[key_prefix + 'loss']
+    weights = jax.vmap(_compute_weights, in_axes=(None, 0))(
+        log_like, jnp.array(temperature))
+    ctx['posterior_weights'] = weights
+
+    # Save artifact
+    art_w = wandb.Artifact(name="bma_weights", type="npz")
+    jnp.savez(f'tmp_files/{logger.id}_weights.npz',
+              weights=weights, t_space=t_space,
+              log_like=log_like, temperature=temperature)
+    art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
+    logger.log_artifact(art_w)
+    print("Saved posterior weights artifact")
+
+
+@_register_eval_metric
+def _eval_load_posterior_weights(*, logger, temperature, ctx, **_kw):
+    """Load posterior weights from a wandb artifact stored in ``ctx['_artifact_weights']``."""
+    artifact = ctx.get('_artifact_weights')
+    if artifact is None:
+        raise RuntimeError("'load_posterior_weights' requires artifact_weights in run_evaluation")
+
+    def _compute_weights(log_like, t):
+        log_post = log_like / t
+        log_post -= jax.scipy.special.logsumexp(log_post)
+        return jnp.exp(log_post)
+
+    for f in artifact.files():
+        if 'weights' in f.name:
+            wf = np.load(artifact.get_entry(f.name).download(), allow_pickle=True)
+            weights = jax.vmap(_compute_weights, in_axes=(None, 0))(
+                wf['log_like'], jnp.array(temperature))
+            ctx['posterior_weights'] = weights
+            print("Loaded posterior weights from artifact")
+            return
+    raise RuntimeError("No weights file found in artifact")
+
+
+@_register_eval_metric
+def _eval_post_pred_per_temp(*, logits, labels, logger, key_prefix,
+                              temperature, ctx, **_kw):
+    """BMA post-predictive for each temperature using posterior weights."""
+    weights_all = ctx.get('posterior_weights')
+    if weights_all is None:
+        raise RuntimeError("'post_pred_per_temp' requires 'compute_posterior_weights' first")
+    for weight, temp in zip(weights_all, temperature):
+        pp = post_pred_performance(logits, labels, weight)
+        logger.summary.update({
+            f'{key_prefix}ppd_t{temp}_{mk}': v for mk, v in pp.items()
+        })
+
+
+@_register_eval_metric
+def _eval_mutual_info_per_temp(*, logits, logger, key_prefix,
+                                temperature, ctx, **_kw):
+    """Mutual information for each temperature using posterior weights."""
+    weights_all = ctx.get('posterior_weights')
+    if weights_all is None:
+        raise RuntimeError("'mutual_info_per_temp' requires 'compute_posterior_weights' first")
+    for weight, temp in zip(weights_all, temperature):
+        mi = mutual_information(logits.astype(jnp.float32), weights=weight)
+        logger.summary.update({f'{key_prefix}mutual_information_ppd_t{temp}': mi})
+
+
+@_register_eval_metric
+def _eval_mean_entropy_per_temp(*, logits, logger, key_prefix,
+                                 temperature, ctx, **_kw):
+    """Mean predictive entropy for each temperature using posterior weights."""
+    weights_all = ctx.get('posterior_weights')
+    if weights_all is None:
+        raise RuntimeError("'mean_entropy_per_temp' requires 'compute_posterior_weights' first")
+    for weight, temp in zip(weights_all, temperature):
+        me = mean_entropy(logits.astype(jnp.float32), weights=weight)
+        logger.summary.update({f'{key_prefix}mean_entropy_ppd_t{temp}': me})
+
+
+@_register_eval_metric
+def _eval_best_temperature(*, logits, labels, logger, key_prefix,
+                            temperature, ctx, **_kw):
+    """Find the best temperature on this dataset and store the best weight in *ctx*.
+
+    Iterates over temperatures, computing BMA post-predictive performance
+    for each, and caches the weight with the highest log-likelihood as
+    ``ctx['best_weight']`` and ``ctx['best_temperature']``.
+    """
+    weights_all = ctx.get('posterior_weights')
+    if weights_all is None:
+        raise RuntimeError("'best_temperature' requires 'compute_posterior_weights' first")
+    best = {'ll': -jnp.inf, 'temp': None, 'weight': None}
+    for weight, temp in zip(weights_all, temperature):
+        pp = post_pred_performance(logits, labels, weight)
+        if pp['ll'] > best['ll']:
+            best = {'ll': pp['ll'], 'temp': temp, 'weight': weight}
+        logger.summary.update({
+            f'{key_prefix}ppd_t{temp}_{mk}': v for mk, v in pp.items()
+        })
+    ctx['best_weight'] = best['weight']
+    ctx['best_temperature'] = best['temp']
+    logger.summary.update({
+        f'{key_prefix}best_log_like_temp': best['temp'],
+        f'{key_prefix}best_log_like': best['ll'],
+    })
+
+
+def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
+                   batch_size_eval, t_sample_fn=None, temperature=(1.0,),
+                   logger, logger_prefix='', smoke_test=False, k=0,
+                   artifact_weights=None):
+    """Run the modular evaluation pipeline.
+
+    **Two-phase design**: for each entry in *eval_specs* the pipeline first
+    computes logits on the specified dataset, then runs the requested metrics
+    on those logits.  A shared *ctx* dict enables cross-dataset communication
+    (e.g. posterior weights computed on train used by metrics on test).
+
+    Args:
+        s_model: Subspace model instance.
+        params: Model parameters pytree.
+        rng_key: JAX random key.
+        data: ``DataSplits`` instance; splits are looked up by name via
+            ``data.get(name)``.
+        eval_specs: Ordered list of eval specification dicts.  Each dict may
+            contain:
+
+            - ``name`` (str): Split name passed to ``data.get()`` (``'train'``, ``'val'``, ``'test'``).
+            - ``sampling`` (str): ``'linspace'`` | ``'t_sample'``
+              (default ``'linspace'``).
+            - ``n_samples`` (int): Number of *t* samples
+              (default 20; clipped to 3 for smoke tests / k==0).
+            - ``key_prefix`` (str): Prefix for metric keys
+              (default ``'{name}_'``).
+            - ``metrics`` (list): Names (str) or dicts ``{'name': …, **extra}``
+              registered in ``_EVAL_METRICS``.
+            - ``store_logits`` (bool): If True, cache logits in *ctx*.
+
+        batch_size_eval: Batch size for evaluation forward passes.
+        t_sample_fn: Callable for ``'t_sample'`` sampling mode.
+        temperature: Sequence of temperature values for posterior weighting.
+        logger: wandb run object.
+        logger_prefix: Global prefix prepended to logged keys.
+        smoke_test: Limit *n_samples* to 3.
+        k: Bézier curve degree.
+        artifact_weights: Optional wandb artifact with pre-computed weights.
+
+    Returns:
+        ctx: Context dict accumulated during evaluation.
+    """
+    t_max = getattr(s_model, 't_max', 1.0)
+    ctx = {}
+    if artifact_weights is not None:
+        ctx['_artifact_weights'] = artifact_weights
+
+    for spec in eval_specs:
+        ds_name = spec['name']
+        split = data.get(ds_name)
+        if split is None:
+            logging.warning(
+                "Eval spec references dataset '%s' not available — skipping.",
+                ds_name)
+            continue
+
+        input_ids, attention_mask, labels_ = split
+        sampling = spec.get('sampling', 'linspace')
+        n_samples = spec.get('n_samples', 20)
+        if smoke_test or k == 0:
+            n_samples = min(n_samples, 3)
+        key_prefix = spec.get('key_prefix', f'{ds_name}_')
+
+        t_space = (jnp.linspace(0, t_max, n_samples)
+                   if sampling == 'linspace' else None)
+
+        # Phase 1 – compute logits
+        print(f"Evaluating '{ds_name}' ({sampling}, {n_samples} samples)")
+        use_linspace = (sampling == 'linspace')
+        metrics_fn = setup_metrics(
+            s_model, max(batch_size_eval, 1), input_ids, attention_mask, labels_,
+            n_samples=n_samples, use_linspace=use_linspace, average=False,
+            key_prefix=key_prefix,
+            t_sample_fn=None if use_linspace else t_sample_fn)
+        base_metrics, logits = metrics_fn(rng_key, params)
+
+        # Optionally cache logits in ctx
+        if spec.get('store_logits'):
+            ctx[f'{ds_name}_logits'] = logits
+            ctx[f'{ds_name}_base_metrics'] = base_metrics
+
+        # Phase 2 – run requested metrics
+        metric_kwargs = dict(
+            logits=logits, labels=labels_, base_metrics=base_metrics,
+            key_prefix=key_prefix, t_space=t_space, logger=logger,
+            logger_prefix=logger_prefix, temperature=temperature,
+            ctx=ctx, k=k)
+
+        for metric_spec in spec.get('metrics', []):
+            if isinstance(metric_spec, str):
+                name, extra = metric_spec, {}
+            elif isinstance(metric_spec, dict):
+                extra = dict(metric_spec)
+                name = extra.pop('name')
+            else:
+                raise ValueError(f"Invalid metric spec: {metric_spec}")
+
+            if name not in _EVAL_METRICS:
+                raise ValueError(
+                    f"Unknown eval metric '{name}'. "
+                    f"Available: {sorted(_EVAL_METRICS)}")
+            _EVAL_METRICS[name](**metric_kwargs, **extra)
+
+    return ctx
+
+
+def _build_masks(params_tree, k, filter_masks, optimizer_conf, lora_params):
+    """Build the curve / train / LoRA masks from configuration.
+
+    Returns ``(curve_mask, train_mask, lora_mask)``.
+    """
+    curve_mask = jax.tree.map(lambda x: False, params_tree)
+    if k > 0:
+        for f in filter_masks:
+            curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True,
+                                     BoolschenOperator=eval(f['op']))
+
+    if 'freeze_other_params' in optimizer_conf and optimizer_conf['freeze_other_params']:
+        train_mask = jax.tree.map(lambda x: False, params_tree)
+        for f in filter_masks:
+            train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
+                                     BoolschenOperator=eval(f['op']))
+        if lora_params and lora_params['use_lora']:
+            for f in lora_params['filter_masks']:
+                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
+                                         BoolschenOperator=eval(f['op']))
+    else:
+        train_mask = jax.tree.map(lambda x: True, params_tree)
+
+    lora_mask = jax.tree.map(lambda x: False, params_tree)
+    if lora_params and lora_params['use_lora']:
+        for f in lora_params['filter_masks']:
+            lora_mask = filter_mask(lora_mask, *f['keys'],
+                                    as_curve=np.array(f['dims']),
+                                    BoolschenOperator=eval(f['op']))
+    return curve_mask, train_mask, lora_mask
+
+
+# ---------------------------------------------------------------------------
+# Setup helpers – model construction, optimizer, masking
+# ---------------------------------------------------------------------------
+
+def _element_wise_mask(element_freeze_mask):
+    """Optax GradientTransformation that zeros updates for frozen parameters.
+
+    ``element_freeze_mask`` leaves can be:
+    - 0.0 (or False): Allow update
+    - 1.0 (or True): Freeze parameter
+    - Array of 0s/1s: Element-wise freeze/update
+    """
+    def init_fn(params):
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None):
+        new_updates = jax.tree.map(
+            lambda f, u: u * (1 - f) if type(f) != bool else u,
+            element_freeze_mask, updates)
+        return new_updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _create_subspace_model(*, model, params_tree, k, filter_masks, optimizer_conf,
+                            lora_params, model_params, subspace_model):
+    """Create masks and instantiate a subspace model (no parameter initialization).
+
+    Also handles weight_decay migration from model_params to optimizer_conf for
+    adamw optimizers.
+
+    Returns:
+        ``(s_model, curve_mask, train_mask, _model_params)``
+    """
+    curve_mask, train_mask, lora_mask = _build_masks(
+        params_tree, k, filter_masks, optimizer_conf, lora_params)
+
+    # Copy model_params to allow mutation (e.g. zeroing weight_decay passed to optimizer)
+    _model_params = dict(model_params) if model_params else {}
+    weight_decay = _model_params.get('weight_decay', 0.0)
+    if (weight_decay > 0.0) and (optimizer_conf['name'] == 'adamw'):
+        optimizer_conf['kwargs']['weight_decay'] = weight_decay
+        _model_params['weight_decay'] = 0.0  # zero out to avoid double weight decay in model
+
+    logging.info("Using subspace model: %s", subspace_model)
+    _runtime_kwargs = dict(model=model, k=k, perm_spec=False, mutuable_param_name=False)
+    if lora_params and lora_params.get('use_lora', False):
+        _runtime_kwargs['lora_mask'] = lora_mask
+    s_model_cls = get_subspace_model(subspace_model)
+    s_model = s_model_cls(**_runtime_kwargs, **_model_params)
+
+    return s_model, curve_mask, train_mask, _model_params
+
+
+def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
+                           jitter_multiplier, lora_params, fixed_cps_train_params=False):
+    """Initialize parameters on an existing subspace model.
+
+    Calls ``init_params_from_point``, updates the train mask for LoRA,
+    and maps any fixed control-point weights into the parameter vector.
+
+    Returns:
+        params (dict, updated in-place)
+    """
+    params = s_model.init_params_from_point(
+        init_key, params, curve_mask,
+        noise_fn=lambda p, key: p + jitter_multiplier * random.normal(key, p.shape, dtype=p.dtype))
+
+    # set train mask according to config
+    # Only update mask for LoRA-capable subspaces
+    if lora_params and lora_params.get('use_lora', False):
+        updated_train_mask = s_model.update_mask_for_lora(
+            train_mask, params['params'], b_off=False, w0_off=True)  # w0 must be off for LoRA
+    else:
+        updated_train_mask = train_mask
+    s_model.set_train_mask(updated_train_mask)
+
+    # Map pretrained control points which are fixed into params vector
+    if fixed_cps_train_params != False:
+        k = s_model.k
+        assert (len(fixed_cps_train_params) == (k + 1)), \
+            "fixed_cps_train_params length must match k or be False"
+        for i, p in enumerate(fixed_cps_train_params):
+            if p != False:
+                def map_fn(m, p, cp_f):
+                    if m:
+                        p = p.at[i].set(cp_f)
+                    return p
+                params['params'] = jax.tree.map(map_fn, s_model.curve_mask, params['params'], p)
+
+    return params
+
+
+def _build_subspace_model(*, model, params, k, filter_masks, optimizer_conf,
+                           lora_params, model_params, subspace_model,
+                           jitter_multiplier, init_key, fixed_cps_train_params):
+    """Create masks, instantiate a subspace model, and initialise parameters.
+
+    Convenience wrapper around ``_create_subspace_model`` and
+    ``_init_subspace_params``.
+
+    Returns:
+        ``(s_model, params, _model_params, curve_mask, train_mask)``
+    """
+    s_model, curve_mask, train_mask, _model_params = _create_subspace_model(
+        model=model, params_tree=params['params'], k=k, filter_masks=filter_masks,
+        optimizer_conf=optimizer_conf, lora_params=lora_params,
+        model_params=model_params, subspace_model=subspace_model)
+
+    params = _init_subspace_params(
+        s_model, params, curve_mask, train_mask, init_key,
+        jitter_multiplier, lora_params, fixed_cps_train_params)
+
+    return s_model, params, _model_params, curve_mask, train_mask
+
+
+def _build_optimizer(*, optimizer_conf, s_model, params, fixed_cps_train_params):
+    """Create the optimizer chain (gradient clipping, CP freezing, base optimizer)
+    and initialise optimizer state.
+
+    Returns:
+        ``(optimizer, opt_state, n_trainable_params)``
+    """
+    if optimizer_conf['name'].startswith('sam'):
+        raise NotImplementedError("SAM optimizer is not yet implemented for text classification")
+
+    base_optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
+
+    opt_chain_list = []
+    if "grad_clip_norm" in optimizer_conf:
+        opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]))
+
+    # Fix curve parameters during training if specified
+    if fixed_cps_train_params != False:
+        def get_dims(param):
+            return (-1,) + (1,) * (param.ndim - 1)
+        cps_fixed = [True if p != False else False for p in fixed_cps_train_params]
+        fixed_cp_mask = jax.tree.map(
+            lambda m, p: jnp.array(cps_fixed).reshape(get_dims(p)) if m else False,
+            s_model.curve_mask, params['params'])
+        opt_chain_list.append(_element_wise_mask(fixed_cp_mask))
+
+    opt_chain_list.append(base_optimizer)
+    optimizer = optax.chain(*opt_chain_list)
+
+    only_train_params = s_model.only_trainable_params(params['params'])
+    n_trainable_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
+    print(f"Number of trainable parameters: {n_trainable_params:_}")
+    opt_state = optimizer.init(only_train_params)
+
+    return optimizer, opt_state, n_trainable_params
+
+def _make_train_batch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
+                          lora_rho, lora_rho_s, rho_scheduler, eval_every_n_batch,
+                          valid_metrics_fn, empty_metric, get_best_params,
+                          initial_cp_center, k,
+                          train_input_ids, train_attention_mask, train_labels):
+    """Return a ``train_batch(carry, batch_idx)`` closure for ``jax.lax.scan``."""
+
+    def train_batch(carry, batch_idx):
+        rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
+
+        x_batch = jnp.take(train_input_ids, batch_idx, axis=0)
+        atten_batch = jnp.take(train_attention_mask, batch_idx, axis=0)
+        y_ = jnp.take(train_labels, batch_idx, axis=0)
+
+        rng_key, subkey = random.split(rng_key)
+        t = t_sample_fn(subkey)
+        # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
+        if lora_rho > 0.0 or lora_rho_s > 0.0:
+            current_rho = rho_scheduler(update_idx, lora_rho)
+            current_rho_s = rho_scheduler(update_idx, lora_rho_s)
+            params = s_model.set_lora_rho(current_rho, current_rho_s, params)
+        loss, params, opt_state, (grad_, logs) = s_model.train_step(
+            subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+        # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+        current_lr = lr_schedule(update_idx)
+        # validate
+        rng_key, valid_key = random.split(rng_key)
+
+        metrics = jax.lax.cond((update_idx % eval_every_n_batch) == 0, lambda x: valid_metrics_fn(
+            valid_key, params)[0], lambda x: empty_metric[0], None)
+        best_params = jax.lax.cond(
+            metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
+        best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
+
+        if k > 0:
+            cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+            upper_length = _bezier_upper_bound(cp)
+            lower_length = _bezier_lower_bound(cp)
+            mean_center = _bezier_mass_center(cp)
+            gyration_radius = _bezier_gyration(cp)
+            rel_center = _bezier_rel_center(cp, initial_cp_center)
+
+            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1), \
+                {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length,
+                 'lower_length': lower_length, 'mean_center': mean_center,
+                 'gyration_radius': gyration_radius, 'rel_center': rel_center,
+                 **metrics, **logs}
+        else:
+            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1), \
+                {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+
+    return train_batch
+
+
+def _make_train_epoch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
+                           lora_rho, lora_rho_s, rho_scheduler, eval_every_n_batch,
+                           valid_metrics_fn, empty_metric, get_best_params,
+                           initial_cp_center, k,
+                           train_input_ids, train_attention_mask, train_labels,
+                           batch_size, smoke_test, num_epochs):
+    """Return a ``train_epoch(carry, epoch)`` closure for ``jax.lax.scan``.
+
+    Internally creates the per-batch function via ``_make_train_batch_fn``.
+    """
+    train_batch_fn = _make_train_batch_fn(
+        s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
+        t_sample_fn=t_sample_fn, lora_rho=lora_rho, lora_rho_s=lora_rho_s,
+        rho_scheduler=rho_scheduler, eval_every_n_batch=eval_every_n_batch,
+        valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
+        get_best_params=get_best_params,
+        initial_cp_center=initial_cp_center, k=k,
+        train_input_ids=train_input_ids,
+        train_attention_mask=train_attention_mask,
+        train_labels=train_labels)
+    n_train_samples = train_labels.shape[0]
+
+    def _inf_mean(x):
+        mask = jnp.isfinite(x)
+        return jnp.where(mask, x, 0).sum() / mask.sum()
+
+    @scan_tqdm(num_epochs)
+    def train_epoch(carry, epoch):
+        rng_key = carry[0]
+        rng_key, subkey = random.split(rng_key)
+        shuffel_idx = random.permutation(subkey, n_train_samples)
+        shuffel_idx = es('(ib)->ib', shuffel_idx, b=batch_size)
+
+        # Limit number of batches for smoke test
+        if smoke_test:
+            smoke_batch_limit = 3
+            n_batches = min(smoke_batch_limit, shuffel_idx.shape[0])
+            shuffel_idx = shuffel_idx[:n_batches]
+            jax.debug.print(f"Smoke test: Limited to {n_batches} batches per epoch")
+
+        # train on batches
+        carry, metrics = jax.lax.scan(train_batch_fn, carry, shuffel_idx)
+        val_loss_ = _inf_mean(metrics['val_loss'])
+        val_acc_ = _inf_mean(metrics['val_acc'])
+        jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}",
+                        epoch + 1, num_epochs, metrics['loss'][-1], val_loss_, val_acc_)
+        return carry, metrics
+
+    return train_epoch
+
+
+def _make_expert_step_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
+                           eval_every_n_batch, valid_metrics_fn, empty_metric,
+                           get_best_params, num_steps, batch_size, window_size):
+    """Return a ``_train_expert_step(carry, step)`` closure for ``jax.lax.scan``."""
+
+    @scan_tqdm(num_steps)
+    def _train_expert_step(carry, step):
+        rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all) = carry
+        rng_key, subkey = random.split(rng_key)
+
+        t = random.uniform(subkey, (1,), minval=0., maxval=1.)
+
+        # get batch from data
+        pos = jnp.round(t * x_all.shape[0]).squeeze().astype(int)
+        rng_key, subkey = random.split(rng_key)
+        idx = random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size // 2
+        idx %= x_all.shape[0]  # wrap around
+        x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
+        atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
+        y_ = jnp.take(y_all, idx, axis=0, mode='clip')
+
+        t = t_sample_fn(subkey)
+        loss, params, opt_state, (grad_, logs) = s_model.train_step(
+            subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
+        # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
+        current_lr = lr_schedule(step)
+
+        # validate
+        rng_key, valid_key = random.split(rng_key)
+        metrics = jax.lax.cond((step % eval_every_n_batch) == 0, lambda x: valid_metrics_fn(
+            valid_key, params)[0], lambda x: empty_metric[0], None)
+        best_params = jax.lax.cond(
+            metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
+        best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
+
+        return (rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all)), \
+            {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
+
+    return _train_expert_step
+
+
+# ---------------------------------------------------------------------------
+# Training pipeline helpers
+# ---------------------------------------------------------------------------
+
+def _setup_t_sample_fn(s_model, curve_sampling_mode):
+    """Create t-sampling function based on curve sampling mode.
+
+    Args:
+        s_model: Subspace model with ``curve_mask`` and ``t_max`` attributes.
+        curve_sampling_mode: ``'per_leave'`` or ``'combined'`` (and variants).
+
+    Returns:
+        Callable ``(key) -> t`` value(s).
+    """
+    t_max = getattr(s_model, 't_max', 1.0)
+    if curve_sampling_mode == 'per_leave':
+        print("Using per-leave curve sampling")
+        only_curves = jax.tree.map(lambda m: True if m else None, s_model.curve_mask)
+        num_curve_leaves = len(jax.tree.leaves(only_curves))
+        struct = jax.tree.structure(only_curves)
+
+        def t_sample_fn(key):
+            t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=t_max)
+            t_tree = jax.tree.unflatten(struct, t_flatt)
+            t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree,
+                                   is_leaf=lambda x: x is None)
+            return t_tree
+    else:
+        def t_sample_fn(key):
+            return random.uniform(key, (1,), minval=0., maxval=t_max)
+    return t_sample_fn
+
+
+def _setup_validation(s_model, params, val_input_ids, val_attention_mask,
+                       val_labels, batch_size_eval, k,
+                       lora_rho=0.0, lora_rho_s=0.0):
+    """Set up validation metrics function and best-parameter tracking.
+
+    If *val_input_ids* is ``None``, returns no-op stubs.
+
+    Returns:
+        ``(valid_metrics_fn, empty_metric, get_best_params)``
+    """
+    empty_metric = _empty_val_metric()
+    has_val = val_input_ids is not None
+
+    if has_val:
+        print("save best parameters")
+        valid_metrics_fn_inner = setup_metrics(
+            s_model, batch_size_eval, val_input_ids, val_attention_mask, val_labels,
+            n_samples=10 if k > 0 else 1, key_prefix='val_')
+
+        def valid_metrics_fn(rng, params):
+            if lora_rho > 0.0 or lora_rho_s > 0.0:
+                params = s_model.set_lora_rho(rho_w=0.0, rho_s=0.0, params=params)
+            return valid_metrics_fn_inner(rng, params)
+
+        def get_best_params(params):
+            return s_model.only_trainable_params(params['params'])
+    else:
+        valid_metrics_fn = lambda rng, params: empty_metric
+        def get_best_params(params):
+            return None
+
+    return valid_metrics_fn, empty_metric, get_best_params
+
+
+def _setup_rho_scheduler(lora_params, num_steps):
+    """Create rho scheduler for LoRA noise annealing.
+
+    Returns:
+        Callable ``(step, base_rho) -> current_rho``.
+    """
+    if lora_params and lora_params.get('rho_scheduler_frequency', 0.0) > 0.0:
+        frequency = lora_params['rho_scheduler_frequency']
+        base_frequency = num_steps / (2 * frequency)
+        print(f"Using cosine rho schedule with total steps {num_steps}")
+
+        def rho_scheduler(x, base):
+            return base * (1 - jnp.cos(x / base_frequency * jnp.pi))
+        return rho_scheduler
+    else:
+        return lambda step, base: base
+
+
+def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
+                       artifact_weights_use=False):
+    """Build evaluation specification list based on curve degree.
+
+    Args:
+        k: Bézier curve degree (0 = single point / pretraining).
+        curve_sampling_mode: ``'combined'``, ``'per_leave'``, ``'combined_noBMA'``, etc.
+        has_train_data: Whether training data is available for eval.
+        has_val: Whether validation data is available.
+        artifact_weights_use: Pre-computed weights artifact, if any.
+
+    Returns:
+        Ordered list of eval specification dicts for ``run_evaluation``.
+    """
+    eval_specs = []
+
+    # 1) Always: test with linspace -> summary (+ plot_curve if k > 0)
+    _test_metrics: list[str | dict] = ['summary']
+    if k > 0:
+        _test_metrics.append({'name': 'plot_curve', 'plot_title': 'Final testset'})
+    eval_specs.append({
+        'name': 'test', 'sampling': 'linspace', 'key_prefix': 'final_',
+        'metrics': _test_metrics,
+    })
+
+    # 2) Curve-specific evaluation (k > 0)
+    if k > 0:
+        if curve_sampling_mode == 'combined':
+            # Posterior weights from train data
+            if has_train_data:
+                print("Compute posterior weights on train set")
+                eval_specs.append({
+                    'name': 'train', 'sampling': 'linspace',
+                    'key_prefix': 'f_train_',
+                    'metrics': [
+                        'post_pred', 'mutual_info', 'entropy_along_curve',
+                        {'name': 'plot_curve', 'plot_title': 'Final trainset'},
+                        'compute_posterior_weights',
+                    ],
+                })
+            elif artifact_weights_use:
+                eval_specs.append({
+                    'name': 'test', 'sampling': 'linspace',
+                    'key_prefix': '_tmp_',
+                    'metrics': ['load_posterior_weights'],
+                })
+
+            if has_val:
+                # Find best temperature on validation set
+                eval_specs.append({
+                    'name': 'val', 'sampling': 'linspace',
+                    'key_prefix': 'final_valid_',
+                    'metrics': ['best_temperature'],
+                })
+                # Apply best weight from val to test
+                eval_specs.append({
+                    'name': 'test', 'sampling': 'linspace',
+                    'key_prefix': 'post_pred_test_ppd_',
+                    'metrics': [
+                        {'name': 'post_pred', 'weight_key': 'best_weight'},
+                        {'name': 'mutual_info', 'weight_key': 'best_weight'},
+                        {'name': 'mean_entropy', 'weight_key': 'best_weight'},
+                    ],
+                })
+            else:
+                # Per-temperature analysis on test
+                eval_specs.append({
+                    'name': 'test', 'sampling': 'linspace',
+                    'key_prefix': 'post_pred_test_ppd_',
+                    'metrics': [
+                        'post_pred_per_temp',
+                        'mutual_info_per_temp',
+                        'mean_entropy_per_temp',
+                    ],
+                })
+
+            # Entropy along curve on test (always for combined mode)
+            eval_specs.append({
+                'name': 'test', 'sampling': 'linspace',
+                'key_prefix': '',
+                'metrics': ['entropy_along_curve'],
+            })
+
+        else:
+            # Non-combined mode (per_leaf, combined_noBMA, etc.)
+            use_t_sample = 'combined' not in curve_sampling_mode
+            eval_specs.append({
+                'name': 'test',
+                'sampling': 't_sample' if use_t_sample else 'linspace',
+                'key_prefix': 'approx_',
+                'metrics': [
+                    'post_pred', 'mutual_info', 'mean_entropy',
+                    'entropy_along_curve',
+                ],
+            })
+
+    return eval_specs
+
+
+def _run_eval_phase(*, rng_key, s_model, params, k, data,
+                     curve_sampling_mode, batch_size_eval, t_sample_fn,
+                     temperature, lora_rho=0.0, lora_rho_s=0.0,
+                     logger, logger_prefix, smoke_test,
+                     artifact_weights_use=False):
+    """Disable LoRA noise and run the modular evaluation pipeline.
+
+    Args:
+        data: ``DataSplits`` with all dataset arrays.
+
+    Returns:
+        params (possibly modified with LoRA rho set to zero).
+    """
+    # Disable LoRA noise for evaluation
+    if lora_rho > 0.0 or lora_rho_s > 0.0:
+        params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+
+    eval_specs = _build_eval_specs(
+        k, curve_sampling_mode,
+        has_train_data=data.has_train, has_val=data.has_val,
+        artifact_weights_use=artifact_weights_use)
+
+    run_evaluation(
+        s_model=s_model, params=params, rng_key=rng_key,
+        data=data, eval_specs=eval_specs,
+        batch_size_eval=batch_size_eval, t_sample_fn=t_sample_fn,
+        temperature=temperature, logger=logger,
+        logger_prefix=logger_prefix, smoke_test=smoke_test, k=k,
+        artifact_weights=artifact_weights_use if artifact_weights_use else None,
+    )
+
+    return params
+
+
+def _run_training_phase(*, rng_key, s_model, optimizer, params, opt_state,
+                         data, cosine_sim,
+                         lr_schedule, t_sample_fn, dataset_sampling,
+                         lora_rho, lora_rho_s, rho_scheduler,
+                         eval_every_n_batch,
+                         valid_metrics_fn, empty_metric, get_best_params,
+                         batch_size, num_epochs, num_steps,
+                         k, smoke_test,
+                         logger, logger_prefix, scan_fn=None):
+    """Execute one training phase (expert or minibatch) and log metrics.
+
+    If *scan_fn* is provided it is reused (avoids JAX retrace across pretraining
+    iterations); otherwise a new ``@jit`` scan wrapper is created.
+
+    Returns:
+        ``(rng_key, params, last_trainable_params, scan_fn)``
+    """
+    if num_steps <= 0:
+        return rng_key, params, None, scan_fn
+
+    # Initialize best-parameter tracking
+    best_val_ll = -np.inf
+    best_params = s_model.only_trainable_params(params['params']) if data.has_val else None
+
+    ds_sampling = list(dataset_sampling.keys())[0]
+    train_input_ids = data.train_input_ids
+    train_attention_mask = data.train_attention_mask
+    train_labels = data.train_labels
+
+    # Initial CP center for curve metrics
+    cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+    initial_cp_center = cp_w.mean(axis=0)
+
+    if ds_sampling == 'expert':
+        print(f"Start sorted expert training for {num_steps}")
+        sort_mode = dataset_sampling['expert'].get('sort_mode', False)
+        if sort_mode == 'Random':
+            order = random.permutation(rng_key, train_input_ids.shape[0])
+            train_input_ids = train_input_ids[order]
+            train_attention_mask = train_attention_mask[order]
+            train_labels = train_labels[order]
+        elif sort_mode:
+            assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
+            distance = 1 - cosine_sim
+            if sort_mode == 'Hierarchical':
+                condensed = squareform(distance, checks=False)
+                Z = hierarchy.linkage(condensed, method='average')
+                Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
+                order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
+                order = jnp.array(order)
+            elif sort_mode == 'Spectral':
+                distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
+                D = jnp.diag(distance.sum(axis=1))
+                L = D - distance
+                vals, vecs = jnp.linalg.eigh(L)
+                fiedler = vecs[:, -2]
+                order = jnp.argsort(fiedler)
+            elif sort_mode == 'First_data':
+                order = jnp.argsort(distance[0])
+            else:
+                raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
+            train_input_ids = train_input_ids[order]
+            train_attention_mask = train_attention_mask[order]
+            train_labels = train_labels[order]
+            print(f"Data sorted for expert sampling using {sort_mode} method")
+
+        window_size = dataset_sampling['expert']['window_size']
+        window_size = max(batch_size, window_size)
+        train_expert_step = _make_expert_step_fn(
+            s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
+            t_sample_fn=t_sample_fn, eval_every_n_batch=eval_every_n_batch,
+            valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
+            get_best_params=get_best_params, num_steps=num_steps,
+            batch_size=batch_size, window_size=window_size)
+
+        carry = (rng_key, params, opt_state, best_val_ll, best_params,
+                 (train_input_ids, train_attention_mask, train_labels))
+        if scan_fn is None:
+            @jit
+            def scan_fn(carry, xs):
+                return jax.lax.scan(train_expert_step, carry, xs)
+        carry, metrics = scan_fn(carry, jnp.arange(num_steps))
+
+    elif ds_sampling == 'minibatch':
+        print(f"Start minibatch training for {num_epochs} epochs")
+        train_epoch_fn = _make_train_epoch_fn(
+            s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
+            t_sample_fn=t_sample_fn, lora_rho=lora_rho, lora_rho_s=lora_rho_s,
+            rho_scheduler=rho_scheduler, eval_every_n_batch=eval_every_n_batch,
+            valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
+            get_best_params=get_best_params,
+            initial_cp_center=initial_cp_center, k=k,
+            train_input_ids=train_input_ids,
+            train_attention_mask=train_attention_mask,
+            train_labels=train_labels,
+            batch_size=batch_size, smoke_test=smoke_test,
+            num_epochs=num_epochs)
+
+        carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
+        if scan_fn is None:
+            @jit
+            def scan_fn(carry, xs):
+                return jax.lax.scan(train_epoch_fn, carry, xs)
+        carry, metrics = scan_fn(carry, jnp.arange(num_epochs))
+    else:
+        raise ValueError(f"Unknown dataset_sampling method {ds_sampling}. Choose 'expert' or 'minibatch'.")
+
+    # Clean up inf values from lazy validation
+    for key, value in metrics.items():
+        if key.startswith('val_'):
+            metrics[key] = jnp.array(value).flatten()[::eval_every_n_batch].repeat(
+                eval_every_n_batch, axis=0)[:num_steps]
+        else:
+            metrics[key] = jnp.array(value).flatten()
+
+    # Log all metrics
+    _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
+
+    # Log metrics as artifact
+    epochs = np.repeat(np.arange(num_epochs), num_steps // batch_size)
+    jnp.savez(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz', **metrics, epochs=epochs)
+    art = wandb.Artifact(name="metrics", type="npz")
+    art.add_file(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz')
+    logger.log_artifact(art)
+
+    # Extract results from carry
+    rng_key = carry[0]
+    params = carry[1]
+    last_trainable_params = None
+    if data.has_val:
+        last_trainable_params = s_model.only_trainable_params(params['params'])
+        best_curve_params = carry[4]
+        params['params'] = jax.tree.map(
+            lambda x, y, m: x if m else y,
+            best_curve_params, params['params'], s_model.train_mask)
+
+    if k > 0:
+        cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+        length = _bezier_length(cp)
+        logger.summary.update({'Curve length': length})
+
+    return rng_key, params, last_trainable_params, scan_fn
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stage functions – called by train() orchestrator
+# ---------------------------------------------------------------------------
+
+def _build_lr_schedule(curve_params):
+    """Build optax learning-rate schedule from config.
+
+    Mutates ``curve_params['optimizer_conf']['kwargs']['learning_rate']``
+    in-place (replaces the raw dict/float with the optax schedule object).
+    """
+    lr_conf = curve_params['optimizer_conf']['kwargs']['learning_rate']
+    if isinstance(lr_conf, dict):
+        lr_schedule = getattr(optax, lr_conf['name'])(**lr_conf['kwargs'])
+    else:
+        lr_schedule = optax.constant_schedule(lr_conf)
+    curve_params['optimizer_conf']['kwargs']['learning_rate'] = lr_schedule
+    return lr_schedule
+
+
+def _prepare_datasets(rng_key, config, logger):
+    """Load data, resolve model path, build LR schedule, prepare splits.
+
+    Returns:
+        ``(data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key)``
+    """
+    curve_params = config['curve_params']
+    BATCH_SIZE = curve_params['batch_size']
+
+    # Load train and test data
+    input_ids, attention_mask, labels, target_ids, unique_target_ids = \
+        load_text_classification_data(config['dataset_path'], run=logger)
+    print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
+
+    test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = \
+        load_text_classification_data(config['dataset_path'], run=logger, test=True)
+    print(f"Target token IDs: {unique_target_ids}")
+
+    # Resolve model path
+    if config['net_kwargs']['model_path'].startswith('ddold/'):
+        model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
+        config['net_kwargs']['model_path'] = model_artifact.download()
+
+    # Build learning rate schedule
+    lr_schedule = _build_lr_schedule(curve_params)
+
+    # Prepare train / val / test splits
+    rng_key, split_key = random.split(rng_key)
+    perm_idx = random.permutation(split_key, len(input_ids))
+    num_epochs_cfg = curve_params.get('num_epochs', -1)
+    num_steps_cfg = curve_params.get('num_steps', -1)
+    val_percentage = curve_params.get('val_percentage', 0.0)
+    assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), \
+        "Only one of num_epochs or num_steps should be > 0"
+
+    has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
+    if has_train_data:
+        num_epochs = num_epochs_cfg
+        num_steps = num_steps_cfg
+        if num_steps > 0:
+            num_epochs = int(np.ceil(1. * num_steps * BATCH_SIZE / len(input_ids)))
+            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
+        num_steps = int(np.ceil(1. * num_epochs * len(input_ids) / BATCH_SIZE))
+        print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
+
+        n_train = int(np.floor((1. - val_percentage) * len(input_ids) / BATCH_SIZE) * BATCH_SIZE)
+        ordered_ids = input_ids[perm_idx]
+        ordered_mask = attention_mask[perm_idx]
+        ordered_labels = labels[perm_idx]
+
+        train_input_ids = ordered_ids[:n_train]
+        train_attention_mask = ordered_mask[:n_train]
+        train_labels = ordered_labels[:n_train]
+        val_input_ids = ordered_ids[n_train:]
+        val_attention_mask = ordered_mask[n_train:]
+        val_labels = ordered_labels[n_train:]
+        has_val = len(val_input_ids) > 0
+        if has_val:
+            print("Validation data are used")
+        print(f"Training data: {len(train_input_ids)} samples, "
+              f"Validation data: {len(val_input_ids)} samples")
+    else:
+        train_input_ids = train_attention_mask = train_labels = None
+        val_input_ids = val_attention_mask = val_labels = None
+        num_epochs = num_steps = 0
+        has_val = False
+
+    # Normalise empty val arrays to None for DataSplits.has_val
+    if not has_val:
+        val_input_ids = val_attention_mask = val_labels = None
+
+    data = DataSplits(
+        train_input_ids=train_input_ids,
+        train_attention_mask=train_attention_mask,
+        train_labels=train_labels,
+        val_input_ids=val_input_ids,
+        val_attention_mask=val_attention_mask,
+        val_labels=val_labels,
+        test_input_ids=test_input_ids,
+        test_attention_mask=test_attention_mask,
+        test_labels=test_labels,
+    )
+
+    return data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key
+
+
+def _parse_hyperparams(config, *, unique_target_ids, num_epochs, num_steps,
+                        lr_schedule):
+    """Extract hyperparameters from *config* into a ``TrainHyperparams``.
+
+    Pops ``cp_fix`` from ``curve_params``.
+    """
+    curve_params = config['curve_params']
+    cp_fix = curve_params.pop('cp_fix')
+    print(f"Control point fixed list: {cp_fix}")
+
+    batch_size = curve_params['batch_size']
+    return TrainHyperparams(
+        cp_fix=cp_fix,
+        batch_size=batch_size,
+        batch_size_eval=batch_size * 2,
+        eval_every_n_batch=config['eval_every_n_batch'],
+        num_epochs=num_epochs,
+        num_steps=num_steps,
+        save_params=config.get('save_params', False),
+        smoke_test=config.get('smoke_test', False),
+        lora_params=config.get('lora_params', None),
+        lora_rho=curve_params.get('model_params', {}).get('lora_rho', 0.0),
+        lora_rho_s=curve_params.get('model_params', {}).get('lora_rho_s', 0.0),
+        dataset_sampling=config.get('dataset_sampling', {}),
+        ds_sampling=list(config.get('dataset_sampling', {}).keys())[0],
+        curve_sampling_mode=curve_params.get('curve_sampling_mode', 'combined'),
+        temperature=curve_params.get('temperature', [1.0]),
+        lr_schedule=lr_schedule,
+        deg_segments=curve_params.get('model_params', {}).get('curve_segment', False),
+        indep_connected=curve_params.get('model_params', {}).get('indepent_connected', False),
+        unique_target_ids=unique_target_ids,
+        net_kwargs=config['net_kwargs'],
+        curve_params=curve_params,
+    )
+
+
+def _compute_expert_embeddings(model, params, data, hp):
+    """Compute cosine-similarity matrix for expert sorting, if needed.
+
+    Returns ``None`` when expert sorting is not configured or not required.
+    """
+    if (hp.ds_sampling != 'expert') or (hp.num_steps <= 0) or not data.has_train:
+        return None
+    sort_mode = hp.dataset_sampling['expert'].get('sort_mode', False)
+    if not sort_mode or sort_mode == 'Random':
+        return None
+    print("compute embeddings for expert sort")
+    embedding = get_embedding(
+        data.train_input_ids, data.train_attention_mask,
+        model, params, hp.batch_size)
+    print(f"Computed embeddings for expert sort with shape {embedding.shape}")
+    device = embedding.device
+    embedding = jax.device_put(embedding, jax.devices("cpu")[0])
+    embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
+    embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
+    cosine_sim = jax.device_put(jnp.dot(embedding, embedding.T), device)
+    print(f"Computed cosine similarity matrix with shape {cosine_sim.shape}")
+    del embedding
+    return cosine_sim
+
+
+def _setup_training_env(*, rng_key, k, hp, data, fixed_cps_train_params=False):
+    """Create model, subspace, optimizer, and all training support objects.
+
+    Handles both k=0 (pretraining) and k>0 (curve fitting) cases.
+    For k=0, ``env.base_params`` provides a pristine copy for per-CP
+    re-initialisation.
+
+    Returns:
+        ``(env, rng_key)`` where *env* is a ``TrainingEnv``.
+    """
+    curve_params = hp.curve_params
+
+    model = QwenTextClassificationWrapper(
+        **hp.net_kwargs, target_token_ids=hp.unique_target_ids)
+    base_params = unfreeze(model.init(None, None))
+
+    optimizer_conf = deepcopy(curve_params['optimizer_conf'])
+    model_params = dict(curve_params.get('model_params', {}))
+    rng_key, init_key = random.split(rng_key)
+
+    if k == 0:
+        model_params['curve_segment'] = False  # no segments at k=0
+        s_model, curve_mask, train_mask, _ = _create_subspace_model(
+            model=model, params_tree=base_params['params'], k=0,
+            filter_masks=curve_params.get('filter_masks', []),
+            optimizer_conf=optimizer_conf,
+            lora_params=hp.lora_params,
+            model_params=model_params,
+            subspace_model=curve_params['subspace_model'])
+
+        # Init once to set s_model internal state (curve_mask, LoRA structs)
+        params = jax.tree.map(lambda x: x, base_params)
+        params = _init_subspace_params(
+            s_model, params, curve_mask, train_mask, init_key,
+            curve_params.get('jitter_multiplier', 0.0), hp.lora_params)
+    else:
+        s_model, params, _, curve_mask, train_mask = _build_subspace_model(
+            model=model, params=base_params, k=k,
+            filter_masks=curve_params.get('filter_masks', []),
+            optimizer_conf=optimizer_conf,
+            lora_params=hp.lora_params,
+            model_params=model_params,
+            subspace_model=curve_params['subspace_model'],
+            jitter_multiplier=curve_params.get('jitter_multiplier', 0.0),
+            init_key=init_key,
+            fixed_cps_train_params=fixed_cps_train_params)
+        base_params = None  # not needed for curve phase
+
+    # Build optimizer
+    optimizer, opt_state, n_trainable = _build_optimizer(
+        optimizer_conf=optimizer_conf, s_model=s_model,
+        params=params, fixed_cps_train_params=fixed_cps_train_params)
+
+    # Expert embeddings
+    cosine_sim = _compute_expert_embeddings(model, params, data, hp)
+
+    # t sampling, rho scheduler, validation
+    t_sample_fn = _setup_t_sample_fn(s_model, hp.curve_sampling_mode)
+    rho_scheduler = _setup_rho_scheduler(hp.lora_params, hp.num_steps)
+
+    if data.has_train:
+        valid_metrics_fn, empty_metric, get_best_params = \
+            _setup_validation(
+                s_model, params, data.val_input_ids, data.val_attention_mask,
+                data.val_labels, hp.batch_size_eval, k=k,
+                lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s)
+    else:
+        empty_metric = _empty_val_metric()
+        valid_metrics_fn = lambda rng, params: empty_metric
+        get_best_params = lambda params: None
+
+    env = TrainingEnv(
+        s_model=s_model, params=params, base_params=base_params,
+        curve_mask=curve_mask, train_mask=train_mask,
+        optimizer=optimizer, opt_state=opt_state,
+        t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
+        valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
+        get_best_params=get_best_params,
+        cosine_sim=cosine_sim, n_trainable=n_trainable)
+
+    return env, rng_key
+
+
+def _pretrain_fixed_cps(rng_key, hp, data, logger, artifact):
+    """Train each fixed control point independently (k=0).
+
+    Returns:
+        ``(train_params, rng_key)``
+    """
+    cp_fix = hp.cp_fix
+    curve_params = hp.curve_params
+
+    # Validation checks
+    if hp.deg_segments:
+        all_segments_fixed_endpoints = np.all(
+            [hp.deg_segments == i for i in np.diff(
+                np.argwhere(np.array(cp_fix) == 1).flatten())])
+        assert all_segments_fixed_endpoints, (
+            "In curve segment mode, fixed control points must be consecutive "
+            "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
+    if hp.lora_params is not None and np.sum(cp_fix) < len(cp_fix):
+        _lora_mode = curve_params.get('model_params', {}).get('lora_mode', '')
+        assert _lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
+            "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
+            "subspace curves with fixed control points")
+
+    # Setup training environment for k=0
+    env, rng_key = _setup_training_env(k=0, hp=hp, data=data, rng_key=rng_key)
+
+    # Pretraining loop
+    train_params = []
+    scan_fn = None
+    print("Pretraining fixed control points")
+    for i, fixed in enumerate(cp_fix):
+        if fixed:
+            print(f"Training cp member {i}")
+            rng_key, init_key = random.split(rng_key)
+            params = jax.tree.map(lambda x: x, env.base_params)
+            params = _init_subspace_params(
+                env.s_model, params, env.curve_mask, env.train_mask, init_key,
+                curve_params.get('jitter_multiplier', 0.0), hp.lora_params)
+
+            # Re-init optimizer state
+            only_train = env.s_model.only_trainable_params(params['params'])
+            opt_state = env.optimizer.init(only_train)
+
+            # Train
+            rng_key, params, _, scan_fn = _run_training_phase(
+                rng_key=rng_key,
+                s_model=env.s_model, optimizer=env.optimizer,
+                params=params, opt_state=opt_state,
+                data=data, cosine_sim=env.cosine_sim,
+                lr_schedule=hp.lr_schedule, t_sample_fn=env.t_sample_fn,
+                dataset_sampling=hp.dataset_sampling,
+                lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s,
+                rho_scheduler=env.rho_scheduler,
+                eval_every_n_batch=hp.eval_every_n_batch,
+                valid_metrics_fn=env.valid_metrics_fn, empty_metric=env.empty_metric,
+                get_best_params=env.get_best_params,
+                batch_size=hp.batch_size,
+                num_epochs=hp.num_epochs, num_steps=hp.num_steps,
+                k=0, smoke_test=hp.smoke_test,
+                logger=logger, logger_prefix=f'cp_fixed_{i}_',
+                scan_fn=scan_fn)
+
+            # Evaluate
+            _run_eval_phase(
+                s_model=env.s_model, params=params,
+                rng_key=rng_key, k=0,
+                t_sample_fn=env.t_sample_fn,
+                logger=logger, logger_prefix=f'cp_fixed_{i}_',
+                data=data, **hp.eval_common)
+
+            train_params.append(env.s_model.only_trainable_params(params['params']))
+            rng_key, _ = random.split(rng_key)
+        else:
+            train_params.append(False)
+
+    del env  # free GPU memory before curve phase
+
+    if hp.save_params:
+        print("Save pretrained trainable params ...")
+        np.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
+        time.sleep(1)
+        print("Saved pretrained parameters to tmp_files")
+        artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
+
+    return train_params, rng_key
+
+
+def _train_full_curve(rng_key, hp, data, train_params, logger, artifact):
+    """Fit the full Bézier curve (k > 0), evaluate, and save parameters.
+
+    Args:
+        train_params: Pretrained control-point params (list or ``False``).
+    """
+    cp_fix = hp.cp_fix
+    k = len(cp_fix) - 1
+    all_fixed = len(cp_fix) == np.sum(cp_fix)
+
+    print("Training curve model")
+    if np.sum(cp_fix) == 0:
+        print("No fixed control points, training full curve with all control points free.")
+        if hp.deg_segments:
+            assert hp.indep_connected is True, (
+                "In curve segment mode with no fixed control points, curve "
+                "optimization only makes sense if all segments are "
+                "independently connected.")
+
+    # Setup training environment for k > 0
+    env, rng_key = _setup_training_env(
+        k=k, hp=hp, data=data, rng_key=rng_key,
+        fixed_cps_train_params=train_params)
+
+    # Log parameter stats
+    n_params = sum(
+        p.size if isinstance(p, jnp.ndarray) else 0
+        for p in jax.tree.flatten(env.params)[0])
+    param_memory = sum(
+        p.size * p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0
+        for p in jax.tree.flatten(env.params)[0])
+    logger.summary.update({
+        'n_params': n_params,
+        'memory_params': param_memory,
+        'n_params_trainable': env.n_trainable,
+    })
+    print(f"Number of parameters: {n_params:_}\n"
+          f"Memory of parameters: {param_memory / (1024**2):_}MB")
+
+    # Train (unless all CPs are fixed → eval-only)
+    if not all_fixed:
+        rng_key, params, last_trainable_params, _ = _run_training_phase(
+            rng_key=rng_key,
+            s_model=env.s_model, optimizer=env.optimizer,
+            params=env.params, opt_state=env.opt_state,
+            data=data, cosine_sim=env.cosine_sim,
+            lr_schedule=hp.lr_schedule, t_sample_fn=env.t_sample_fn,
+            dataset_sampling=hp.dataset_sampling,
+            lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s,
+            rho_scheduler=env.rho_scheduler,
+            eval_every_n_batch=hp.eval_every_n_batch,
+            valid_metrics_fn=env.valid_metrics_fn, empty_metric=env.empty_metric,
+            get_best_params=env.get_best_params,
+            batch_size=hp.batch_size,
+            num_epochs=hp.num_epochs, num_steps=hp.num_steps,
+            k=k, smoke_test=hp.smoke_test,
+            logger=logger, logger_prefix='')
+    else:
+        params = env.params
+        last_trainable_params = None
+
+    # Evaluate
+    _run_eval_phase(
+        s_model=env.s_model, params=params,
+        rng_key=rng_key, k=k,
+        t_sample_fn=env.t_sample_fn,
+        logger=logger, logger_prefix='',
+        data=data, **hp.eval_common)
+
+    # Save curve params
+    if hp.save_params:
+        print("Save final trainable params ...")
+        np.save(f'tmp_files/{logger.id}_trainable_params.npy',
+                env.s_model.only_trainable_params(params['params']))
+        if last_trainable_params is not None:
+            np.save(f'tmp_files/{logger.id}_last_trainable_params.npy',
+                    last_trainable_params)
+        time.sleep(1)
+        print("Saved trainable parameters to tmp_files")
+        artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
+        if last_trainable_params is not None:
+            artifact.add_file(f'tmp_files/{logger.id}_last_trainable_params.npy')
+
+
 def main():
     logger = wandb.init()
     config = wandb.config
@@ -301,1104 +1909,29 @@ def main():
 
 
 def train(logger, config):
-    """
-    Main training function for Qwen curve fine-tuning
-    
-    Args:
-        logger: Wandb logger
-        config: Training configuration
-    """
-    # jax.clear_caches()
+    """Main training orchestrator for Qwen curve fine-tuning."""
     rng_key = random.PRNGKey(config['rng_seed'])
-    EVAL_EVERY_N_BATCH = config['eval_every_n_batch']
-    BATCH_SIZE_EVAL = config['curve_params']['batch_size'] * 2
-    SAVE_PARAMS = config.get('save_params', False)
-    SWEEP_PARAM_PATH = config.get('load_params_path', False)
-    
-    LOG_CURVE_METRICS = True # whether to log curve metrics like length and mutual information during training (can slow down training)
-
-    # Create artifact for storing parameters
-    # if SAVE_PARAMS:
     artifact = wandb.Artifact(name="params", type="pytree")
 
-    input_ids, attention_mask, labels, target_ids, unique_target_ids = load_text_classification_data(config['dataset_path'], run=logger)
-    # shuffle once for train/val split
-    rng_key, split_key = random.split(rng_key)
-    perm_idx = random.permutation(split_key, len(input_ids))
-    print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
-
-    test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = load_text_classification_data(config['dataset_path'], run=logger, test=True)
-    print(f"Target token IDs: {unique_target_ids}")
-
-    # Load Qwen model once
-    if config['net_kwargs']['model_path'].startswith('ddold/'):
-        model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
-        config['net_kwargs']['model_path'] = model_artifact.download()
-
-    # Configure optimizer kwargs
-    if isinstance(config['curve_params']['optimizer_conf']['kwargs']['learning_rate'], dict):
-        lr_schedule = getattr(optax, config['curve_params']['optimizer_conf']['kwargs']['learning_rate']['name'])(
-            **config['curve_params']['optimizer_conf']['kwargs']['learning_rate']['kwargs'])
-    else:
-        lr_schedule = optax.constant_schedule(config['curve_params']['optimizer_conf']['kwargs']['learning_rate'])
-    config['curve_params']['optimizer_conf']['kwargs']['learning_rate'] = lr_schedule
-
-    def train_curve_inner(rng_key,
-                         curve_state: ProcessState,
-                         k: int,
-                         num_epochs: int,
-                         batch_size: int,
-                         optimizer_conf: dict,
-                         natural_parameterization: bool,
-                         gravity: float,
-                         energy_weakening: float,
-                         regularizer: str|bool,
-                         dataset_path: str,
-                         entropy_maxim: float,
-                         fixed_cps_train_params: list|bool = False,
-                         filter_masks: list = None,
-                         lora_params: dict = None,
-                         net_kwargs: dict = None,
-                         weight_decay: float = 0.0,
-                         jitter_multiplier: float = 0.0,
-                         smoke_test: bool = False,
-                         num_steps: int = -1,  # num steps are either given or computed from num_epochs
-                         temperature: list = [1.0,],
-                         dataset_sampling: dict = None,
-                         val_percentage: float = 0.0,
-                         curve_parameterization = 'bezier',
-                         curve_segment: int | bool = False,
-                         indepent_connected: bool = False,
-                         curve_sampling_mode: str = 'combined', # 'combined', 'per_leave'
-                         logger_prefix: str = '',
-                         _cached_s_model=None,
-                         _cached_optimizer=None,
-                         _cached_scan_jit=None,
-                         ):
-        # Note: jitter parameter is unused but kept for interface compatibility
-        rng_key, init_key = random.split(rng_key)
-        # Load dataset
-        assert not ((num_epochs > 0) and (num_steps > 0)), "Only one of num_epochs or num_steps should be > 0"
-        val = False
-        if num_epochs > 0 or num_steps > 0:
-            # compute num_epochs if num_steps is given
-            if num_steps > 0:
-                num_epochs = int(np.ceil(1.*num_steps*batch_size / len(input_ids)))
-                print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
-            
-            num_steps = int(np.ceil(1.*num_epochs * len(input_ids) / batch_size))
-            print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
-
-            # Split data (simple train/val split) # we dont use validate data
-            n_train = int(np.floor((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
-            train_input_ids = input_ids[perm_idx][:n_train]
-            train_attention_mask = attention_mask[perm_idx][:n_train]
-            train_labels = labels[perm_idx][:n_train]
-            
-            val_input_ids = input_ids[perm_idx][n_train:]
-            val_attention_mask = attention_mask[perm_idx][n_train:]
-            val_labels = labels[perm_idx][n_train:]
-            if len(val_input_ids) > 0:
-                print("Validation data are used")
-                val = True
-            print(f"Training data: {len(train_input_ids)} samples, Validation data: {len(val_input_ids)} samples")
-
-        # load init model parameters
-        model = QwenTextClassificationWrapper(**net_kwargs, target_token_ids=unique_target_ids)
-        params = unfreeze(model.init(None, None))
-        dtype = jax.tree.leaves(params)[0].dtype
-
-        #compute embeddings for sorting if expert sampling is used
-        ds_sampling = list(dataset_sampling.keys())
-        assert len(ds_sampling) == 1, "Only one dataset_sampling apporach could be given"
-        ds_sampling = ds_sampling[0]
-        if (ds_sampling == 'expert') and (num_steps > 0):
-            print(f"compute embeddings for expert sort")
-            sort_mode = dataset_sampling['expert'].get('sort_mode', False)
-            if sort_mode and (sort_mode != 'Random'):
-                embedding = get_embedding(train_input_ids, train_attention_mask, model, params, batch_size)
-                print(f"Computed embeddings for expert sort with shape {embedding.shape}")
-                device = embedding.device
-                embedding = jax.device_put(embedding, jax.devices("cpu")[0])
-                embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
-                embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
-                # compute cosine similarity matrix  
-                cosine_sim = jax.device_put(jnp.dot(embedding, embedding.T), device)
-                print(f"Computed cosine similarity matrix with shape {cosine_sim.shape}")
-                del embedding
-                
-        
-        curve_mask = jax.tree.map(lambda x: False, params['params'])
-        # only if k > 0, otherwise no curve parameters are used
-        if k > 0:
-            for f in filter_masks:
-                curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-
-        if "freeze_other_params" in optimizer_conf and optimizer_conf["freeze_other_params"]:
-            train_mask = jax.tree.map(lambda x: False, params['params'])
-            # all curve and lora params are trainable
-            for f in filter_masks:
-                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-            if lora_params and lora_params['use_lora']:
-                for f in lora_params['filter_masks']:
-                    train_mask = filter_mask(train_mask, *f['keys'], as_curve=True, BoolschenOperator=eval(f['op']))
-        else:
-            train_mask = jax.tree.map(lambda x: True, params['params'])
-        # set LoRA mask for all parameters
-        lora_mask = jax.tree.map(lambda x: False, params['params'])  # LoRA mask for all parameters
-        if lora_params and lora_params['use_lora']:
-            for f in lora_params['filter_masks']:
-                lora_mask = filter_mask(lora_mask, *f['keys'], as_curve=np.array(f['dims']), BoolschenOperator=eval(f['op']))
-        # pprint.pprint(f"LoRA mask: {lora_mask}")
-        # pprint.pprint(f"Curve mask: {curve_mask}")
-        # pprint.pprint(f"Train mask: {train_mask}")
-
-        perm_spec = False
-
-        # add weight decay to optimizer if adamw is specified
-        if (weight_decay > 0.0) and (optimizer_conf['name'] == 'adamw'):
-            optimizer_conf['kwargs']['weight_decay'] = weight_decay
-            weight_decay = 0.0  # set to 0.0 to avoid double weight decay in model
-        if lora_params and lora_params['use_lora']:
-            print("Using LoRA with parameters:", lora_params)
-            if isinstance(regularizer, str):
-                if entropy_maxim > 0.0:
-                    s_model = LoRARepulsiveEntropyCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
-                                                                   model=model, k=k, weight_decay=weight_decay,
-                                                                   perm_spec=perm_spec,
-                                                                   natural_parameterization=natural_parameterization,
-                                                                   mutuable_param_name=False,
-                                                                   curve_parameterization=curve_parameterization,
-                                                                   curve_segment=curve_segment,
-                                                                   indepent_connected=indepent_connected,
-                                                                   gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
-                                                                   entropy_weight=entropy_maxim,)
-                else:
-                    s_model = LoRARepulsiveCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                            lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
-                                                            model=model, k=k, weight_decay=weight_decay,
-                                                            perm_spec=perm_spec,
-                                                            natural_parameterization=natural_parameterization,
-                                                            mutuable_param_name=False,
-                                                            curve_parameterization=curve_parameterization,
-                                                            curve_segment=curve_segment,
-                                                            indepent_connected=indepent_connected,
-                                                            gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-            else:
-                if entropy_maxim > 0.0:
-                    s_model = LoRAJSDCategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                      lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0), lora_rho_s=lora_params.get('lora_rho_s', 0.0),
-                                                      model=model, k=k, weight_decay=weight_decay, 
-                                                      perm_spec=perm_spec,
-                                                      natural_parameterization=natural_parameterization,
-                                                      mutuable_param_name=False,
-                                                      curve_parameterization=curve_parameterization,
-                                                      curve_segment=curve_segment,
-                                                      indepent_connected=indepent_connected,
-                                                      entropy_weight=entropy_maxim,
-                                                      )
-                else:
-                    s_model = LoRACategorySubspace(lora_mask=lora_mask, r=lora_params['r'], lora_dtype=lora_params['lora_dtype'], lora_alpha=lora_params['lora_alpha'], 
-                                                   lora_mode=lora_params['lora_mode'], lora_rho=lora_params.get('lora_rho', 0.0),  lora_rho_s=lora_params.get('lora_rho_s', 0.0),
-                                                   model=model, k=k, weight_decay=weight_decay, 
-                                                   perm_spec=perm_spec,
-                                                   natural_parameterization=natural_parameterization,
-                                                   mutuable_param_name=False,
-                                                   curve_parameterization=curve_parameterization,
-                                                   curve_segment=curve_segment,
-                                                   indepent_connected=indepent_connected,
-                                                   )
-        else:
-            if regularizer:
-                s_model = RepulsiveCategorySubspace(model=model, k=k, weight_decay=weight_decay,
-                                                   perm_spec=perm_spec,
-                                                   natural_parameterization=natural_parameterization,
-                                                   mutuable_param_name=False,
-                                                   curve_parameterization=curve_parameterization,
-                                                   curve_segment=curve_segment,
-                                                   indepent_connected=indepent_connected,
-                                                   gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
-            else:
-                s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
-                                           perm_spec=perm_spec,
-                                           natural_parameterization=natural_parameterization,
-                                           curve_parameterization=curve_parameterization,
-                                           curve_segment=curve_segment,
-                                           indepent_connected=indepent_connected,
-                                           mutuable_param_name=False)
-
-        # Reuse cached s_model to avoid JAX retrace on each CP pretraining iteration
-        if _cached_s_model is not None:
-            s_model = _cached_s_model
-
-        # initialize curve parameter with pretrained point parameter
-        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*random.normal(key, p.shape, dtype=p.dtype))
-
-        # set train mask according to config
-        # Only update mask for LoRA-capable subspaces
-        if lora_params and lora_params['use_lora']:
-            train_mask = s_model.update_mask_for_lora(train_mask, params['params'], b_off=False, w0_off=True) # w0 must be off for LoRA
-        s_model.set_train_mask(train_mask)
-        
-        #*** Fix control points handling ***#
-        #*** Map pretrained control points which are fixed into params vector ***#
-        if fixed_cps_train_params != False:
-            # if k > 0:
-            #     assert jax.tree.all(jax.tree.map(lambda x, y: x == y, s_model.train_mask, s_model.curve_mask)), "Pretraind Curve fitting requieres train mask and curve mask to be the same(Lora Params also Curve param)"
-            assert (len(fixed_cps_train_params) == (k+1)), "fixed_cps_train_params length must match k or be False"
-            for i,p in enumerate(fixed_cps_train_params):
-                if p != False:
-                    def map_fn(m,p,cp_f):
-                        if m:
-                            p = p.at[i].set(cp_f)
-                        return p
-                    params['params'] = jax.tree.map(map_fn, s_model.curve_mask, params['params'], p)
-
-        t_max = getattr(s_model, 't_max', 1.0)
-        if curve_sampling_mode == 'per_leave':
-            print("Using per-leave curve sampling")
-            # num_leaves_parameter = len(jax.tree.leaves(s_model.curve_mask))
-            # t_structure = jax.tree.structure(s_model.curve_mask)
-
-            # def t_sample_fn(key):
-            #     t_vec = jax.random.uniform(key, (num_leaves_parameter,), minval=0., maxval=1.)
-            #     t_tree = jax.tree.unflatten(t_structure, t_vec)
-            #     return t_tree
-            only_curves = jax.tree.map(lambda m: True if m else None, s_model.curve_mask)
-            num_curve_leaves = len(jax.tree.leaves(only_curves))
-            struct = jax.tree.structure(only_curves)
-
-            def t_sample_fn(key):
-                t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=t_max)
-                t_tree = jax.tree.unflatten(struct, t_flatt)
-                t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
-                return t_tree
-        else:
-            def t_sample_fn(key):
-                return random.uniform(key, (1,), minval=0., maxval=t_max)
-
-
-        artifact_weights_use = False
-        if SWEEP_PARAM_PATH:
-            raise NotImplementedError("Loading from sweep is not implemented in this version.")
-            print(f"Load parameters from sweep {SWEEP_PARAM_PATH}")
-            def prepare_config(cfg, with_dataset=True):
-                # cfg_copy = json.loads(json.dumps(cfg))
-                cfg_copy = deepcopy(dict(cfg))
-                if with_dataset:
-                    cfg_copy['dataset_path'] = "ddold/qwen_PtoC/obqa_dataset:v0"
-                    cfg_copy['curve_params']['num_steps'] = 5_000 
-                # cfg_copy['curve_params'].pop('num_steps', None) 
-                cfg_copy['curve_params'].pop('num_epochs', None)
-                cfg_copy['curve_params'].pop('temperature', None)
-                cfg_copy.pop('save_params', None)
-                cfg_copy.pop('smoke_test', None)
-                cfg_copy.pop('eval_every_n_batch', None)
-                cfg_copy.pop('load_params_path', None)
-                cfg_copy['net_kwargs']['model_path'] = cfg_copy['net_kwargs']['model_path'].split('/')[-1]
-                return cfg_copy
-            print("config:", config)
-            config_copy = prepare_config(config, with_dataset=True)
-            artifact_use = False
-            trainable_params = False
-            api = wandb.Api()
-
-            def load_art(run):
-                artifact_use, artifact_weights_use = False, False
-                print(f"Found config with obqa dataset with name: {run.name}, id: {run.id}")
-                for art_l in run.logged_artifacts():
-                    if art_l.type == "pytree" and art_l.name.startswith("params"):
-                        print(f"Downloading params from {art_l.name}")
-                        artifact_use = logger.use_artifact(art_l, type='pytree')
-                    if art_l.type == "npz" and art_l.name.startswith("bma_weights"):
-                        print(f"Downloading weights from {art_l.name}")
-                        artifact_weights_use = logger.use_artifact(art_l, type='npz')
-                return artifact_use, artifact_weights_use
-            # search for matching run in sweep or in run if run path was given
-            try:
-                print(f"Searching sweep {SWEEP_PARAM_PATH} for matching config")   
-                for run in api.sweep(SWEEP_PARAM_PATH).runs:
-                    # check if config matches
-                    matching_config = prepare_config(run.config, with_dataset=False)
-                    if matching_config == config_copy:
-                        if run.state != "finished":
-                            print(f"Found Run {run.name} but is not finished, skipping...")
-                            continue
-                        artifact_use, artifact_weights_use = load_art(run)
-            except wandb.errors.CommError as e:
-                if e.message.startswith("Could not find sweep"):
-                    try:
-                        print(f"Searching run {SWEEP_PARAM_PATH} for matching config")
-                        run = api.run(SWEEP_PARAM_PATH)
-                        matching_config = prepare_config(run.config, with_dataset=False)
-                        if matching_config == prepare_config(config, with_dataset=False):
-                            if run.state != "finished":
-                                print(f"Found Run {run.name} but is not finished, skipping...")
-                                raise KeyError("Run not finished")
-                            artifact_use, artifact_weights_use = load_art(run)
-                    except Exception as e:
-                        print("No sweep or run found")
-                        raise e
-                else:
-                    raise e
-            assert artifact_use, f"No matching run found in sweep {SWEEP_PARAM_PATH}"
-            # assert artifact_weights_use, f"No matching weights found in sweep {SWEEP_PARAM_PATH}"
-            
-            # load trainable params
-            for f in artifact_use.files():
-                if 'trainable_params' in f.name:
-                    trainable_params = np.load(artifact_use.get_entry(f.name).download(), allow_pickle=True).item()
-                    print(f"Loaded trainable_params from {f.name}")
-                    assert len(set(trainable_params.keys()) - set(params['params'].keys())) == 0, "Loaded trainable_params do not match model params"
-            assert trainable_params, f"trainable_params not found in artifact {artifact_use.name}"
-
-            # merge loaded trainable params with current params
-            def load_fn(m, p, pl):
-                if m:
-                    assert p.shape == pl.shape, f"Shape mismatch for parameter with shape {p.shape} and loaded shape {pl.shape}"
-                    return pl
-                else:
-                    return p
-            params['params'] = jax.tree.map(load_fn, s_model.train_mask, params['params'], trainable_params)
-        
-            if (num_epochs <= 0) and (num_steps <= 0) and (artifact_weights_use == False):
-                raise ValueError("Either num_epochs or num_steps must be > 0 for training, or a sweep path must be provided to load weights for BMA.")
-
-        # compute number of parameters for last curve fitting run
-        if k > 0:
-            n_params = sum(p.size if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
-            param_memory = sum(p.size*p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0 for p in jax.tree.flatten(params)[0])
-            logger.summary.update({'n_params': n_params, 'memory_params': param_memory})
-            print(f"Number of parameters: {n_params:_}\nMemory of parameters: {param_memory/(1024**2):_}MB")
-
-        # if SAVE_PARAMS:
-        #     jnp.save(f'tmp_files/{logger.id}_init_params.npy', params)
-        #     artifact.add_file(f'tmp_files/{logger.id}_init_params.npy')
-        # if SAVE_PARAMS:
-        #     print("Save init params")
-        #     # jnp.save(f'tmp_files/{logger.id}_best_params.npy', best_params)
-        #     trainable_params = s_model.only_trainable_params(params['params'])
-        #     jnp.save(f'tmp_files/{logger.id}_trainable_params_init.npy', trainable_params)
-                #     import time
-                # time.sleep(0.5)
-        #     artifact.add_file(f'tmp_files/{logger.id}_trainable_params_init.npy')
-
-        # Define optimizer
-        # ToDo check sam args must be preprocessed and not in this function
-        if optimizer_conf['name'].startswith('sam'):
-            raise NotImplementedError("SAM optimizer is not yet implemented for text classification")
-            # lr = optimizer_conf['kwargs'].pop('adv_lr')
-            rho = optimizer_conf['kwargs'].pop('adv_rho')
-            adv_opt = optax.chain(optax.contrib.normalize(), optax.sgd(rho))
-            optim_name = optimizer_conf['name'].split('_')[1]
-            base_opt = getattr(optax, optim_name)(**optimizer_conf['kwargs'])
-            optimizer = optax.contrib.sam(base_opt, adv_optimizer=adv_opt, sync_period=2, opaque_mode=True)
-            
-            # @partial(jit, static_argnums=(6), donate_argnums=(2,5))
-            # @profile
-            def train_step_sam(key, t, params, x, y, opt_state, optimizer):
-                """
-                Performs a single training step.
-
-                Parameters:
-                - key: The random key for generating random numbers.
-                - params: The parameters of the model.
-                - x: The input data.
-                - y: The target output.
-                - opt_state: The optimizer state.
-                - optimizer: The optimizer.
-
-                Returns:
-                - The loss, updated parameters, and updated optimizer state.
-
-                """
-                self = s_model 
-                trainable_params = self.only_trainable_params(params['params'])
-                freezed_params = freeze(jax.tree.map(lambda x, m: x if not m else jnp.array([]), params['params'], self.train_mask))
-                (loss, (stats_params, logs)), grads = jax.value_and_grad(
-                    self.compute_loss, argnums=2, has_aux=True)(key, t, trainable_params, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)
-                # update params
-                updates, opt_state = optimizer.update(
-                    grads, opt_state, trainable_params, grad_fn=lambda pp, _ : jax.grad(lambda p: self.compute_loss(key, t, p, params[self.mutable_name] if self.mutable_name else {}, freezed_params, x, y)[0])(pp))
-                trainable_params = optax.apply_updates(trainable_params, updates)
-                params = jax.tree.map(lambda x, y, m: x if m else y, trainable_params, unfreeze(freezed_params), self.train_mask)
-                params = {'params': params}
-                if self.mutable_name:
-                    params[self.mutable_name] = stats_params
-                return loss, params, opt_state, (grads, logs)
-
-            s_model.train_step = train_step_sam  # use SAM train step
-        else:
-            optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
-        # Add gradient clipping to the optimizer using optax.chain
-        opt_chain_list = []
-        if "grad_clip_norm" in optimizer_conf:
-            opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]))
-        
-        #*** Fix control points handling ***#
-        #*** Fix curve parameters during training if specified ***#
-        def element_wise_mask(element_freeze_mask):
-            """
-            Multiplies the updates by a element_freeze_mask.
-            element_freeze_mask leaves can be:
-            - 0.0 (or False): Allow update
-            - 1.0 (or True): Freeze parameter
-            - Array of 0s/1s: Element-wise freeze/update
-            """
-            def init_fn(params):
-                return optax.EmptyState()
-
-            def update_fn(updates, state, params=None):
-                # This performs element-wise multiplication (u * m)
-                # It handles both scalar masks (broadcasting) and array masks
-                new_updates = jax.tree.map(lambda f, u: u * (1 - f) if type(f) != bool else u, element_freeze_mask, updates)
-                return new_updates, state
-
-            return optax.GradientTransformation(init_fn, update_fn)
-        if fixed_cps_train_params != False:
-            def get_dims(param):
-                return (-1,) + (1,)* (param.ndim -1)
-            # fixed_cp_mask e.g [1,0.1] for k=2 with prodcasting to param shape such that only first dimension is selectively freezed
-            cps_fixed = [True if p != False else False for p in fixed_cps_train_params]
-            fixed_cp_mask = jax.tree.map(lambda m, p: jnp.array(cps_fixed).reshape(get_dims(p)) if m else False, s_model.curve_mask, params['params'])
-            # clears updates for fixed control points
-            opt_chain_list.append(element_wise_mask(fixed_cp_mask))
-
-        opt_chain_list.append(optimizer)
-        # if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
-        #     opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
-        optimizer = optax.chain(*opt_chain_list)
-        # Reuse cached optimizer to avoid JAX retrace (static_argnums=(0,7) on train_step)
-        if _cached_optimizer is not None:
-            optimizer = _cached_optimizer
-
-        only_train_params = s_model.only_trainable_params(params['params'])
-        n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
-        print(f"Number of trainable parameters: {n_params:_}")
-        if k > 0:
-            logger.summary.update({'n_params_trainable': n_params})
-        opt_state = optimizer.init(only_train_params)  # only trainable parameters according mask
-
-        best_val_ll = -np.inf
-        empty_metric = {'val_loss':jnp.array(jnp.inf, dtype=jnp.float32), 'val_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_ece': jnp.array(jnp.inf, dtype=jnp.float32),
-                        'val_bma_ll':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_bma_acc':jnp.array(-jnp.inf, dtype=jnp.float32), 'val_bma_ece': jnp.array(jnp.inf, dtype=jnp.float32)}, None
-        if val:
-            print("save best parameters")
-            # best_params = jax.device_get(params)  # best params on cpu to save memory
-            best_params = s_model.only_trainable_params(params['params'])  # best params on cpu to save memory
-            # best_params = jax.device_put(params, jax.devices('cpu')[0])  # best params on cpu to save memory
-            valid_metrics_fn_tmp = setup_metrics(s_model, BATCH_SIZE_EVAL, val_input_ids, val_attention_mask, val_labels, n_samples=10 if k > 0 else 1, key_prefix='val_')
-            def valid_metrics_fn(rng, params):
-                # always compute metrics with full parameter noise
-                if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                    # params = s_model.set_lora_rho(rho_w=lora_params.get('lora_rho', 0.0),  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
-                    params = s_model.set_lora_rho(rho_w=0.0,  rho_s=0.0, params=params)
-                    # params = s_model.set_lora_rho(rho_w=0.0,  rho_s=lora_params.get('lora_rho_s', 0.0), params=params)
-                return valid_metrics_fn_tmp(rng, params)
-            
-            def get_best_params(params):
-                # return jax.device_get(params)
-                # return params
-                return s_model.only_trainable_params(params['params'])
-        else:
-            best_params = None
-            valid_metrics_fn = lambda rng, params: empty_metric
-            def get_best_params(params):
-                return None
-            
-
-        # Bezier curve length
-        # define function to compute bezier curve length
-        def get_d_bezier(t):
-            bezier_coeff_inv = bezier_coeff_fn(k)
-            coeff = jax.vmap(bezier_coeff_inv)(t)
-
-            def clousure(cp):
-                n = cp.shape[0] - 1
-                cp_diff = cp[1:] - cp[:-1]
-                # improved version to reduce memory usage
-                def d_length_t(cp_diff, c):
-                    d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * n)
-                    return cp_diff, d_t
-                return jax.lax.scan(d_length_t, cp_diff, coeff)
-            return clousure
-
-        def bezier_length(cp):
-            t = jnp.linspace(0, 1, 1000)
-            d_norm_bezier = get_d_bezier(t)
-            _, d_t = d_norm_bezier(cp)
-            length = jax.scipy.integrate.trapezoid(d_t, t)
-            return length
-        
-        def lower_bound(cp):
-            # get the length of the line between the first and last control
-            return jnp.linalg.norm(cp[-1]-cp[0])
-        
-        def upper_bound(cp):
-            # get the length of the line between each control point
-            return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
-
-        def mass_center(cp):
-            return jnp.linalg.norm(cp.mean(axis=0))
-        
-        def gyration(cp):
-            mc = cp.mean(0)
-            return jnp.linalg.norm(cp - mc, axis=1).mean()
-        
-        def mean_curvature2(cp):
-            tt = jnp.linspace(0, 1, 10)
-            _, d_bezier = bezier_curve(cp.shape[0], cp)
-
-            def single(t):
-                grad_ = d_bezier(t)
-                second_dev = jax.jacrev(d_bezier)(t).squeeze()
-
-                norm_r_prime_sq = jnp.dot(grad_, grad_)  # |r'(t)|^2
-                norm_r_double_prime_sq = jnp.dot(
-                    second_dev, second_dev)  # |r''(t)|^2
-                dot_r_prime_double_prime = jnp.dot(
-                    grad_, second_dev)  # r'(t) · r''(t)
-
-                # Gram determinant equivalent for curvature
-                numerator = jnp.sqrt(
-                    norm_r_prime_sq * norm_r_double_prime_sq - dot_r_prime_double_prime**2)
-                denominator = norm_r_prime_sq ** (3/2)
-                return numerator / denominator
-            
-            curvature = jax.vmap(single)(tt)
-            return jax.scipy.integrate.trapezoid(curvature, tt)
-        
-        def init_rel_center(cp):
-            mean_center_t0 = cp.mean(axis=0)
-            def rel_center(cp):
-                return jnp.linalg.norm(cp.mean(axis=0) - mean_center_t0)
-            return rel_center
-        
-        # init metric
-        cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-        rel_center_fn = init_rel_center(cp_w)
-
-        if lora_params.get('rho_scheduler_frequency', 0.0) > 0.0:
-            def setup_rho_schedule(n_total_steps, frequency=0.5):
-                print(f"Using cosine rho schedule with total steps {n_total_steps}")
-                base_frequency = n_total_steps / (2*frequency)
-                def rho_sched(x, base):
-                    # return base * 0.5 * (1 - jnp.cos(x / base_frequency * jnp.pi))
-                    return base * (1 - jnp.cos(x / base_frequency * jnp.pi))
-                return rho_sched
-            rho_scheduler = setup_rho_schedule(num_steps, lora_params.get('rho_scheduler_frequency', 0.0))
-        else:
-            rho_scheduler = lambda step, base: base
-
-        def inf_mean(x):
-            mask = jnp.isfinite(x)
-            sum = jnp.where(mask, x, 0).sum()
-            count = mask.sum()
-            return sum / count
-
-
-        # @partial(jit, donate_argnums=(0,))
-        def train_batch(carry, batch_idx):
-            rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
-
-            x_batch = jnp.take(train_input_ids, batch_idx, axis=0)
-            atten_batch = jnp.take(train_attention_mask, batch_idx, axis=0)
-            y_ = jnp.take(train_labels, batch_idx, axis=0)
-
-            rng_key, subkey = random.split(rng_key)
-            t = t_sample_fn(subkey)
-            # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
-            if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                current_rho = rho_scheduler(update_idx, lora_params.get('lora_rho', 0.0))
-                current_rho_s = rho_scheduler(update_idx, lora_params.get('lora_rho_s', 0.0))
-                params = s_model.set_lora_rho(current_rho, current_rho_s, params)
-            loss, params, opt_state, (grad_, logs) = s_model.train_step(
-                subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-            # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-            current_lr = lr_schedule(update_idx)
-            # validate
-            rng_key, valid_key = random.split(rng_key)
-
-            metrics = jax.lax.cond((update_idx % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                valid_key, params)[0], lambda x: empty_metric[0], None)
-            best_params = jax.lax.cond(
-                metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
-            best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
-
-            # grad_mean = jax.tree.map(lambda p, m: p.mean() if m else None, grad_, s_model.train_mask)
-            # grad_metric = {"/".join([str(kk.key) for kk in k]):v for k,v in jax.tree.leaves_with_path(grad_mean)}
-
-            if k>0 and LOG_CURVE_METRICS:
-                cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-                upper_length = upper_bound(cp)
-                lower_length = lower_bound(cp)
-                mean_center = mass_center(cp)
-                gyration_radius = gyration(cp)
-                rel_center = rel_center_fn(cp)
-
-                return (rng_key, params, opt_state, best_val_ll, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length, 'lower_length': lower_length, 'mean_center': mean_center, 'gyration_radius': gyration_radius, 'rel_center': rel_center, **metrics, **logs}
-            else:
-                return (rng_key, params, opt_state, best_val_ll, best_params, update_idx+1), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
-
-        @scan_tqdm(num_epochs)
-        def train_epoch(carry, epoch):
-            rng_key = carry[0]
-            rng_key, subkey = random.split(rng_key)
-            shuffel_idx = random.permutation(subkey, train_labels.shape[0])
-            shuffel_idx = es('(ib)->ib', shuffel_idx, b=batch_size)
-            # x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
-            # x_atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
-            # y_ = es('(ib)...->ib...', train_labels[shuffel], b=batch_size)
-            
-            # Limit number of batches for smoke test
-            if smoke_test:
-                smoke_batch_limit = 3
-                n_batches = min(smoke_batch_limit, shuffel_idx.shape[0])
-                shuffel_idx = shuffel_idx[:n_batches]
-                jax.debug.print(f"Smoke test: Limited to {n_batches} batches per epoch")
-                
-            # train on batches
-            carry, metrics = jax.lax.scan(
-                train_batch, carry, shuffel_idx)
-            # jax.clear_caches()
-            # jax.debug.print(f"Epoch {epoch+1}/{num_epochs}, Loss: {metrics['loss'][-1].item()}{metrics['loss'].shape}, Val Loss: {metrics['val_loss'][-1]}, Val Acc: {metrics['val_acc'][-1]}")
-            val_loss_ = inf_mean(metrics['val_loss'])
-            val_acc_ = inf_mean(metrics['val_acc'])
-            jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}", epoch+1,num_epochs, metrics['loss'][-1], val_loss_, val_acc_)
-            return carry, metrics
-
-
-        def init_train_expert(window_size):
-            @scan_tqdm(num_steps)
-            # @partial(jit, donate_argnums=(0,))
-            def _train_expert_step(carry, step):
-                # x_all, atten_all, y_all, step = data
-                # # skip leading padding tokens in batch for faster training
-                # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-                # atten_batch = atten_batch[:, max_seqlen:]
-
-                # get curve parameter
-                rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all) = carry
-                rng_key, subkey = random.split(rng_key)
-
-                t = random.uniform(subkey, (1,), minval=0., maxval=1.)
-
-                # get batch from data
-                pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
-                rng_key, subkey = random.split(rng_key)
-                idx = random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
-                idx %= x_all.shape[0] # wrap around
-                x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
-                atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
-                y_ = jnp.take(y_all, idx, axis=0, mode='clip')
-
-                t = t_sample_fn(subkey)
-                loss, params, opt_state, (grad_, logs) = s_model.train_step(
-                    subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-                # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
-                current_lr = lr_schedule(step)
-                
-                # validate
-                # rng_key, valid_key = random.split(rng_key)
-                # # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
-                # idx += window_size  # move window
-                # idx = jnp.arange(0, batch_size*3) + pos + x_all.shape[0]//2 # move halfway around the dataset
-                # idx %= x_all.shape[0]  # wrap around
-                # x_val = jnp.take(x_all, idx, axis=0, mode='clip')
-                # atten_val = jnp.take(atten_all, idx, axis=0, mode='clip')
-                # y_val = jnp.take(y_all, idx, axis=0, mode='clip')
-                # val_loss, stat, val_out = s_model.nll(params['params'], params[s_model.mutable_name] if s_model.mutable_name else {}, t, (x_val, atten_val), y_val, False)
-                # val_acc = (jnp.argmax(val_out, axis=-1) == y_val).mean()
-                # return (rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, 'val_loss': val_loss, 'val_acc': val_acc, **logs}
-
-                # validate
-                rng_key, valid_key = random.split(rng_key)
-                metrics = jax.lax.cond((step % EVAL_EVERY_N_BATCH) == 0, lambda x: valid_metrics_fn(
-                    valid_key, params)[0], lambda x: empty_metric[0], None)
-                best_params = jax.lax.cond(
-                    metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
-                best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
-
-                return (rng_key, params, opt_state, best_val_ll, best_params, (x_all, atten_all, y_all)), {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
-
-
-            return _train_expert_step
-
-        # print memory stats
-        # memory_stats = jax.devices()[0].memory_stats()
-        # for stats_name, v in memory_stats.items():
-        #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
-        
-        # train loop if num_steps or num_epochs > 0 and k = 0 => single point fine-tuning or 
-        # if num_steps > 0 and ((k==0) or (k > 1) and (np.sum([0. if type(p) == bool else 1. for p in fixed_cps_train_params]) <= k)): # only if there are free control points left to train
-        if num_steps > 0 and ((curve_state == ProcessState.CURVE_FITTING) or (curve_state == ProcessState.PRETRAINING)): # only if there are free control points left to train
-            if ds_sampling == 'expert':
-                print(f"Start sorted expert training for {num_steps}")
-                if sort_mode == 'Random':
-                    order = random.permutation(rng_key, train_input_ids.shape[0])
-                elif sort_mode:
-                    distance = 1 - cosine_sim
-                    if sort_mode == 'Hierarchical':
-                        # convert to condensed vector form
-                        # distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
-                        # distance = 0.5 * (distance + distance.T)  # ensure symmetry
-                        condensed = squareform(distance, checks=False)
-                        Z = hierarchy.linkage(condensed, method='average')
-                        Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
-                        order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
-                        order = jnp.array(order)
-                    elif sort_mode == 'Spectral':
-                        distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
-                        # Schritt 3: Gradientenmatrix D
-                        D = jnp.diag(distance.sum(axis=1))
-                        # Schritt 4: Laplacian L
-                        L = D - distance
-                        # Schritt 5: Eigenvektoren holen
-                        vals, vecs = jnp.linalg.eigh(L)
-                        # Schritt 6: Fiedler vector (zweiter kleinster Eigenwert)
-                        fiedler = vecs[:, -2]
-                        # Schritt 7: Sortierung nach Fiedler-Vektor
-                        order = jnp.argsort(fiedler)
-                    elif sort_mode == 'First_data':
-                        order = jnp.argsort(distance[0])
-                    else:
-                        raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
-                    train_input_ids = train_input_ids[order]
-                    train_attention_mask = train_attention_mask[order]
-                    train_labels = train_labels[order]
-                    print(f"Data sorted for expert sampling using {sort_mode} method")
-
-                # init expert training loop
-                window_size = dataset_sampling['expert']['window_size']  # context window size for sampling
-                window_size = max(batch_size, window_size) # at least half batch size
-                train_expert_step = init_train_expert(window_size)
-                # start expert training loop
-                carry = (rng_key, params, opt_state, best_val_ll, best_params, (train_input_ids, train_attention_mask, train_labels))
-                if _cached_scan_jit is None:
-                    @jit
-                    def _cached_scan_jit(carry, xs):
-                        return jax.lax.scan(train_expert_step, carry, xs)
-                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_steps))
-            elif ds_sampling == 'minibatch':
-                print(f"Start minibatch training for {num_epochs} epochs")
-                carry = (rng_key, params, opt_state, best_val_ll, best_params, 0) # 0 is used for update counts
-                if _cached_scan_jit is None:
-                    @jit
-                    def _cached_scan_jit(carry, xs):
-                        return jax.lax.scan(train_epoch, carry, xs)
-                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_epochs))
-                window_size = 0  # not used in minibatch training
-            else:
-                raise ValueError(f"Unknown dataset_sampling method {ds_sampling} given. Choose either 'expert' or 'minibatch'.")
-
-            # clean up inf values because of lazy validation
-            for key, value in metrics.items():
-                if key.startswith('val_'):
-                    metrics[key] = jnp.array(value).flatten()[::EVAL_EVERY_N_BATCH].repeat(
-                        EVAL_EVERY_N_BATCH, axis=0)[:num_steps]
-                else:
-                    metrics[key] = jnp.array(value).flatten()
-            
-            # log all metrics
-            _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
-
-            # # print memory stats
-            # memory_stats = jax.devices()[0].memory_stats()
-            # for stats_name, v in memory_stats.items():
-            #     print(f"{stats_name}: {v / (1024 * 1024):.2f} MB" if "bytes" in stats_name else f"{stats_name}: {v}")
-
-            # log metrics as artifact
-            epochs = np.repeat(np.arange(num_epochs), num_steps//batch_size)
-            jnp.savez(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz', **metrics, epochs=epochs)
-            art = wandb.Artifact(name="metrics", type="npz")
-            art.add_file(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz')
-            logger.log_artifact(art)
-
-            rng_key = carry[0]
-            params = carry[1]  # last params on device
-            last_trainable_params = None
-            if val:
-                # params = carry[1]  # last params on device
-                last_trainable_params = s_model.only_trainable_params(params['params'])
-                best_curve_params = carry[4]  # best params (only trainable params)
-                # update last params with best curve params (only trainable params were stored)
-                params['params'] = jax.tree.map(lambda x, y, m: x if m else y, best_curve_params, params['params'], s_model.train_mask)
-            
-
-            if k > 0:
-                # Bezier curve length        
-                cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-                length = bezier_length(cp)
-                logger.summary.update({'Curve length': length})
-
-        #*** compute test metrics with BMA using shared implementation in src.utils.post_pred_performance ***#
-        # plot likelihood and acc along curve
-        t_space = jnp.linspace(0, s_model.t_max, 20)
-        if smoke_test or k == 0:
-            t_space = jnp.linspace(0, s_model.t_max, 3)
-        test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
-        # valid
-        # set lora noise off for evaluation if specified
-        if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-            # params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
-            params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
-            # params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=0.0, params=params)
-        curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-        # post_performance = post_pred_performance(logits_test, test_labels)
-        logger.summary.update({f'{logger_prefix}test_mean_{k}':v.mean() for k,v in curve_metric.items()})
-
-        if (curve_state == ProcessState.CURVE_FITTING) or (curve_state == ProcessState.CURVE_EVAL):
-            fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
-            ax.plot(t_space, -curve_metric['final_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
-            ax2 = ax.twinx()
-            ax2.plot(t_space, curve_metric['final_acc'], label="test acc",
-                    c=plt.get_cmap('tab10')(1), linestyle="--")
-
-            ax3 = ax.twinx()
-            ax3.spines["right"].set_position(("outward", 40))
-            ax3.set_frame_on(True)
-            ax3.patch.set_visible(False)
-            ax3.plot(t_space, curve_metric['final_ece'], label="test ece",
-                    c=plt.get_cmap('tab10')(2), linestyle=":")
-            ax.set_xlabel("t")
-            ax.set_ylabel("mean log likelihood")
-            ax2.set_ylabel("Accuracy")
-            ax3.set_ylabel("ECE")
-            ax.set_title("Final testset")
-            # combine legends from primary and twin axes
-            lines, legend_labels1 = ax.get_legend_handles_labels()
-            lines2, legend_labels2 = ax2.get_legend_handles_labels()
-            lines3, legend_labels3 = ax3.get_legend_handles_labels()
-            ax.legend(lines + lines2 + lines3, legend_labels1 + legend_labels2 + legend_labels3, loc='best', fontsize='small')
-            plt.tight_layout()
-            logger.log(
-                {'Curve Predictive': wandb.Image(fig)})
-
-            # compute and log final curve metrics
-            # compute log likelihood for t grid on train data to get posterior weightings
-            if curve_sampling_mode == "combined":
-                weights = False
-                print("Temperature:", temperature)
-                def compute_weights(log_like, t):
-                    log_post = log_like / t
-                    log_post -= jax.scipy.special.logsumexp(log_post)
-                    return jnp.exp(log_post)
-                if num_epochs > 0 or num_steps > 0: # train ds must be defined
-                    print("Compute posterior weights on train set")
-                    train_metrics_fn = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), train_input_ids, train_attention_mask, train_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='f_train_')
-                    # compute weigths without noise
-                    if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-                        params = s_model.set_lora_rho(0., 0., params)
-                    train_curve_metric, logits_train = train_metrics_fn(rng_key, params)
-
-                    post_performance = post_pred_performance(logits_train, train_labels)
-                    logger.summary.update({f'train_mean_{k}':v.mean() for k,v in post_performance.items()})
-                    mi = mutual_information(logits_train.astype(jnp.float32))
-                    logger.summary.update({'train_mutual_information': mi})
-                    entrop = entropy(logits_train.astype(jnp.float32))
-                    logger.summary.update({'train_std_entropy_along_curve': entrop.mean(-1).std(), 'train_mean_entropy_along_curve': entrop.mean()}) # average data/ mean or std along curve
-
-                    # plot curve of train log likelihood
-                    fig, ax = plt.subplots(1, 1, figsize=(4, 3), sharey=True)
-                    ax.plot(t_space, -train_curve_metric['f_train_loss'], label="test_ll", c=plt.get_cmap('tab10')(0))
-                    ax2 = ax.twinx()
-                    ax2.plot(t_space, train_curve_metric['f_train_acc'], label="test acc",
-                            c=plt.get_cmap('tab10')(1), linestyle="--")
-                    ax3 = ax.twinx()
-                    ax3.spines["right"].set_position(("outward", 40))
-                    ax3.set_frame_on(True)
-                    ax3.patch.set_visible(False)
-                    ax3.plot(t_space, train_curve_metric['f_train_ece'], label="test ece",
-                            c=plt.get_cmap('tab10')(2), linestyle=":")
-                    ax.set_xlabel("t")
-                    ax.set_ylabel("mean log likelihood")
-                    ax2.set_ylabel("Accuracy")
-                    ax3.set_ylabel("ECE")
-                    ax.set_title("Final trainset")
-                    lines, legend_labels1 = ax.get_legend_handles_labels()
-                    lines2, legend_labels2 = ax2.get_legend_handles_labels()
-                    lines3, legend_labels3 = ax3.get_legend_handles_labels()
-                    ax.legend(lines + lines2 + lines3, legend_labels1 + legend_labels2 + legend_labels3, loc='best', fontsize='small')
-                    plt.tight_layout()
-                    logger.log(
-                        {'Curve Predictive Train': wandb.Image(fig)})
-                    
-                    # loss is mean and without correct likelihood constant. In addition Uniform prior is dropped to unnormalized log posterior computation
-                    weights = jax.vmap(compute_weights, in_axes=(None, 0))(-train_curve_metric['f_train_loss'], jnp.array(temperature))  # shape (#temperature, #samples)
-                    art_w = wandb.Artifact(name="bma_weights", type="npz")
-                    jnp.savez(f'tmp_files/{logger.id}_weights.npz', weights=weights, t_space=t_space, log_like=-train_curve_metric['f_train_loss'], temperature=temperature)
-                    art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
-                    logger.log_artifact(art_w)
-                    print("Saved posterior weights artifact")
-                else:
-                    if artifact_weights_use:
-                        for f in artifact_weights_use.files():
-                            if 'weights' in f.name:
-                                weight_file = np.load(artifact_weights_use.get_entry(f.name).download(), allow_pickle=True)
-                                weights = jax.vmap(compute_weights, in_axes=(None, 0))(weight_file['log_like'], jnp.array(temperature))
-                                # weights = weight_file['weights']
-                                t_space = weight_file['t_space']
-                                print("Loaded posterior weights from artifact")
-                    assert type(weights) != bool, f"Weights for posterior predictive could be computed or are not saved in {SWEEP_PARAM_PATH}."
-
-                if val:            
-                    valid_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), val_input_ids, val_attention_mask, val_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_valid_')
-                    curve_metric_val, logits_val = valid_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-                    log_like_val_best = {'ll':-jnp.inf, 'temp': None, 'weight': None}
-                    for weight, temp in zip(weights, temperature):
-                        post_performance = post_pred_performance(logits_val, val_labels, weight)
-                        if log_like_val_best['ll'] < post_performance['ll']:
-                            log_like_val_best = {'ll': post_performance['ll'], 'temp': temp, 'weight': weight}
-                        logger.summary.update({f'post_pred_val_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
-                    logger.summary.update({'best_val_log_like_temp': log_like_val_best['temp'], 'best_val_log_like': log_like_val_best['ll']})
-
-                    post_performance = post_pred_performance(logits_test, test_labels, log_like_val_best['weight'])
-                    logger.summary.update({f'post_pred_test_ppd_{k}':v for k,v in post_performance.items()})
-                    mi = mutual_information(logits_test.astype(jnp.float32), weights=log_like_val_best['weight'])
-                    m_entropy = mean_entropy(logits_test.astype(jnp.float32), weights=log_like_val_best['weight'])
-                    logger.summary.update({f'test_mutual_information_ppd': mi, f'test_mean_entropy_ppd': m_entropy})
-                else: 
-                    for weight, temp in zip(weights, temperature):
-                        post_performance = post_pred_performance(logits_test, test_labels, weight)
-                        logger.summary.update({f'post_pred_test_ppd_t{temp}_{k}':v for k,v in post_performance.items()})
-                        mi = mutual_information(logits_test.astype(jnp.float32), weights=weight)
-                        m_entropy = mean_entropy(logits_test.astype(jnp.float32), weights=weight)
-                        logger.summary.update({f'test_mutual_information_ppd_t{temp}': mi, f'test_mean_entropy_ppd_t{temp}': m_entropy})
-
-                entrop = entropy(logits_test.astype(jnp.float32))
-                logger.summary.update({'std_entropy_along_curve': entrop.mean(-1).std(), 'mean_entropy_along_curve': entrop.mean()})
-            else:
-                print("Using random sampling to approx. independent curves")
-                if "combined" not in curve_sampling_mode:
-                    print("Using random sampling to approx. independent curves")
-                    test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=False, average=False, key_prefix='approx_', t_sample_fn=t_sample_fn)
-                    # valid
-                    curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-                post_performance = post_pred_performance(logits_test, test_labels)
-                logger.summary.update({f'{logger_prefix}approx_pred_test_mean_{k}':v for k,v in post_performance.items()})
-
-                mi = mutual_information(logits_test.astype(jnp.float32))
-                m_entropy = mean_entropy(logits_test.astype(jnp.float32))
-                entrop = entropy(logits_test.astype(jnp.float32))
-                logger.summary.update({f'test_mutual_information_approx': mi, f'test_mean_entropy_approx': m_entropy, 'std_entropy_approx': entrop.mean(-1).std(), 'mean_entropy_approx': entrop.mean()})
-
-            # reset lora noise if specified
-            # if lora_params.get('lora_rho', 0.0) > 0.0 or lora_params.get('lora_rho_s', 0.0) > 0.0:
-            #     params = s_model.set_lora_rho(rho_s=lora_params.get('lora_rho_s', 0.0), rho_w=lora_params.get('lora_rho', 0.0), params=params)
-            #     curve_metric, logits_test = test_metrics_fn_final(rng_key, params) # logits test with shape (n_samples, n_data, n_classes)
-            #     post_performance = post_pred_performance(logits_test, test_labels)
-            #     logger.summary.update({f'{logger_prefix}approx_pred_test_mean_wRho_{k}':v for k,v in post_performance.items()})
-
-            #     mi = mutual_information(logits_test.astype(jnp.float32))
-            #     m_entropy = mean_entropy(logits_test.astype(jnp.float32))
-            #     entrop = entropy(logits_test.astype(jnp.float32))
-            #     logger.summary.update({f'test_mutual_information_approx_wRho_': mi, f'test_mean_entropy_approx_wRho_': m_entropy, 'std_entropy_approx_wRho_': entrop.mean(-1).std(), 'mean_entropy_approx_wRho_': entrop.mean()})
-
-
-
-        # post_predict_logits = (logits_test * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes)
-        # post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == test_labels)
-        # post_ece = ece_fn(post_predict_logits, test_labels, num_bins=15)
-        # logger.log({'post_predictive': (-curve_metric['final_loss'] * weights).sum(),
-        #             'post_pred_acc': post_acc,
-        #             'post_pred_ece': post_ece,
-        #             })
-        return rng_key, s_model, params, last_trainable_params, optimizer, _cached_scan_jit
-
-
-
-    params = None
-    cp_fix = config['curve_params'].pop('cp_fix')
-    print(f"Control point fixed list: {cp_fix}")
-    deg_segments = config['curve_params'].get('curve_segment', False)
-    indep_connected = config['curve_params'].get('indepent_connected', False)
-
-    # pretrain fixed control points 
-    if np.sum(cp_fix) > 0:
-        curve_state = ProcessState.PRETRAINING
-        if deg_segments:
-            all_segments_fixed_endpoints = np.all([deg_segments == i for i in np.diff(np.argwhere(np.array(cp_fix) == 1).flatten())])
-            assert all_segments_fixed_endpoints, "In curve segment mode, fixed control points must be consecutive and include endpoints, e.g. [1,0,1,0,1] with deg 2."
-        if config.get('lora_params', None) is not None and np.sum(cp_fix) < len(cp_fix):
-            assert (config['lora_params']['lora_mode'] == 'A(t)B(t)') or config['lora_params']['lora_mode'] == 'A(t)eB(t)', "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for subspace curves with fixed control points" 
-        train_params = []
-        _cached_pretrain_model = None
-        _cached_pretrain_optimizer = None
-        _cached_pretrain_scan = None
-        print("Pretraining fixed control points")
-        for i, fixed in enumerate(cp_fix):
-            if fixed:
-                print(f"Training cp member {i}")
-                config['curve_params']['k'] = 0 
-                config['curve_params']['curve_segment'] = False 
-
-                if params is not None:
-                    del params  # free memory
-                rng_key, s_model, params, _, _pretrain_opt, _pretrain_scan = train_curve_inner(
-                    rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
-                    lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
-                    smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
-                    _cached_s_model=_cached_pretrain_model,
-                    _cached_optimizer=_cached_pretrain_optimizer,
-                    _cached_scan_jit=_cached_pretrain_scan,
-                    logger_prefix=f'cp_fixed_{i}_')
-                _cached_pretrain_model = s_model      # reuse same instance to avoid JAX retrace
-                _cached_pretrain_optimizer = _pretrain_opt  # reuse same optimizer object
-                _cached_pretrain_scan = _pretrain_scan  # reuse compiled scan (no retrace/recompile)
-                train_params.append(s_model.only_trainable_params(params['params']))
-                rng_key, _ = random.split(rng_key)
-            else:
-                train_params.append(False)
-
-        if SAVE_PARAMS:
-            print("Save pretrained trainable params ...")
-            np.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
-            # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
-            time.sleep(1)  # ensure file is written
-            print("Saved pretrained parameters to tmp_files")
-            artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
-    else:
-        # assert config['curve_params'].get('curve_segment', False) is False, "Curve segment mode does not make sense if no control points are fixed. (control points of shared segments would get more gradient upgraded)" 
-        train_params = False
-    if params is not None:
-        del params  # free memory
-    
-
-    # train curve model
-    if len(cp_fix) > 1:
-        print("Training curve model")
-        config['curve_params']['k'] = len(cp_fix)-1
-        config['curve_params']['curve_segment'] = deg_segments 
-        if np.sum(cp_fix) == 0:
-            print("No fixed control points, training full curve with all control points free.")
-            if deg_segments:
-                assert indep_connected == True, "In curve segment mode with no fixed control points, curve optimzation only makes sense if all segments are independently connected (e.g. each segment doesn't optimize its last cp) to avoid optimization issues with shared control points between segments."
-        if len(cp_fix) == np.sum(cp_fix): # all control points are fixed e.g. [1,1] but we check linear mode connection
-            curve_state = ProcessState.CURVE_EVAL
-        else:
-            curve_state = ProcessState.CURVE_FITTING
-        rng_key, s_model, params, last_trainable_params, _, _ = train_curve_inner(
-                rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
-                lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
-                smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 
-                fixed_cps_train_params=train_params)
-    
-        if SAVE_PARAMS:
-            print("Save final trainable params ...")
-            np.save(f'tmp_files/{logger.id}_trainable_params.npy', s_model.only_trainable_params(params['params']))
-            if last_trainable_params is not None:
-                np.save(f'tmp_files/{logger.id}_last_trainable_params.npy', last_trainable_params)
-            # artifact.add_file(f'tmp_files/{logger.id}_best_params.npy')
-            time.sleep(1)  # ensure file is written
-            print("Saved trainable parameters to tmp_files")
-            artifact.add_file(f'tmp_files/{logger.id}_trainable_params.npy')
-            if last_trainable_params is not None:
-                artifact.add_file(f'tmp_files/{logger.id}_last_trainable_params.npy')
-
-    if SAVE_PARAMS:    
+    data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key = \
+        _prepare_datasets(rng_key, config, logger)
+
+    hp = _parse_hyperparams(
+        config, unique_target_ids=unique_target_ids,
+        num_epochs=num_epochs, num_steps=num_steps,
+        lr_schedule=lr_schedule)
+
+    train_params = False
+    if np.sum(hp.cp_fix) > 0:
+        train_params, rng_key = _pretrain_fixed_cps(
+            rng_key, hp, data, logger, artifact)
+
+    if len(hp.cp_fix) > 1:
+        _train_full_curve(rng_key, hp, data, train_params, logger, artifact)
+
+    if hp.save_params:
         logger.log_artifact(artifact)
-        time.sleep(5)  # ensure artifact is logged
+        time.sleep(5)
         print("Logged artifact with parameters.")
     logger.finish()
 
@@ -1446,15 +1979,7 @@ if __name__ == '__main__':
             'smoke_test': args.smoke_test,
             'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
             # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
-            'lora_params': {'use_lora': True, 'r': 8, 
-                            'lora_dtype': 'float32',
-                            'lora_alpha': 16.0,
-                            # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'A(t)B(t)',
-                            # 'lora_mode': 'Arotsd(t)eB',
-                            # 'lora_mode': 'Arot(t)sdeBrot(t)',
-                            'lora_rho': .25,
-                            'lora_rho_s': .5,
+            'lora_params': {'use_lora': True,
                             'rho_scheduler_frequency': 100.,
                             'filter_masks': 
                                 [
@@ -1468,23 +1993,35 @@ if __name__ == '__main__':
                                 #     {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [0, 1]},
                                 # ]},  # use lora for query projection
             'curve_params': {'cp_fix': args.cp_fix,
+                            'subspace_model': 'lora_category',
                             'num_epochs': -1,
                             'num_steps': 10 if args.smoke_test else 5_000,
                             # 'num_steps': 5000,
                             # 'num_steps': -1,
                             'batch_size': args.batch_size,
-                            'natural_parameterization': False,
-                            'gravity': 5.0,
-                            'energy_weakening': 4., 
-                            'regularizer': False, # False, 'cosine', 'energy', 'force', 
-                            'entropy_maxim': 0.,
-                            'weight_decay': 0.,
                             'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
                             'temperature': [1.0,],
                             'val_percentage' : 0.1,
-                            'curve_parameterization': 'bezier',
                             'curve_sampling_mode': 'combined_noBMA', # 'per_leave' or 'combined'
-                            'curve_segment': 2, # if int only train on curve segment of degeree curve_segment between fixed control points, if False train on whole curve
+                            'model_params': {
+                                'natural_parameterization': False,
+                                'weight_decay': 0.,
+                                'curve_parameterization': 'bezier',
+                                'curve_segment': 3,  # if int, train on segment of degree curve_segment between fixed CPs; if False, train on whole curve
+                                'indepent_connected': False,  # if True in segment mode, segments are independently connected
+                                # 'gravity': 5.0,
+                                # 'energy_weakening': 4.,
+                                # 'regularizer': False,  # False, 'cosine', 'energy', 'force'
+                                # 'entropy_weight': 0.,
+                                'r': 8,
+                                'lora_dtype': 'float32',
+                                'lora_alpha': 16.0,
+                                # 'lora_mode': 'Arotsd(t)eB',
+                                'lora_mode': 'A(t)B(t)',
+                                # 'lora_mode': 'Arot(t)sdeBrot(t)',
+                                'lora_rho': .25,
+                                'lora_rho_s': .5,
+                            },
                             # 'curve_sampling_mode': 'per_leave', # 'per_leave' or 'combined'
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
@@ -1517,6 +2054,6 @@ if __name__ == '__main__':
                             #                                         'freeze_other_params': True,
                             #                    },
                         }}
-        logger = wandb.init(project="qwen_PtoC", name="test_noWD on_curve + epsilon_s 05", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)
         train(logger, config)
 

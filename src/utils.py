@@ -5,7 +5,7 @@ from scipy.special import binom
 import matplotlib.pyplot as plt
 from jax import numpy as jnp
 import jax
-from numpyro import distributions as dist
+# from numpyro import distributions as dist
 from copy import deepcopy
 from flax.core import unfreeze
 # from src.models import MLPModel, MLPModelUCI, init_model_tube, init_t_lambda_to_phi, init_model_phi, init_model_line
@@ -365,6 +365,7 @@ def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_p
     Returns:
         dict with keys either ('ll','acc','ece') or with prefix '{key_prefix}bma_ll', etc.
     """
+    logits = jax.nn.log_softmax(logits, axis=-1)  # ensure logits are normalized for logsumexp
     if isinstance(weights, bool):
         # treating True as uniform average
         post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])
@@ -373,7 +374,9 @@ def post_pred_performance(logits, labels, weights: bool|jnp.ndarray=False, key_p
 
     post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
     post_ece = calibration_error(post_predict_logits, labels, num_bins)
-    ll = dist.Categorical(logits=post_predict_logits).log_prob(labels).mean()
+    ll = jnp.take_along_axis(post_predict_logits, labels[:, None], axis=-1).squeeze().mean()
+    # alternative ll computation using Categorical distribution (should be the same)
+    # ll = dist.Categorical(logits=post_predict_logits).log_prob(labels).mean()
 
     return {f'{key_prefix}ll': ll, f'{key_prefix}acc': post_acc, f'{key_prefix}ece': post_ece}
 
@@ -429,8 +432,8 @@ def init_model(config, unique_target_ids):
         for f in lora_params['filter_masks']:
             lora_mask = filter_mask(lora_mask, *f['keys'], as_curve=np.array(f['dims']), BoolschenOperator=eval(f['op']))
 
-    curve_pps = deepcopy(config['curve_params'])
-    curve_pps.pop('cp_fix')
+    # curve_pps = deepcopy(config['curve_params'])
+    # curve_pps.pop('cp_fix')
     s_model = LoRAEntropyCategorySubspace(
         lora_mask=lora_mask,
         r=lora_params['r'],
@@ -440,7 +443,15 @@ def init_model(config, unique_target_ids):
         lora_rho=lora_params.get('lora_rho', 0.0),
         lora_rho_s=lora_params.get('lora_rho_s', 0.0),
         model=model,
-        **curve_pps,
+        k=config['curve_params']['k'],
+        weight_decay=config['curve_params']['weight_decay'],
+        entropy_weight=config['curve_params'].get('entropy_weight', 0.0),
+        perm_spec=False,
+        natural_parameterization=config['curve_params']['natural_parameterization'],
+        mutuable_param_name=False,
+        curve_parameterization=config['curve_params'].get('curve_parameterization', 'bezier'),
+        indepent_connected = config['curve_params'].get('indepent_connected', False),
+        curve_segment = config['curve_params'].get('curve_segment', False),
     )
 
     init_key = jax.random.PRNGKey(config.get('rng_seed', 1))
@@ -539,3 +550,75 @@ def load_checkpoint_new(run, params, s_model):
                 print(f"Loaded bma_weights from {f.name}")
 
     return params, bma_weights, trainable_params, init_trainable_params, pretrained_params, last_trainable_params
+
+
+def legacy_config_transform(config: dict) -> dict:
+    """Transform a legacy flat config into the new nested ``model_params`` format.
+
+    Legacy format (pre-refactor):
+        - ``config['curve_params']`` contains model-constructor kwargs directly:
+          ``natural_parameterization``, ``gravity``, ``energy_weakening``,
+          ``regularizer``, ``weight_decay``, ``curve_parameterization``,
+          ``curve_segment``, ``indepent_connected``, ``entropy_maxim``.
+        - ``config['lora_params']`` contains LoRA model-constructor kwargs:
+          ``r``, ``lora_dtype``, ``lora_alpha``, ``lora_mode``,
+          ``lora_rho``, ``lora_rho_s``.
+
+    New format (post-refactor):
+        - ``config['curve_params']['model_params']`` contains all model-constructor
+          kwargs (``entropy_maxim`` is renamed to ``entropy_weight``).
+        - ``config['lora_params']`` contains only training-loop concerns:
+          ``use_lora``, ``filter_masks``, ``rho_scheduler_frequency``.
+
+    If the config already contains ``model_params`` inside ``curve_params`` it is
+    returned unchanged (idempotent).
+    """
+    from copy import deepcopy
+
+    config = deepcopy(dict(config))
+
+    if 'model_params' in config.get('curve_params', {}):
+        return config  # already in new format
+
+    curve_params = config.get('curve_params', {})
+    lora_params = config.get('lora_params', {})
+
+    _MODEL_PARAMS_FROM_CURVE = [
+        'natural_parameterization',
+        'gravity',
+        'energy_weakening',
+        'regularizer',
+        'weight_decay',
+        'curve_parameterization',
+        'curve_segment',
+        'indepent_connected',
+    ]
+    _LORA_MODEL_PARAMS = [
+        'r',
+        'lora_dtype',
+        'lora_alpha',
+        'lora_mode',
+        'lora_rho',
+        'lora_rho_s',
+    ]
+
+    model_params: dict = {}
+
+    for key in _MODEL_PARAMS_FROM_CURVE:
+        if key in curve_params:
+            model_params[key] = curve_params.pop(key)
+
+    # rename entropy_maxim → entropy_weight
+    if 'entropy_maxim' in curve_params:
+        model_params['entropy_weight'] = curve_params.pop('entropy_maxim')
+
+    for key in _LORA_MODEL_PARAMS:
+        if key in lora_params:
+            model_params[key] = lora_params.pop(key)
+
+    curve_params['model_params'] = model_params
+    config['curve_params'] = curve_params
+    if lora_params is not None:
+        config['lora_params'] = lora_params
+
+    return config

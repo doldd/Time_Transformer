@@ -28,6 +28,7 @@ def main(sweep_id: str, use_art: bool):
             config['dataset_path'] = f"artifacts/{config['dataset_path'].split('/')[-1]}/test_data.npz"
             config['net_kwargs']['model_path'] = f"artifacts/{config['net_kwargs']['model_path'].split('/')[-1]}"
         config['curve_params']['k'] = 0
+        config['curve_params']['curve_segment'] = False
 
         # Load data inside the loop so dataset can vary per run if needed
         test_input_ids, test_attention_mask, test_labels, test_target_ids, test_unique_target_ids = \

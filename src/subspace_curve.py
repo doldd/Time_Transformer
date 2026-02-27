@@ -21,7 +21,34 @@ logger = logging.getLogger(__name__)
 
 __all__ = ['OrthoSpan', 'SubspaceModel', 'pytree_to_matrix', 'pytree_to_vec',
            'vec_to_pytree', 'bezier_curve', 'segmented_bezier_coeff_fn',
-           'UniformTSubspace', 'UniformTCategory']
+           'UniformTSubspace', 'UniformTCategory',
+           'SUBSPACE_REGISTRY', 'get_subspace_model']
+
+# ---------------------------------------------------------------------------
+# Subspace model registry – maps string names to SubspaceBaseModel subclasses
+# ---------------------------------------------------------------------------
+SUBSPACE_REGISTRY: dict[str, type] = {}
+
+def register_subspace_model(name: str):
+    """Class decorator that registers a SubspaceBaseModel subclass."""
+    def decorator(cls):
+        if name in SUBSPACE_REGISTRY:
+            raise ValueError(f"Duplicate subspace model name: '{name}'")
+        SUBSPACE_REGISTRY[name] = cls
+        return cls
+    return decorator
+
+def get_subspace_model(name: str) -> type:
+    """Look up a registered SubspaceBaseModel subclass by *name*.
+
+    Raises ``ValueError`` with a list of known names when *name* is unknown.
+    """
+    if name not in SUBSPACE_REGISTRY:
+        raise ValueError(
+            f"Unknown subspace model: '{name}'. "
+            f"Available: {sorted(SUBSPACE_REGISTRY.keys())}"
+        )
+    return SUBSPACE_REGISTRY[name]
 
 def tree_broadcast(prefix_tree: Any, full_tree: Any,
                    is_leaf: Callable[[Any], bool] | None = None
@@ -800,6 +827,7 @@ class SubspaceBaseModel:
         return loss, params, opt_state, (grads, logs)
 
 
+@register_subspace_model('category')
 class CategorySubspace(SubspaceBaseModel):
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
@@ -824,6 +852,7 @@ class CategorySubspace(SubspaceBaseModel):
                 logits=out, labels=y)
         return jnp.mean(nll), state, out
     
+@register_subspace_model('regression')
 class RegressionSubspace(SubspaceBaseModel):
     def __init__(self, out_dist_log_scale=jnp.log(1.0), **kwargs):
         """
@@ -862,6 +891,7 @@ class RegressionSubspace(SubspaceBaseModel):
         return nll, state, out
 
 
+@register_subspace_model('dist_regression')
 class DistRegressionSubspace(SubspaceBaseModel):
     def __init__(self, init_outDist_log_scale=jnp.log(1.), **kwargs):
         """
@@ -923,6 +953,7 @@ class DistRegressionSubspace(SubspaceBaseModel):
         nll = -jax.scipy.stats.norm.logpdf(y, loc=out.squeeze(axis=-1), scale=jnp.exp(params['log_scale'])+1e-8)
         return nll, state, out
     
+@register_subspace_model('quantile')
 class QuantileSubspace(SubspaceBaseModel):
     def __init__(self, model, k, quantiles, weight_decay=0, perm_spec = False, natural_parameterization=False, mutuable_param_name = False):
         super().__init__(model, k, weight_decay, perm_spec, natural_parameterization, mutuable_param_name)
@@ -1116,15 +1147,19 @@ class JensenShannonMixin:
         return loss.squeeze(), (state, {'nll1': nll.mean(), 'nll2': nll2.mean(), 'jsd': jsd})
 
 # Define classes:
+@register_subspace_model('repulsive_regression')
 class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):
     pass
 
+@register_subspace_model('repulsive_dist_regression')
 class RepulsiveDistRegressionSubspace(RepulsiveMixin, DistRegressionSubspace):
     pass
 
+@register_subspace_model('repulsive_category')
 class RepulsiveCategorySubspace(RepulsiveMixin, CategorySubspace):
     pass
 
+@register_subspace_model('repulsive_quantile')
 class RepulsiveQuantileSubspace(RepulsiveMixin, QuantileSubspace):
     pass
 
@@ -1614,27 +1649,35 @@ class LoRAMixin:
         out, state = self._predict(params, state, x, train=train)
         return out, state
 
+@register_subspace_model('lora_regression')
 class LoRARegressionSubspace(LoRAMixin, RegressionSubspace):
     pass
 
+@register_subspace_model('lora_category')
 class LoRACategorySubspace(LoRAMixin, CategorySubspace):
     pass
 
+@register_subspace_model('lora_repulsive_category')
 class LoRARepulsiveCategorySubspace(LoRAMixin, RepulsiveMixin, CategorySubspace):
     pass
-        
+
+@register_subspace_model('lora_repulsive_jsd_category')
 class LoRARepulsiveEntropyCategorySubspace(LoRAMixin, RepulsiveMixin, JensenShannonMixin, CategorySubspace):
     pass
 
+@register_subspace_model('lora_quantile')
 class LoRAQuantileSubspace(LoRAMixin, QuantileSubspace):
     pass
 
+@register_subspace_model('lora_repulsive_quantile')
 class LoRARepulsiveQuantileSubspace(LoRAMixin, RepulsiveMixin, QuantileSubspace):
     pass
 
+@register_subspace_model('lora_entropy_category')
 class LoRAEntropyCategorySubspace(LoRAMixin, EntropyMixin2, CategorySubspace):
     pass
 
+@register_subspace_model('lora_jsd_category')
 class LoRAJSDCategorySubspace(LoRAMixin, JensenShannonMixin, CategorySubspace):
     pass
 

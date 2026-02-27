@@ -32,6 +32,7 @@ from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
 from dataclasses import dataclass
 import time
+from contextlib import contextmanager
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -87,10 +88,14 @@ def _empty_val_metric():
 
 @dataclass
 class TrainHyperparams:
-    """Parsed hyperparameters for the training pipeline.
+    """Pure training hyperparameters for the pipeline.
 
     Constructed by ``_parse_hyperparams`` after data loading; consumed by
     every stage function so they don't need the raw *config* dict.
+
+    Intentionally excludes object-construction configs (optimizer_conf,
+    model_params, curve_params, lora_params, net_kwargs) — those live in
+    their own top-level config groups and are passed where needed.
     """
     cp_fix: list
     batch_size: int
@@ -100,19 +105,17 @@ class TrainHyperparams:
     num_steps: int
     save_params: bool
     smoke_test: bool
-    lora_params: dict | None
-    lora_rho: float
-    lora_rho_s: float
     dataset_sampling: dict
     ds_sampling: str
     curve_sampling_mode: str
     temperature: list
     lr_schedule: object
-    deg_segments: int | bool
-    indep_connected: bool
+    deg_segments: int | bool   # derived from model_params['curve_segment']
+    indep_connected: bool      # derived from model_params['indepent_connected']
+    val_percentage: float      # fraction of train data held out for validation
     unique_target_ids: jnp.ndarray
-    net_kwargs: dict
-    curve_params: dict  # remaining curve_params (cp_fix already popped)
+    lora_rho: float            # LoRA weight noise (from lora_params)
+    lora_rho_s: float          # LoRA scale noise  (from lora_params)
 
     @property
     def eval_common(self) -> dict:
@@ -491,22 +494,11 @@ def _plot_curve_along_t(t_space, loss, acc, ece, title='Curve Predictive',
 # Evaluation pipeline – compute logits per dataset, then apply metrics
 # ---------------------------------------------------------------------------
 
-_EVAL_METRICS: dict = {}
-
-
-def _register_eval_metric(fn):
-    """Decorator: register an evaluation metric by function name (strips ``_eval_`` prefix)."""
-    name = fn.__name__
-    if name.startswith('_eval_'):
-        name = name[len('_eval_'):]
-    _EVAL_METRICS[name] = fn
-    return fn
-
-
 # --- Individual metric functions ---------------------------------------------------
 # Each receives keyword arguments from the orchestrator and may read/write *ctx*.
+# Defined here as plain functions; grouped into preset lists at the end of this
+# section (PRETRAIN_EVAL_FNS, CURVE_EVAL_FNS).
 
-@_register_eval_metric
 def _eval_summary(*, base_metrics, logger, logger_prefix='', **_kw):
     """Log the mean of every base metric to ``logger.summary``."""
     logger.summary.update({
@@ -515,7 +507,6 @@ def _eval_summary(*, base_metrics, logger, logger_prefix='', **_kw):
     })
 
 
-@_register_eval_metric
 def _eval_post_pred(*, logits, labels, logger, key_prefix, ctx, weight_key=None, **_kw):
     """BMA post-predictive performance (uniform or weighted via *weight_key*)."""
     weights = ctx.get(weight_key, False) if weight_key else False
@@ -523,7 +514,6 @@ def _eval_post_pred(*, logits, labels, logger, key_prefix, ctx, weight_key=None,
     logger.summary.update({f'{key_prefix}{mk}': v for mk, v in pp.items()})
 
 
-@_register_eval_metric
 def _eval_plot_curve(*, base_metrics, key_prefix, t_space, logger,
                      plot_title=None, **_kw):
     """Plot loss / accuracy / ECE along the curve parameter *t*."""
@@ -539,7 +529,6 @@ def _eval_plot_curve(*, base_metrics, key_prefix, t_space, logger,
     logger.log({f'Curve Predictive {plot_title or key_prefix}': wandb.Image(fig)})
 
 
-@_register_eval_metric
 def _eval_entropy_along_curve(*, logits, logger, key_prefix, **_kw):
     """Compute std / mean of per-sample entropy along the curve."""
     entrop = entropy(logits.astype(jnp.float32))
@@ -549,7 +538,6 @@ def _eval_entropy_along_curve(*, logits, logger, key_prefix, **_kw):
     })
 
 
-@_register_eval_metric
 def _eval_mutual_info(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
     """Mutual information across curve samples (optionally weighted)."""
     weights = ctx.get(weight_key, False) if weight_key else False
@@ -557,7 +545,6 @@ def _eval_mutual_info(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw
     logger.summary.update({f'{key_prefix}mutual_information': mi})
 
 
-@_register_eval_metric
 def _eval_mean_entropy(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
     """Predictive entropy of the BMA mixture (optionally weighted)."""
     weights = ctx.get(weight_key, False) if weight_key else False
@@ -565,7 +552,6 @@ def _eval_mean_entropy(*, logits, logger, key_prefix, ctx, weight_key=None, **_k
     logger.summary.update({f'{key_prefix}mean_entropy': me})
 
 
-@_register_eval_metric
 def _eval_compute_posterior_weights(*, base_metrics, key_prefix, logger,
                                     temperature, t_space, ctx, **_kw):
     """Derive posterior weights from the per-sample loss and cache in *ctx*.
@@ -594,7 +580,6 @@ def _eval_compute_posterior_weights(*, base_metrics, key_prefix, logger,
     print("Saved posterior weights artifact")
 
 
-@_register_eval_metric
 def _eval_load_posterior_weights(*, logger, temperature, ctx, **_kw):
     """Load posterior weights from a wandb artifact stored in ``ctx['_artifact_weights']``."""
     artifact = ctx.get('_artifact_weights')
@@ -617,7 +602,6 @@ def _eval_load_posterior_weights(*, logger, temperature, ctx, **_kw):
     raise RuntimeError("No weights file found in artifact")
 
 
-@_register_eval_metric
 def _eval_post_pred_per_temp(*, logits, labels, logger, key_prefix,
                               temperature, ctx, **_kw):
     """BMA post-predictive for each temperature using posterior weights."""
@@ -631,7 +615,6 @@ def _eval_post_pred_per_temp(*, logits, labels, logger, key_prefix,
         })
 
 
-@_register_eval_metric
 def _eval_mutual_info_per_temp(*, logits, logger, key_prefix,
                                 temperature, ctx, **_kw):
     """Mutual information for each temperature using posterior weights."""
@@ -643,7 +626,6 @@ def _eval_mutual_info_per_temp(*, logits, logger, key_prefix,
         logger.summary.update({f'{key_prefix}mutual_information_ppd_t{temp}': mi})
 
 
-@_register_eval_metric
 def _eval_mean_entropy_per_temp(*, logits, logger, key_prefix,
                                  temperature, ctx, **_kw):
     """Mean predictive entropy for each temperature using posterior weights."""
@@ -655,7 +637,6 @@ def _eval_mean_entropy_per_temp(*, logits, logger, key_prefix,
         logger.summary.update({f'{key_prefix}mean_entropy_ppd_t{temp}': me})
 
 
-@_register_eval_metric
 def _eval_best_temperature(*, logits, labels, logger, key_prefix,
                             temperature, ctx, **_kw):
     """Find the best temperature on this dataset and store the best weight in *ctx*.
@@ -681,6 +662,24 @@ def _eval_best_temperature(*, logits, labels, logger, key_prefix,
         f'{key_prefix}best_log_like_temp': best['temp'],
         f'{key_prefix}best_log_like': best['ll'],
     })
+
+
+# ---------------------------------------------------------------------------
+# Preset eval-function lists – pass these into _run_eval_phase / run_evaluation
+# to declare which metrics to compute without touching run_evaluation internals.
+# ---------------------------------------------------------------------------
+
+PRETRAIN_EVAL_FNS = [
+    _eval_summary,
+    _eval_post_pred,
+]
+
+CURVE_EVAL_FNS = [
+    _eval_post_pred,
+    _eval_mutual_info,
+    _eval_mean_entropy,
+    _eval_entropy_along_curve,
+]
 
 
 def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
@@ -710,8 +709,8 @@ def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
               (default 20; clipped to 3 for smoke tests / k==0).
             - ``key_prefix`` (str): Prefix for metric keys
               (default ``'{name}_'``).
-            - ``metrics`` (list): Names (str) or dicts ``{'name': …, **extra}``
-              registered in ``_EVAL_METRICS``.
+            - ``metrics`` (list): Callables or dicts ``{'fn': callable, **extra}``
+              to run on this data split.
             - ``store_logits`` (bool): If True, cache logits in *ctx*.
 
         batch_size_eval: Batch size for evaluation forward passes.
@@ -773,19 +772,16 @@ def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
             ctx=ctx, k=k)
 
         for metric_spec in spec.get('metrics', []):
-            if isinstance(metric_spec, str):
-                name, extra = metric_spec, {}
+            if callable(metric_spec):
+                metric_spec(**metric_kwargs)
             elif isinstance(metric_spec, dict):
                 extra = dict(metric_spec)
-                name = extra.pop('name')
+                fn = extra.pop('fn')
+                fn(**metric_kwargs, **extra)
             else:
-                raise ValueError(f"Invalid metric spec: {metric_spec}")
-
-            if name not in _EVAL_METRICS:
                 raise ValueError(
-                    f"Unknown eval metric '{name}'. "
-                    f"Available: {sorted(_EVAL_METRICS)}")
-            _EVAL_METRICS[name](**metric_kwargs, **extra)
+                    f"Invalid metric spec {metric_spec!r}: "
+                    "must be a callable or a dict with a 'fn' key.")
 
     return ctx
 
@@ -1222,9 +1218,9 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
     eval_specs = []
 
     # 1) Always: test with linspace -> summary (+ plot_curve if k > 0)
-    _test_metrics: list[str | dict] = ['summary']
+    _test_metrics = list(PRETRAIN_EVAL_FNS)
     if k > 0:
-        _test_metrics.append({'name': 'plot_curve', 'plot_title': 'Final testset'})
+        _test_metrics.append({'fn': _eval_plot_curve, 'plot_title': 'Final testset'})
     eval_specs.append({
         'name': 'test', 'sampling': 'linspace', 'key_prefix': 'final_',
         'metrics': _test_metrics,
@@ -1240,16 +1236,16 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
                     'name': 'train', 'sampling': 'linspace',
                     'key_prefix': 'f_train_',
                     'metrics': [
-                        'post_pred', 'mutual_info', 'entropy_along_curve',
-                        {'name': 'plot_curve', 'plot_title': 'Final trainset'},
-                        'compute_posterior_weights',
+                        _eval_post_pred, _eval_mutual_info, _eval_entropy_along_curve,
+                        {'fn': _eval_plot_curve, 'plot_title': 'Final trainset'},
+                        _eval_compute_posterior_weights,
                     ],
                 })
             elif artifact_weights_use:
                 eval_specs.append({
                     'name': 'test', 'sampling': 'linspace',
                     'key_prefix': '_tmp_',
-                    'metrics': ['load_posterior_weights'],
+                    'metrics': [_eval_load_posterior_weights],
                 })
 
             if has_val:
@@ -1257,16 +1253,16 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
                 eval_specs.append({
                     'name': 'val', 'sampling': 'linspace',
                     'key_prefix': 'final_valid_',
-                    'metrics': ['best_temperature'],
+                    'metrics': [_eval_best_temperature],
                 })
                 # Apply best weight from val to test
                 eval_specs.append({
                     'name': 'test', 'sampling': 'linspace',
                     'key_prefix': 'post_pred_test_ppd_',
                     'metrics': [
-                        {'name': 'post_pred', 'weight_key': 'best_weight'},
-                        {'name': 'mutual_info', 'weight_key': 'best_weight'},
-                        {'name': 'mean_entropy', 'weight_key': 'best_weight'},
+                        {'fn': _eval_post_pred, 'weight_key': 'best_weight'},
+                        {'fn': _eval_mutual_info, 'weight_key': 'best_weight'},
+                        {'fn': _eval_mean_entropy, 'weight_key': 'best_weight'},
                     ],
                 })
             else:
@@ -1275,9 +1271,9 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
                     'name': 'test', 'sampling': 'linspace',
                     'key_prefix': 'post_pred_test_ppd_',
                     'metrics': [
-                        'post_pred_per_temp',
-                        'mutual_info_per_temp',
-                        'mean_entropy_per_temp',
+                        _eval_post_pred_per_temp,
+                        _eval_mutual_info_per_temp,
+                        _eval_mean_entropy_per_temp,
                     ],
                 })
 
@@ -1285,7 +1281,7 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
             eval_specs.append({
                 'name': 'test', 'sampling': 'linspace',
                 'key_prefix': '',
-                'metrics': ['entropy_along_curve'],
+                'metrics': [_eval_entropy_along_curve],
             })
 
         else:
@@ -1295,10 +1291,7 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
                 'name': 'test',
                 'sampling': 't_sample' if use_t_sample else 'linspace',
                 'key_prefix': 'approx_',
-                'metrics': [
-                    'post_pred', 'mutual_info', 'mean_entropy',
-                    'entropy_along_curve',
-                ],
+                'metrics': list(CURVE_EVAL_FNS),
             })
 
     return eval_specs
@@ -1338,23 +1331,41 @@ def _run_eval_phase(*, rng_key, s_model, params, k, data,
     return params
 
 
-def _run_training_phase(*, rng_key, s_model, optimizer, params, opt_state,
-                         data, cosine_sim,
-                         lr_schedule, t_sample_fn, dataset_sampling,
-                         lora_rho, lora_rho_s, rho_scheduler,
-                         eval_every_n_batch,
-                         valid_metrics_fn, empty_metric, get_best_params,
-                         batch_size, num_epochs, num_steps,
-                         k, smoke_test,
-                         logger, logger_prefix, scan_fn=None):
+def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_fn=None):
     """Execute one training phase (expert or minibatch) and log metrics.
 
-    If *scan_fn* is provided it is reused (avoids JAX retrace across pretraining
-    iterations); otherwise a new ``@jit`` scan wrapper is created.
+    Reads ``params`` and ``opt_state`` from *env*; callers that need to
+    override them (e.g. the per-CP pretrain loop) should mutate those fields
+    on *env* before calling.
+
+    If *scan_fn* is provided it is reused (avoids JAX retrace across
+    pretraining iterations); otherwise a new ``@jit`` scan wrapper is created.
 
     Returns:
         ``(rng_key, params, last_trainable_params, scan_fn)``
     """
+    s_model = env.s_model
+    optimizer = env.optimizer
+    params = env.params
+    opt_state = env.opt_state
+    cosine_sim = env.cosine_sim
+    t_sample_fn = env.t_sample_fn
+    rho_scheduler = env.rho_scheduler
+    valid_metrics_fn = env.valid_metrics_fn
+    empty_metric = env.empty_metric
+    get_best_params = env.get_best_params
+
+    k = s_model.k
+    lr_schedule = hp.lr_schedule
+    dataset_sampling = hp.dataset_sampling
+    lora_rho = hp.lora_rho
+    lora_rho_s = hp.lora_rho_s
+    eval_every_n_batch = hp.eval_every_n_batch
+    batch_size = hp.batch_size
+    num_epochs = hp.num_epochs
+    num_steps = hp.num_steps
+    smoke_test = hp.smoke_test
+
     if num_steps <= 0:
         return rng_key, params, None, scan_fn
 
@@ -1486,140 +1497,158 @@ def _run_training_phase(*, rng_key, s_model, optimizer, params, opt_state,
 # Pipeline stage functions – called by train() orchestrator
 # ---------------------------------------------------------------------------
 
-def _build_lr_schedule(curve_params):
-    """Build optax learning-rate schedule from config.
+def _setup_lr_schedule(optimizer_conf):
+    """Build optax learning-rate schedule from the optimizer config dict.
 
-    Mutates ``curve_params['optimizer_conf']['kwargs']['learning_rate']``
-    in-place (replaces the raw dict/float with the optax schedule object).
+    Mutates ``optimizer_conf['kwargs']['learning_rate']`` in-place (replaces
+    the raw dict/float with the compiled optax schedule object) and returns
+    the schedule.
     """
-    lr_conf = curve_params['optimizer_conf']['kwargs']['learning_rate']
+    lr_conf = optimizer_conf['kwargs']['learning_rate']
     if isinstance(lr_conf, dict):
         lr_schedule = getattr(optax, lr_conf['name'])(**lr_conf['kwargs'])
     else:
         lr_schedule = optax.constant_schedule(lr_conf)
-    curve_params['optimizer_conf']['kwargs']['learning_rate'] = lr_schedule
+    optimizer_conf['kwargs']['learning_rate'] = lr_schedule
     return lr_schedule
 
 
-def _prepare_datasets(rng_key, config, logger):
-    """Load data, resolve model path, build LR schedule, prepare splits.
+def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
+                      smoke_test, logger):
+    """Load data and prepare train / val / test splits.
+
+    Args:
+        rng_key: JAX random key used for the train/val shuffle permutation.
+        dataset_path: Path or wandb artifact reference for the dataset.
+        val_percentage: Fraction of training data to reserve for validation.
+        batch_size: Used to batch-align the train split so every epoch
+            contains whole batches.  When *smoke_test* is True the dataset
+            is also truncated to ``3 * batch_size`` training samples.
+        smoke_test: Truncate dataset to a small size for fast iteration.
+        logger: wandb run used when resolving artifact dataset paths.
 
     Returns:
-        ``(data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key)``
+        ``(data, unique_target_ids, rng_key)``
     """
-    curve_params = config['curve_params']
-    BATCH_SIZE = curve_params['batch_size']
-
     # Load train and test data
-    input_ids, attention_mask, labels, target_ids, unique_target_ids = \
-        load_text_classification_data(config['dataset_path'], run=logger)
+    input_ids, attention_mask, labels, _, unique_target_ids = \
+        load_text_classification_data(dataset_path, run=logger)
     print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
 
     test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = \
-        load_text_classification_data(config['dataset_path'], run=logger, test=True)
+        load_text_classification_data(dataset_path, run=logger, test=True)
     print(f"Target token IDs: {unique_target_ids}")
 
-    # Resolve model path
-    if config['net_kwargs']['model_path'].startswith('ddold/'):
-        model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
-        config['net_kwargs']['model_path'] = model_artifact.download()
-
-    # Build learning rate schedule
-    lr_schedule = _build_lr_schedule(curve_params)
-
-    # Prepare train / val / test splits
+    # Shuffle and split into train / val
     rng_key, split_key = random.split(rng_key)
     perm_idx = random.permutation(split_key, len(input_ids))
-    num_epochs_cfg = curve_params.get('num_epochs', -1)
-    num_steps_cfg = curve_params.get('num_steps', -1)
-    val_percentage = curve_params.get('val_percentage', 0.0)
-    assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), \
-        "Only one of num_epochs or num_steps should be > 0"
 
-    has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
-    if has_train_data:
-        num_epochs = num_epochs_cfg
-        num_steps = num_steps_cfg
-        if num_steps > 0:
-            num_epochs = int(np.ceil(1. * num_steps * BATCH_SIZE / len(input_ids)))
-            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
-        num_steps = int(np.ceil(1. * num_epochs * len(input_ids) / BATCH_SIZE))
-        print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
+    n_train = int(np.floor((1. - val_percentage) * len(input_ids) / batch_size) * batch_size)
+    ordered_ids = input_ids[perm_idx]
+    ordered_mask = attention_mask[perm_idx]
+    ordered_labels = labels[perm_idx]
 
-        n_train = int(np.floor((1. - val_percentage) * len(input_ids) / BATCH_SIZE) * BATCH_SIZE)
-        ordered_ids = input_ids[perm_idx]
-        ordered_mask = attention_mask[perm_idx]
-        ordered_labels = labels[perm_idx]
+    train_input_ids = ordered_ids[:n_train]
+    train_attention_mask = ordered_mask[:n_train]
+    train_labels = ordered_labels[:n_train]
+    val_input_ids = ordered_ids[n_train:] if val_percentage > 0.0 else None
+    val_attention_mask = ordered_mask[n_train:] if val_percentage > 0.0 else None
+    val_labels = ordered_labels[n_train:] if val_percentage > 0.0 else None
 
-        train_input_ids = ordered_ids[:n_train]
-        train_attention_mask = ordered_mask[:n_train]
-        train_labels = ordered_labels[:n_train]
-        val_input_ids = ordered_ids[n_train:]
-        val_attention_mask = ordered_mask[n_train:]
-        val_labels = ordered_labels[n_train:]
-        has_val = len(val_input_ids) > 0
-        if has_val:
-            print("Validation data are used")
-        print(f"Training data: {len(train_input_ids)} samples, "
-              f"Validation data: {len(val_input_ids)} samples")
-    else:
-        train_input_ids = train_attention_mask = train_labels = None
-        val_input_ids = val_attention_mask = val_labels = None
-        num_epochs = num_steps = 0
-        has_val = False
+    # Smoke-test truncation: keep only a few batches so the run finishes fast
+    if smoke_test:
+        n_smoke = 3 * batch_size
+        train_input_ids = train_input_ids[:n_smoke]
+        train_attention_mask = train_attention_mask[:n_smoke]
+        train_labels = train_labels[:n_smoke]
+        if val_input_ids is not None:
+            val_input_ids = val_input_ids[:batch_size]
+            val_attention_mask = val_attention_mask[:batch_size]
+            val_labels = val_labels[:batch_size]
+        test_input_ids = test_input_ids[:n_smoke]
+        test_attention_mask = test_attention_mask[:n_smoke]
+        test_labels = test_labels[:n_smoke]
+        print(f"Smoke test: dataset truncated to {n_smoke} train samples")
 
-    # Normalise empty val arrays to None for DataSplits.has_val
-    if not has_val:
-        val_input_ids = val_attention_mask = val_labels = None
+    has_val = val_input_ids is not None and len(val_input_ids) > 0
+    if has_val:
+        print("Validation data are used")
+    print(f"Training data: {len(train_input_ids)} samples, "
+          f"Validation data: {len(val_input_ids) if has_val else 0} samples")
 
     data = DataSplits(
         train_input_ids=train_input_ids,
         train_attention_mask=train_attention_mask,
         train_labels=train_labels,
-        val_input_ids=val_input_ids,
-        val_attention_mask=val_attention_mask,
-        val_labels=val_labels,
+        val_input_ids=val_input_ids if has_val else None,
+        val_attention_mask=val_attention_mask if has_val else None,
+        val_labels=val_labels if has_val else None,
         test_input_ids=test_input_ids,
         test_attention_mask=test_attention_mask,
         test_labels=test_labels,
     )
 
-    return data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key
+    return data, unique_target_ids, rng_key
 
 
-def _parse_hyperparams(config, *, unique_target_ids, num_epochs, num_steps,
-                        lr_schedule):
-    """Extract hyperparameters from *config* into a ``TrainHyperparams``.
+def _parse_hyperparams(config, *, unique_target_ids, data, lr_schedule):
+    """Extract true training hyperparameters from *config* into a ``TrainHyperparams``.
 
-    Pops ``cp_fix`` from ``curve_params``.
+    Reads ``train_hyper``, ``model_params``, and ``lora_params`` groups from
+    *config* — none of those groups is mutated here.
+
+    Also computes ``num_epochs`` and ``num_steps`` from the data size and the
+    ``num_epochs`` / ``num_steps`` config values (exactly one must be > 0 for
+    training; both ≤ 0 means eval-only).
     """
-    curve_params = config['curve_params']
-    cp_fix = curve_params.pop('cp_fix')
+    th = config['train_hyper']
+    mp = config.get('model_params', {})
+    lp = config.get('lora_params', {})
+
+    cp_fix = th['cp_fix']
     print(f"Control point fixed list: {cp_fix}")
 
-    batch_size = curve_params['batch_size']
+    batch_size = th['batch_size']
+    dataset_sampling = th.get('dataset_sampling', {})
+
+    # Compute num_epochs / num_steps from data size
+    num_epochs_cfg = th.get('num_epochs', -1)
+    num_steps_cfg = th.get('num_steps', -1)
+    assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), \
+        "Only one of num_epochs or num_steps should be > 0"
+    has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
+    if has_train_data:
+        n_train = len(data.train_input_ids)
+        num_epochs = num_epochs_cfg
+        num_steps = num_steps_cfg
+        if num_steps > 0:
+            num_epochs = int(np.ceil(1. * num_steps * batch_size / n_train))
+            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
+        num_steps = int(np.ceil(1. * num_epochs * n_train / batch_size))
+        print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
+    else:
+        num_epochs = num_steps = 0
+
     return TrainHyperparams(
         cp_fix=cp_fix,
         batch_size=batch_size,
         batch_size_eval=batch_size * 2,
-        eval_every_n_batch=config['eval_every_n_batch'],
+        eval_every_n_batch=th.get('eval_every_n_batch', 20),
         num_epochs=num_epochs,
         num_steps=num_steps,
         save_params=config.get('save_params', False),
         smoke_test=config.get('smoke_test', False),
-        lora_params=config.get('lora_params', None),
-        lora_rho=curve_params.get('model_params', {}).get('lora_rho', 0.0),
-        lora_rho_s=curve_params.get('model_params', {}).get('lora_rho_s', 0.0),
-        dataset_sampling=config.get('dataset_sampling', {}),
-        ds_sampling=list(config.get('dataset_sampling', {}).keys())[0],
-        curve_sampling_mode=curve_params.get('curve_sampling_mode', 'combined'),
-        temperature=curve_params.get('temperature', [1.0]),
+        dataset_sampling=dataset_sampling,
+        ds_sampling=list(dataset_sampling.keys())[0],
+        curve_sampling_mode=th.get('curve_sampling_mode', 'combined'),
+        temperature=th.get('temperature', [1.0]),
         lr_schedule=lr_schedule,
-        deg_segments=curve_params.get('model_params', {}).get('curve_segment', False),
-        indep_connected=curve_params.get('model_params', {}).get('indepent_connected', False),
+        deg_segments=mp.get('curve_segment', False),
+        indep_connected=mp.get('indepent_connected', False),
+        val_percentage=config.get('val_percentage', 0.0),
         unique_target_ids=unique_target_ids,
-        net_kwargs=config['net_kwargs'],
-        curve_params=curve_params,
+        lora_rho=lp.get('lora_rho', 0.0),
+        lora_rho_s=lp.get('lora_rho_s', 0.0),
     )
 
 
@@ -1648,50 +1677,59 @@ def _compute_expert_embeddings(model, params, data, hp):
     return cosine_sim
 
 
-def _setup_training_env(*, rng_key, k, hp, data, fixed_cps_train_params=False):
+def _setup_training_env(*, rng_key, k, hp, config, data,
+                         fixed_cps_train_params=False):
     """Create model, subspace, optimizer, and all training support objects.
 
     Handles both k=0 (pretraining) and k>0 (curve fitting) cases.
-    For k=0, ``env.base_params`` provides a pristine copy for per-CP
-    re-initialisation.
+
+    *hp* carries pure training hyperparameters; object-construction config
+    (model architecture, optimizer, LoRA, masking) is read from the raw
+    *config* groups: ``net_kwargs``, ``model_params``, ``optimizer_conf``,
+    ``curve_params``, ``lora_params``.
 
     Returns:
         ``(env, rng_key)`` where *env* is a ``TrainingEnv``.
     """
-    curve_params = hp.curve_params
+    net_kwargs = config['net_kwargs']
+    mp = config.get('model_params', {})
+    optimizer_conf = deepcopy(config['optimizer_conf'])
+    model_params = dict(mp)
+    filter_masks = config.get('curve_params', {}).get('filter_masks', [])
+    subspace_model = mp.get('subspace_model', '')
+    jitter_multiplier = mp.get('jitter_multiplier', 0.0)
+    lora_params = config.get('lora_params', None)
 
     model = QwenTextClassificationWrapper(
-        **hp.net_kwargs, target_token_ids=hp.unique_target_ids)
+        **net_kwargs, target_token_ids=hp.unique_target_ids)
     base_params = unfreeze(model.init(None, None))
 
-    optimizer_conf = deepcopy(curve_params['optimizer_conf'])
-    model_params = dict(curve_params.get('model_params', {}))
     rng_key, init_key = random.split(rng_key)
 
     if k == 0:
         model_params['curve_segment'] = False  # no segments at k=0
         s_model, curve_mask, train_mask, _ = _create_subspace_model(
             model=model, params_tree=base_params['params'], k=0,
-            filter_masks=curve_params.get('filter_masks', []),
+            filter_masks=filter_masks,
             optimizer_conf=optimizer_conf,
-            lora_params=hp.lora_params,
+            lora_params=lora_params,
             model_params=model_params,
-            subspace_model=curve_params['subspace_model'])
+            subspace_model=subspace_model)
 
         # Init once to set s_model internal state (curve_mask, LoRA structs)
         params = jax.tree.map(lambda x: x, base_params)
         params = _init_subspace_params(
             s_model, params, curve_mask, train_mask, init_key,
-            curve_params.get('jitter_multiplier', 0.0), hp.lora_params)
+            jitter_multiplier, lora_params)
     else:
         s_model, params, _, curve_mask, train_mask = _build_subspace_model(
             model=model, params=base_params, k=k,
-            filter_masks=curve_params.get('filter_masks', []),
+            filter_masks=filter_masks,
             optimizer_conf=optimizer_conf,
-            lora_params=hp.lora_params,
+            lora_params=lora_params,
             model_params=model_params,
-            subspace_model=curve_params['subspace_model'],
-            jitter_multiplier=curve_params.get('jitter_multiplier', 0.0),
+            subspace_model=subspace_model,
+            jitter_multiplier=jitter_multiplier,
             init_key=init_key,
             fixed_cps_train_params=fixed_cps_train_params)
         base_params = None  # not needed for curve phase
@@ -1706,7 +1744,7 @@ def _setup_training_env(*, rng_key, k, hp, data, fixed_cps_train_params=False):
 
     # t sampling, rho scheduler, validation
     t_sample_fn = _setup_t_sample_fn(s_model, hp.curve_sampling_mode)
-    rho_scheduler = _setup_rho_scheduler(hp.lora_params, hp.num_steps)
+    rho_scheduler = _setup_rho_scheduler(lora_params, hp.num_steps)
 
     if data.has_train:
         valid_metrics_fn, empty_metric, get_best_params = \
@@ -1731,14 +1769,34 @@ def _setup_training_env(*, rng_key, k, hp, data, fixed_cps_train_params=False):
     return env, rng_key
 
 
-def _pretrain_fixed_cps(rng_key, hp, data, logger, artifact):
+@contextmanager
+def single_point_mask(s_model):
+    """Temporarily set k=0 on *s_model* by zeroing its curve mask.
+
+    Saves the original ``k`` and ``curve_mask`` on entry and restores both on
+    exit.  The body of the ``with`` block sees the model as a single-point
+    (k=0) model — useful for pretraining individual fixed control points
+    without altering the outer curve model.
+    """
+    original_k = s_model.k
+    original_curve_mask = s_model.curve_mask
+    s_model.k = 0
+    s_model.curve_mask = jax.tree.map(lambda x: False, original_curve_mask)
+    try:
+        yield s_model
+    finally:
+        s_model.k = original_k
+        s_model.curve_mask = original_curve_mask
+
+
+def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
     """Train each fixed control point independently (k=0).
 
     Returns:
         ``(train_params, rng_key)``
     """
     cp_fix = hp.cp_fix
-    curve_params = hp.curve_params
+    lora_params = config.get('lora_params', None)
 
     # Validation checks
     if hp.deg_segments:
@@ -1748,63 +1806,55 @@ def _pretrain_fixed_cps(rng_key, hp, data, logger, artifact):
         assert all_segments_fixed_endpoints, (
             "In curve segment mode, fixed control points must be consecutive "
             "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
-    if hp.lora_params is not None and np.sum(cp_fix) < len(cp_fix):
-        _lora_mode = curve_params.get('model_params', {}).get('lora_mode', '')
+    if lora_params is not None and np.sum(cp_fix) < len(cp_fix):
+        _lora_mode = config.get('model_params', {}).get('lora_mode', '')
         assert _lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
             "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
             "subspace curves with fixed control points")
 
     # Setup training environment for k=0
-    env, rng_key = _setup_training_env(k=0, hp=hp, data=data, rng_key=rng_key)
+    env, rng_key = _setup_training_env(
+        k=0, hp=hp, config=config, data=data, rng_key=rng_key)
 
-    # Pretraining loop
+    # Pretraining loop — single_point_mask makes the k=0 intent explicit and
+    # ensures the model is restored even if an exception is raised.
     train_params = []
     scan_fn = None
     print("Pretraining fixed control points")
-    for i, fixed in enumerate(cp_fix):
-        if fixed:
-            print(f"Training cp member {i}")
-            rng_key, init_key = random.split(rng_key)
-            params = jax.tree.map(lambda x: x, env.base_params)
-            params = _init_subspace_params(
-                env.s_model, params, env.curve_mask, env.train_mask, init_key,
-                curve_params.get('jitter_multiplier', 0.0), hp.lora_params)
+    with single_point_mask(env.s_model):
+        for i, fixed in enumerate(cp_fix):
+            if fixed:
+                print(f"Training cp member {i}")
+                rng_key, init_key = random.split(rng_key)
+                params = jax.tree.map(lambda x: x, env.base_params)
+                params = _init_subspace_params(
+                    env.s_model, params, env.curve_mask, env.train_mask, init_key,
+                    config.get('model_params', {}).get('jitter_multiplier', 0.0),
+                    lora_params)
 
-            # Re-init optimizer state
-            only_train = env.s_model.only_trainable_params(params['params'])
-            opt_state = env.optimizer.init(only_train)
+                # Re-init optimizer state
+                only_train = env.s_model.only_trainable_params(params['params'])
+                opt_state = env.optimizer.init(only_train)
 
-            # Train
-            rng_key, params, _, scan_fn = _run_training_phase(
-                rng_key=rng_key,
-                s_model=env.s_model, optimizer=env.optimizer,
-                params=params, opt_state=opt_state,
-                data=data, cosine_sim=env.cosine_sim,
-                lr_schedule=hp.lr_schedule, t_sample_fn=env.t_sample_fn,
-                dataset_sampling=hp.dataset_sampling,
-                lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s,
-                rho_scheduler=env.rho_scheduler,
-                eval_every_n_batch=hp.eval_every_n_batch,
-                valid_metrics_fn=env.valid_metrics_fn, empty_metric=env.empty_metric,
-                get_best_params=env.get_best_params,
-                batch_size=hp.batch_size,
-                num_epochs=hp.num_epochs, num_steps=hp.num_steps,
-                k=0, smoke_test=hp.smoke_test,
-                logger=logger, logger_prefix=f'cp_fixed_{i}_',
-                scan_fn=scan_fn)
+                # Train
+                env.params = params
+                env.opt_state = opt_state
+                rng_key, params, _, scan_fn = _run_training_phase(
+                    rng_key, env, data, hp, logger, f'cp_fixed_{i}_',
+                    scan_fn=scan_fn)
 
-            # Evaluate
-            _run_eval_phase(
-                s_model=env.s_model, params=params,
-                rng_key=rng_key, k=0,
-                t_sample_fn=env.t_sample_fn,
-                logger=logger, logger_prefix=f'cp_fixed_{i}_',
-                data=data, **hp.eval_common)
+                # Evaluate
+                _run_eval_phase(
+                    s_model=env.s_model, params=params,
+                    rng_key=rng_key, k=0,
+                    t_sample_fn=env.t_sample_fn,
+                    logger=logger, logger_prefix=f'cp_fixed_{i}_',
+                    data=data, **hp.eval_common)
 
-            train_params.append(env.s_model.only_trainable_params(params['params']))
-            rng_key, _ = random.split(rng_key)
-        else:
-            train_params.append(False)
+                train_params.append(env.s_model.only_trainable_params(params['params']))
+                rng_key, _ = random.split(rng_key)
+            else:
+                train_params.append(False)
 
     del env  # free GPU memory before curve phase
 
@@ -1818,7 +1868,7 @@ def _pretrain_fixed_cps(rng_key, hp, data, logger, artifact):
     return train_params, rng_key
 
 
-def _train_full_curve(rng_key, hp, data, train_params, logger, artifact):
+def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact):
     """Fit the full Bézier curve (k > 0), evaluate, and save parameters.
 
     Args:
@@ -1839,7 +1889,7 @@ def _train_full_curve(rng_key, hp, data, train_params, logger, artifact):
 
     # Setup training environment for k > 0
     env, rng_key = _setup_training_env(
-        k=k, hp=hp, data=data, rng_key=rng_key,
+        k=k, hp=hp, config=config, data=data, rng_key=rng_key,
         fixed_cps_train_params=train_params)
 
     # Log parameter stats
@@ -1860,21 +1910,7 @@ def _train_full_curve(rng_key, hp, data, train_params, logger, artifact):
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
         rng_key, params, last_trainable_params, _ = _run_training_phase(
-            rng_key=rng_key,
-            s_model=env.s_model, optimizer=env.optimizer,
-            params=env.params, opt_state=env.opt_state,
-            data=data, cosine_sim=env.cosine_sim,
-            lr_schedule=hp.lr_schedule, t_sample_fn=env.t_sample_fn,
-            dataset_sampling=hp.dataset_sampling,
-            lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s,
-            rho_scheduler=env.rho_scheduler,
-            eval_every_n_batch=hp.eval_every_n_batch,
-            valid_metrics_fn=env.valid_metrics_fn, empty_metric=env.empty_metric,
-            get_best_params=env.get_best_params,
-            batch_size=hp.batch_size,
-            num_epochs=hp.num_epochs, num_steps=hp.num_steps,
-            k=k, smoke_test=hp.smoke_test,
-            logger=logger, logger_prefix='')
+            rng_key, env, data, hp, logger, '')
     else:
         params = env.params
         last_trainable_params = None
@@ -1913,21 +1949,32 @@ def train(logger, config):
     rng_key = random.PRNGKey(config['rng_seed'])
     artifact = wandb.Artifact(name="params", type="pytree")
 
-    data, unique_target_ids, num_epochs, num_steps, lr_schedule, rng_key = \
-        _prepare_datasets(rng_key, config, logger)
+    # Resolve model path from wandb if a local path is not given
+    if config['net_kwargs']['model_path'].startswith('ddold/'):
+        model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
+        config['net_kwargs']['model_path'] = model_artifact.download()
+
+    data, unique_target_ids, rng_key = _prepare_datasets(
+        rng_key,
+        dataset_path=config['dataset_path'],
+        val_percentage=config.get('val_percentage', 0.0),
+        batch_size=config['train_hyper']['batch_size'],
+        smoke_test=config.get('smoke_test', False),
+        logger=logger)
+
+    lr_schedule = _setup_lr_schedule(config['optimizer_conf'])
 
     hp = _parse_hyperparams(
         config, unique_target_ids=unique_target_ids,
-        num_epochs=num_epochs, num_steps=num_steps,
-        lr_schedule=lr_schedule)
+        data=data, lr_schedule=lr_schedule)
 
-    train_params = False
-    if np.sum(hp.cp_fix) > 0:
-        train_params, rng_key = _pretrain_fixed_cps(
-            rng_key, hp, data, logger, artifact)
+    pretrained_params = [False] * len(hp.cp_fix)
+    if any(hp.cp_fix):
+        pretrained_params, rng_key = _pretrain_fixed_cps(
+            rng_key, hp, config, data, logger, artifact)
 
     if len(hp.cp_fix) > 1:
-        _train_full_curve(rng_key, hp, data, train_params, logger, artifact)
+        _train_full_curve(rng_key, hp, config, data, pretrained_params, logger, artifact)
 
     if hp.save_params:
         logger.log_artifact(artifact)
@@ -1957,103 +2004,109 @@ if __name__ == '__main__':
         config = wandb.config
         train(logger, config)
     else:
-        print("Using perdefined config")
-        
-        # Apply smoke test settings if enabled
-        num_epochs = 2 if args.smoke_test else 5  # Keep original value of 2
-        
+        print("Using predefined config")
+
         config = {
+            # --- Run / experiment --------------------------------------------------
             'rng_seed': 1,
-            # 'dataset_path': "datasets/text_classification/boolq/train_data.npz",
+            'save_params': True,
+            'smoke_test': args.smoke_test,
+            # 'load_params_path': "ddold/qwen_PtoC/47xexal3",
+            'load_params_path': False,
+
+            # --- Data --------------------------------------------------------------
             'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
-            'net_kwargs':{'model_path': "artifacts/qwen2.5_7B_bfloat16:v0",},
-            # 'net_kwargs':{'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0",},
-            # 'load_params_path': "ddold/qwen_PtoC/47xexal3", # path to pretrained trainable parameters
-            'load_params_path': False, # path to pretrained trainable parameters
-            # 'load_params_path': "ddold/qwen_PtoC/ywepcmp3", # path to pretrained trainable parameters
-            'save_params': True,
-            'eval_every_n_batch': 20,
-            'smoke_test': args.smoke_test,
-            'dataset_sampling': {'minibatch': {}},  # for minibatch sampling
-            # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},  # 'balanced' or 'uniform' or None
-            'lora_params': {'use_lora': True,
-                            'rho_scheduler_frequency': 100.,
-                            'filter_masks': 
-                                [
-                                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                                    {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                                ]},  # use lora for query projection
-                                # [
-                                #     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [0, 1]},
-                                #     {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [0, 1]},
-                                #     {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [0, 1]},
-                                # ]},  # use lora for query projection
-            'curve_params': {'cp_fix': args.cp_fix,
-                            'subspace_model': 'lora_category',
-                            'num_epochs': -1,
-                            'num_steps': 10 if args.smoke_test else 5_000,
-                            # 'num_steps': 5000,
-                            # 'num_steps': -1,
-                            'batch_size': args.batch_size,
-                            'jitter_multiplier': 0.,  # np.sqrt(2./fan_in, dtype=np.float32) fan_in = 1280 * 16 or 1280 = 1e-2
-                            'temperature': [1.0,],
-                            'val_percentage' : 0.1,
-                            'curve_sampling_mode': 'combined_noBMA', # 'per_leave' or 'combined'
-                            'model_params': {
-                                'natural_parameterization': False,
-                                'weight_decay': 0.,
-                                'curve_parameterization': 'bezier',
-                                'curve_segment': 3,  # if int, train on segment of degree curve_segment between fixed CPs; if False, train on whole curve
-                                'indepent_connected': False,  # if True in segment mode, segments are independently connected
-                                # 'gravity': 5.0,
-                                # 'energy_weakening': 4.,
-                                # 'regularizer': False,  # False, 'cosine', 'energy', 'force'
-                                # 'entropy_weight': 0.,
-                                'r': 8,
-                                'lora_dtype': 'float32',
-                                'lora_alpha': 16.0,
-                                # 'lora_mode': 'Arotsd(t)eB',
-                                'lora_mode': 'A(t)B(t)',
-                                # 'lora_mode': 'Arot(t)sdeBrot(t)',
-                                'lora_rho': .25,
-                                'lora_rho_s': .5,
-                            },
-                            # 'curve_sampling_mode': 'per_leave', # 'per_leave' or 'combined'
-                            # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
-                            #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],
-                            'filter_masks':[
-                                            {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
-                                            {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
-                                            {'keys': ["lm_head", "kernel"], 'op': 'all'},
-                                            ],
-                            #  'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': 0.05, 'weight_decay': 0.0001}},
-                            #  'optimizer_conf': {'name': "adamw", 'learning_rate': 0.05, 'momentum': 0.9, 'nesterov': True},
-                            # 'optimizer_conf': {'name': "sgd", 
-                            #                     'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
-                            #                     'grad_clip_norm': 100.0,
-                            # #                     'freeze_other_params': True},
-                            # 'optimizer_conf': {'name': "sgd", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                            #                                                                 'kwargs': {'transition_steps': 490_000, 'peak_value': 0.1, 'pct_start': 0.2, 'pct_final': 0.6, 'div_factor': 5.0, 'final_div_factor': 10.0}},
-                            #                                                 'momentum': 0.9, 
-                            #                                                 'nesterov': True},},
-                            'optimizer_conf': {'name': "adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                                                                                            'kwargs': {'transition_steps': 5_000, 'peak_value': 1e-4, 'pct_start': 0.12, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                                                                            'weight_decay': 0.0,
-                                                                            },
-                                                                    'freeze_other_params': True,
-                                                },
-                            # 'optimizer_conf': {'name': "sam_adamw", 'kwargs': {'learning_rate': {'name': "linear_onecycle_schedule", 
-                            #                                                                 'kwargs': {'transition_steps': 12_000, 'peak_value': 1e-4, 'pct_start': 0.06, 'pct_final': 1., 'div_factor': 300.0, 'final_div_factor': 300.0}},
-                            #                                                 'weight_decay': 0.01,
-                            #                                                 'adv_rho': 0.05,
-                            #                                                 },
-                            #                                         'freeze_other_params': True,
-                            #                    },
-                        }}
+            'val_percentage': 0.1,
+
+            # --- Base model (QwenTextClassificationWrapper) ------------------------
+            'net_kwargs': {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"},
+            # 'net_kwargs': {'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"},
+
+            # --- Training hyperparameters → TrainHyperparams ----------------------
+            # These control *how* training runs, not *what* is built.
+            'train_hyper': {
+                'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
+                'batch_size': args.batch_size,
+                'num_epochs': -1,             # -1 means use num_steps instead
+                'num_steps': 10 if args.smoke_test else 5_000,
+                'eval_every_n_batch': 20,
+                'temperature': [1.0],
+                'curve_sampling_mode': 'combined_noBMA',  # 'per_leave' | 'combined' | 'combined_noBMA'
+                'dataset_sampling': {'minibatch': {}},
+                # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
+            },
+
+            # --- Subspace model + LoRA architecture (→ _create_subspace_model) ----
+            # All parameters that determine *what* the subspace model is.
+            'model_params': {
+                'subspace_model': 'lora_category',
+                'jitter_multiplier': 0.,      # weight-init noise scale
+                'natural_parameterization': False,
+                'weight_decay': 0.,
+                'curve_parameterization': 'bezier',
+                'curve_segment': 3,           # int → segmented degree; False → full curve
+                'indepent_connected': False,  # True → independently connected segments
+                # 'gravity': 5.0,
+                # 'energy_weakening': 4.,
+                'r': 8,
+                'lora_dtype': 'float32',
+                'lora_alpha': 16.0,
+                'lora_mode': 'A(t)B(t)',
+                # 'lora_mode': 'Arotsd(t)eB',
+                # 'lora_mode': 'Arot(t)sdeBrot(t)',
+            },
+
+            # --- Curve topology (which parameters become the Bézier curve) --------
+            'curve_params': {
+                'filter_masks': [
+                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
+                    {'keys': ["lm_head", "kernel"], 'op': 'all'},
+                ],
+            },
+
+            # --- Optimizer ---------------------------------------------------------
+            'optimizer_conf': {
+                'name': "adamw",
+                'kwargs': {
+                    'learning_rate': {
+                        'name': "linear_onecycle_schedule",
+                        'kwargs': {
+                            'transition_steps': 5_000,
+                            'peak_value': 1e-4,
+                            'pct_start': 0.12,
+                            'pct_final': 1.,
+                            'div_factor': 300.0,
+                            'final_div_factor': 300.0,
+                        },
+                    },
+                    'weight_decay': 0.0,
+                },
+                'freeze_other_params': True,
+                # SGD alternative:
+                # 'name': "sgd",
+                # 'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
+                # 'grad_clip_norm': 100.0,
+            },
+
+            # --- LoRA noise / scheduling -------------------------------------------
+            # lora_rho / lora_rho_s are training hyperparameters but sourced here
+            # to keep all LoRA config in one place.
+            'lora_params': {
+                'use_lora': True,
+                'rho_scheduler_frequency': 100.,
+                'lora_rho': .25,
+                'lora_rho_s': .5,
+                'filter_masks': [
+                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                    {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                ],
+            },
+        }
         logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)
         train(logger, config)
 

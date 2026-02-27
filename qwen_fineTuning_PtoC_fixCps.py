@@ -90,32 +90,35 @@ def _empty_val_metric():
 class TrainHyperparams:
     """Pure training hyperparameters for the pipeline.
 
-    Constructed by ``_parse_hyperparams`` after data loading; consumed by
-    every stage function so they don't need the raw *config* dict.
+    All stored fields map 1-to-1 to keys inside ``config['train_hyper']``.
+    Construct via ``TrainHyperparams.from_config(config, data)``; ``data``
+    is only needed to resolve epoch / step counts from data size.
 
-    Intentionally excludes object-construction configs (optimizer_conf,
-    model_params, curve_params, lora_params, net_kwargs) — those live in
-    their own top-level config groups and are passed where needed.
+    Object-construction configs (optimizer_conf, model_params, curve_params,
+    lora_params, net_kwargs) are intentionally excluded — those live in their
+    own top-level config groups and are passed where needed.
     """
     cp_fix: list
     batch_size: int
-    batch_size_eval: int
     eval_every_n_batch: int
     num_epochs: int
     num_steps: int
     save_params: bool
     smoke_test: bool
+    val_percentage: float
     dataset_sampling: dict
-    ds_sampling: str
     curve_sampling_mode: str
     temperature: list
-    lr_schedule: object
-    deg_segments: int | bool   # derived from model_params['curve_segment']
-    indep_connected: bool      # derived from model_params['indepent_connected']
-    val_percentage: float      # fraction of train data held out for validation
-    unique_target_ids: jnp.ndarray
-    lora_rho: float            # LoRA weight noise (from lora_params)
-    lora_rho_s: float          # LoRA scale noise  (from lora_params)
+
+    # --- computed properties (not stored; derived from above fields) ------
+
+    @property
+    def batch_size_eval(self) -> int:
+        return self.batch_size * 2
+
+    @property
+    def ds_sampling(self) -> str:
+        return list(self.dataset_sampling.keys())[0]
 
     @property
     def eval_common(self) -> dict:
@@ -125,8 +128,53 @@ class TrainHyperparams:
             curve_sampling_mode=self.curve_sampling_mode,
             temperature=self.temperature,
             smoke_test=self.smoke_test,
-            lora_rho=self.lora_rho,
-            lora_rho_s=self.lora_rho_s,
+        )
+
+    @classmethod
+    def from_config(cls, config: dict, data: 'DataSplits') -> 'TrainHyperparams':
+        """Construct from a wandb / inline config dict plus loaded data.
+
+        Reads only ``config['train_hyper']``; no other config groups are
+        touched.  ``data`` is needed solely to resolve epoch / step counts
+        from the training-set size.
+        """
+        th = config['train_hyper']
+        batch_size = th['batch_size']
+        dataset_sampling = th.get('dataset_sampling', {})
+
+        cp_fix = th['cp_fix']
+        print(f"Control point fixed list: {cp_fix}")
+
+        # Compute num_epochs / num_steps from data size
+        num_epochs_cfg = th.get('num_epochs', -1)
+        num_steps_cfg = th.get('num_steps', -1)
+        assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), \
+            "Only one of num_epochs or num_steps should be > 0"
+        has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
+        if has_train_data:
+            n_train = len(data.train_input_ids)
+            num_epochs = num_epochs_cfg
+            num_steps = num_steps_cfg
+            if num_steps > 0:
+                num_epochs = int(np.ceil(1. * num_steps * batch_size / n_train))
+                print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
+            num_steps = int(np.ceil(1. * num_epochs * n_train / batch_size))
+            print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
+        else:
+            num_epochs = num_steps = 0
+
+        return cls(
+            cp_fix=cp_fix,
+            batch_size=batch_size,
+            eval_every_n_batch=th.get('eval_every_n_batch', 20),
+            num_epochs=num_epochs,
+            num_steps=num_steps,
+            save_params=th.get('save_params', False),
+            smoke_test=th.get('smoke_test', False),
+            val_percentage=th.get('val_percentage', 0.0),
+            dataset_sampling=dataset_sampling,
+            curve_sampling_mode=th.get('curve_sampling_mode', 'combined'),
+            temperature=th.get('temperature', [1.0]),
         )
 
 
@@ -152,6 +200,9 @@ class TrainingEnv:
     get_best_params: object
     cosine_sim: jnp.ndarray | None
     n_trainable: int
+    lr_schedule: object
+    lora_rho: float
+    lora_rho_s: float
 
 
 # jax.config.update("jax_log_compiles", True)
@@ -1356,10 +1407,10 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
     get_best_params = env.get_best_params
 
     k = s_model.k
-    lr_schedule = hp.lr_schedule
+    lr_schedule = env.lr_schedule
     dataset_sampling = hp.dataset_sampling
-    lora_rho = hp.lora_rho
-    lora_rho_s = hp.lora_rho_s
+    lora_rho = env.lora_rho
+    lora_rho_s = env.lora_rho_s
     eval_every_n_batch = hp.eval_every_n_batch
     batch_size = hp.batch_size
     num_epochs = hp.num_epochs
@@ -1373,7 +1424,7 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
     best_val_ll = -np.inf
     best_params = s_model.only_trainable_params(params['params']) if data.has_val else None
 
-    ds_sampling = list(dataset_sampling.keys())[0]
+    ds_sampling = hp.ds_sampling
     train_input_ids = data.train_input_ids
     train_attention_mask = data.train_attention_mask
     train_labels = data.train_labels
@@ -1591,67 +1642,6 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
     return data, unique_target_ids, rng_key
 
 
-def _parse_hyperparams(config, *, unique_target_ids, data, lr_schedule):
-    """Extract true training hyperparameters from *config* into a ``TrainHyperparams``.
-
-    Reads ``train_hyper``, ``model_params``, and ``lora_params`` groups from
-    *config* — none of those groups is mutated here.
-
-    Also computes ``num_epochs`` and ``num_steps`` from the data size and the
-    ``num_epochs`` / ``num_steps`` config values (exactly one must be > 0 for
-    training; both ≤ 0 means eval-only).
-    """
-    th = config['train_hyper']
-    mp = config.get('model_params', {})
-    lp = config.get('lora_params', {})
-
-    cp_fix = th['cp_fix']
-    print(f"Control point fixed list: {cp_fix}")
-
-    batch_size = th['batch_size']
-    dataset_sampling = th.get('dataset_sampling', {})
-
-    # Compute num_epochs / num_steps from data size
-    num_epochs_cfg = th.get('num_epochs', -1)
-    num_steps_cfg = th.get('num_steps', -1)
-    assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), \
-        "Only one of num_epochs or num_steps should be > 0"
-    has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
-    if has_train_data:
-        n_train = len(data.train_input_ids)
-        num_epochs = num_epochs_cfg
-        num_steps = num_steps_cfg
-        if num_steps > 0:
-            num_epochs = int(np.ceil(1. * num_steps * batch_size / n_train))
-            print(f"Setting num_epochs to {num_epochs} to match {num_steps} steps")
-        num_steps = int(np.ceil(1. * num_epochs * n_train / batch_size))
-        print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
-    else:
-        num_epochs = num_steps = 0
-
-    return TrainHyperparams(
-        cp_fix=cp_fix,
-        batch_size=batch_size,
-        batch_size_eval=batch_size * 2,
-        eval_every_n_batch=th.get('eval_every_n_batch', 20),
-        num_epochs=num_epochs,
-        num_steps=num_steps,
-        save_params=config.get('save_params', False),
-        smoke_test=config.get('smoke_test', False),
-        dataset_sampling=dataset_sampling,
-        ds_sampling=list(dataset_sampling.keys())[0],
-        curve_sampling_mode=th.get('curve_sampling_mode', 'combined'),
-        temperature=th.get('temperature', [1.0]),
-        lr_schedule=lr_schedule,
-        deg_segments=mp.get('curve_segment', False),
-        indep_connected=mp.get('indepent_connected', False),
-        val_percentage=config.get('val_percentage', 0.0),
-        unique_target_ids=unique_target_ids,
-        lora_rho=lp.get('lora_rho', 0.0),
-        lora_rho_s=lp.get('lora_rho_s', 0.0),
-    )
-
-
 def _compute_expert_embeddings(model, params, data, hp):
     """Compute cosine-similarity matrix for expert sorting, if needed.
 
@@ -1699,9 +1689,11 @@ def _setup_training_env(*, rng_key, k, hp, config, data,
     subspace_model = mp.get('subspace_model', '')
     jitter_multiplier = mp.get('jitter_multiplier', 0.0)
     lora_params = config.get('lora_params', None)
+    lr_schedule = optimizer_conf['kwargs']['learning_rate']
+    lora_rho = lora_params.get('lora_rho', 0.0) if lora_params else 0.0
+    lora_rho_s = lora_params.get('lora_rho_s', 0.0) if lora_params else 0.0
 
-    model = QwenTextClassificationWrapper(
-        **net_kwargs, target_token_ids=hp.unique_target_ids)
+    model = QwenTextClassificationWrapper(**net_kwargs)
     base_params = unfreeze(model.init(None, None))
 
     rng_key, init_key = random.split(rng_key)
@@ -1751,7 +1743,7 @@ def _setup_training_env(*, rng_key, k, hp, config, data,
             _setup_validation(
                 s_model, params, data.val_input_ids, data.val_attention_mask,
                 data.val_labels, hp.batch_size_eval, k=k,
-                lora_rho=hp.lora_rho, lora_rho_s=hp.lora_rho_s)
+                lora_rho=lora_rho, lora_rho_s=lora_rho_s)
     else:
         empty_metric = _empty_val_metric()
         valid_metrics_fn = lambda rng, params: empty_metric
@@ -1764,7 +1756,8 @@ def _setup_training_env(*, rng_key, k, hp, config, data,
         t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
         valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
         get_best_params=get_best_params,
-        cosine_sim=cosine_sim, n_trainable=n_trainable)
+        cosine_sim=cosine_sim, n_trainable=n_trainable,
+        lr_schedule=lr_schedule, lora_rho=lora_rho, lora_rho_s=lora_rho_s)
 
     return env, rng_key
 
@@ -1799,9 +1792,10 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
     lora_params = config.get('lora_params', None)
 
     # Validation checks
-    if hp.deg_segments:
+    deg_segments = config.get('model_params', {}).get('curve_segment', False)
+    if deg_segments:
         all_segments_fixed_endpoints = np.all(
-            [hp.deg_segments == i for i in np.diff(
+            [deg_segments == i for i in np.diff(
                 np.argwhere(np.array(cp_fix) == 1).flatten())])
         assert all_segments_fixed_endpoints, (
             "In curve segment mode, fixed control points must be consecutive "
@@ -1849,7 +1843,8 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
                     rng_key=rng_key, k=0,
                     t_sample_fn=env.t_sample_fn,
                     logger=logger, logger_prefix=f'cp_fixed_{i}_',
-                    data=data, **hp.eval_common)
+                    data=data, **hp.eval_common,
+                    lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
 
                 train_params.append(env.s_model.only_trainable_params(params['params']))
                 rng_key, _ = random.split(rng_key)
@@ -1878,11 +1873,13 @@ def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact)
     k = len(cp_fix) - 1
     all_fixed = len(cp_fix) == np.sum(cp_fix)
 
+    deg_segments = config.get('model_params', {}).get('curve_segment', False)
+    indep_connected = config.get('model_params', {}).get('indepent_connected', False)
     print("Training curve model")
     if np.sum(cp_fix) == 0:
         print("No fixed control points, training full curve with all control points free.")
-        if hp.deg_segments:
-            assert hp.indep_connected is True, (
+        if deg_segments:
+            assert indep_connected is True, (
                 "In curve segment mode with no fixed control points, curve "
                 "optimization only makes sense if all segments are "
                 "independently connected.")
@@ -1921,7 +1918,8 @@ def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact)
         rng_key=rng_key, k=k,
         t_sample_fn=env.t_sample_fn,
         logger=logger, logger_prefix='',
-        data=data, **hp.eval_common)
+        data=data, **hp.eval_common,
+        lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
 
     # Save curve params
     if hp.save_params:
@@ -1957,16 +1955,14 @@ def train(logger, config):
     data, unique_target_ids, rng_key = _prepare_datasets(
         rng_key,
         dataset_path=config['dataset_path'],
-        val_percentage=config.get('val_percentage', 0.0),
+        val_percentage=config['train_hyper'].get('val_percentage', 0.0),
         batch_size=config['train_hyper']['batch_size'],
-        smoke_test=config.get('smoke_test', False),
+        smoke_test=config['train_hyper'].get('smoke_test', False),
         logger=logger)
 
-    lr_schedule = _setup_lr_schedule(config['optimizer_conf'])
-
-    hp = _parse_hyperparams(
-        config, unique_target_ids=unique_target_ids,
-        data=data, lr_schedule=lr_schedule)
+    _setup_lr_schedule(config['optimizer_conf'])
+    config['net_kwargs']['target_token_ids'] = unique_target_ids
+    hp = TrainHyperparams.from_config(config, data)
 
     pretrained_params = [False] * len(hp.cp_fix)
     if any(hp.cp_fix):
@@ -2009,8 +2005,6 @@ if __name__ == '__main__':
         config = {
             # --- Run / experiment --------------------------------------------------
             'rng_seed': 1,
-            'save_params': True,
-            'smoke_test': args.smoke_test,
             # 'load_params_path': "ddold/qwen_PtoC/47xexal3",
             'load_params_path': False,
 
@@ -2019,7 +2013,6 @@ if __name__ == '__main__':
             # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
             # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
-            'val_percentage': 0.1,
 
             # --- Base model (QwenTextClassificationWrapper) ------------------------
             'net_kwargs': {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"},
@@ -2037,6 +2030,9 @@ if __name__ == '__main__':
                 'curve_sampling_mode': 'combined_noBMA',  # 'per_leave' | 'combined' | 'combined_noBMA'
                 'dataset_sampling': {'minibatch': {}},
                 # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
+                'save_params': True,
+                'smoke_test': args.smoke_test,
+                'val_percentage': 0.1,
             },
 
             # --- Subspace model + LoRA architecture (→ _create_subspace_model) ----

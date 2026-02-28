@@ -9,19 +9,15 @@ import argparse
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import random, jit
+from jax import random
 import optax
 import wandb
-from functools import partial
 from einshape import jax_einshape as es
 import matplotlib.pyplot as plt
 from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
-from tqdm import tqdm
 from src.utils import calibration_error as ece_fn, post_pred_performance
-from copy import deepcopy
-from numpyro import distributions as dist
 
 # Project imports
 from src.qwen_jax import QwenTextClassificationWrapper
@@ -304,6 +300,12 @@ class ModelParams:
         if self.lora_params and self.lora_params.use_lora:
             d.update(self.lora_params.model_kwargs())
         return d
+
+    @property
+    def lora_rho_values(self) -> tuple[float, float]:
+        """Return ``(lora_rho, lora_rho_s)``, defaulting to 0.0 when no LoRA."""
+        lp = self.lora_params
+        return (lp.lora_rho if lp else 0.0, lp.lora_rho_s if lp else 0.0)
 
     def build_curve_mask(self, params_tree, k):
         """Build the curve mask from ``filter_masks`` applied to *params_tree*.
@@ -1168,9 +1170,7 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
     get_best_params = env.get_best_params
     eval_every_n_batch = config.train_hyper.eval_every_n_batch
     k = s_model.k
-    lora_params = config.model_params.lora_params
-    lora_rho = lora_params.lora_rho if lora_params else 0.0
-    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
+    lora_rho, lora_rho_s = config.model_params.lora_rho_values
 
     def train_batch(carry, batch_idx):
         rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
@@ -1551,9 +1551,7 @@ def _run_eval_phase(*, rng_key, env, params, config: 'Config', data,
     t_sample_fn = env.t_sample_fn
     temperature = config.train_hyper.temperature
     smoke_test = config.train_hyper.smoke_test
-    lora_params = config.model_params.lora_params
-    lora_rho = lora_params.lora_rho if lora_params else 0.0
-    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
+    lora_rho, lora_rho_s = config.model_params.lora_rho_values
 
     # Disable LoRA noise for evaluation
     if lora_rho > 0.0 or lora_rho_s > 0.0:
@@ -1607,6 +1605,7 @@ def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, lo
         window_size = max(hp.batch_size, window_size)
         train_step = _make_expert_step_fn(env, config, window_size=window_size)
         carry = (rng_key, params, opt_state, best_val_ll, best_params, data.get('train'))
+        scan_length = hp.num_steps
 
     elif hp.ds_sampling == 'minibatch':
         print(f"Start minibatch training for {hp.num_epochs} epochs")
@@ -1619,11 +1618,12 @@ def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, lo
             initial_cp_center=initial_cp_center)
 
         carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
+        scan_length = hp.num_epochs
     else:
         raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
 
     # run training loop and collect metrics
-    carry, metrics = jax.lax.scan(train_step, carry, jnp.arange(hp.num_steps))
+    carry, metrics = jax.lax.scan(train_step, carry, jnp.arange(scan_length))
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
@@ -1637,7 +1637,8 @@ def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, lo
     _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
 
     # Log metrics as artifact
-    epochs = np.repeat(np.arange(hp.num_epochs), hp.num_steps // hp.batch_size)
+    batches_per_epoch = hp.num_steps // max(hp.num_epochs, 1)
+    epochs = np.repeat(np.arange(hp.num_epochs), batches_per_epoch)
     jnp.savez(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz', **metrics, epochs=epochs)
     art = wandb.Artifact(name="metrics", type="npz")
     art.add_file(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz')
@@ -1744,17 +1745,14 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
 
 
 def _compute_expert_embeddings(model:QwenTextClassificationWrapper, data, config: 'Config'):
-    """Compute cosine-similarity matrix for expert sorting, if needed.
-    Hold params memory twice perhaps a problem 
-    Returns ``None`` when expert sorting is not configured or not required.
+    """Compute cosine-similarity matrix for expert sorting.
+
+    Callers must already guard on ``ds_sampling == 'expert'`` and a
+    non-Random ``sort_mode``; this function always computes embeddings.
+    Hold params memory twice perhaps a problem.
     """
     params = model.init(None, None)
     hp = config.train_hyper
-    if (hp.ds_sampling != 'expert') or (hp.num_steps <= 0) or not data.has_train:
-        return None
-    sort_mode = hp.dataset_sampling['expert'].get('sort_mode', False)
-    if not sort_mode or sort_mode == 'Random':
-        return None
     print("compute embeddings for expert sort")
     train_input_ids, train_attention_mask, _ = data.get('train')
     embedding = get_embedding(
@@ -1858,7 +1856,6 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
 
                 train_params.append(
                     env.s_model.only_trainable_params(params['params']))
-                rng_key, _ = random.split(rng_key)
             else:
                 train_params.append(False)
 
@@ -1916,12 +1913,11 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     env.optimizer = _init_optimizer(config, curve_mask=env.s_model.curve_mask, curve_params=params['params'])
 
     # Log parameter stats
-    n_params = sum(
-        p.size if isinstance(p, jnp.ndarray) else 0
-        for p in jax.tree.flatten(params)[0])
+    flat_params = jax.tree.flatten(params)[0]
+    n_params = sum(p.size if isinstance(p, jnp.ndarray) else 0 for p in flat_params)
     param_memory = sum(
         p.size * p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0
-        for p in jax.tree.flatten(params)[0])
+        for p in flat_params)
     n_trainable = sum(p.size for p in jax.tree.flatten(
         env.s_model.only_trainable_params(params['params']))[0])
     logger.summary.update({

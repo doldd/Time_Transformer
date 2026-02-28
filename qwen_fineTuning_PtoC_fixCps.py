@@ -586,31 +586,6 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     return acc_fn
 
 
-def get_embedding(input_ids, attention_mask, model, params, batch_size = 11):
-    x_ = input_ids[:(matching_limit:=(input_ids.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-    x_last = input_ids[matching_limit:]
-    x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-    att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-    att_last = attention_mask[matching_limit:]
-    att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-    # inp_last = 
-    # @partial(jax.jit, donate_argnums=(0,))
-    def get_embeddings_(params, data):
-        input_ids, attention_mask = data
-        model_output, state = model.apply(freeze(params), input_ids=input_ids, attention_mask=attention_mask, train=False,
-                                capture_intermediates=True, mutable=['intermediates'])
-        embedding = state['intermediates']['norm']['__call__'][0]
-        return params, embedding
-
-    params, embedding = jax.lax.scan(get_embeddings_, params, (x_, att_m_))
-    embedding = es('ib...->(ib)...', embedding, b=batch_size)
-    if x_last.shape[0] > 0:
-        params, embedding_last = get_embeddings_(params, (x_last, att_last))
-        embedding = jnp.concatenate([embedding, embedding_last], axis=0)
-    return embedding
-
-
 def mutual_information(logits, weights:np.ndarray|bool=False):
     """Compute mutual information from logits over samples
 
@@ -1180,49 +1155,6 @@ def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
     return train_epoch
 
 
-def _sort_data_for_expert(rng_key, data: 'DataSplits', config: 'Config', model):
-    """Sort training data according to expert sampling configuration.
-
-    Handles ``'Random'``, ``'Hierarchical'``, ``'Spectral'``, and
-    ``'First_data'`` sort modes.  Returns the (possibly reordered)
-    training arrays.
-
-    Returns:
-        ``(train_input_ids, train_attention_mask, train_labels)``
-    """
-    train_input_ids, train_attention_mask, train_labels = data.get('train')
-    sort_mode = config.train_hyper.dataset_sampling['expert'].get('sort_mode', False)
-
-    if sort_mode == 'Random':
-        order = random.permutation(rng_key, train_input_ids.shape[0])
-    elif sort_mode:
-        cosine_sim = _compute_expert_embeddings(model, data, config)
-        assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
-        distance = 1 - cosine_sim
-        if sort_mode == 'Hierarchical':
-            condensed = squareform(distance, checks=False)
-            Z = hierarchy.linkage(condensed, method='average')
-            Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
-            order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
-            order = jnp.array(order)
-        elif sort_mode == 'Spectral':
-            distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
-            D = jnp.diag(distance.sum(axis=1))
-            L = D - distance
-            vals, vecs = jnp.linalg.eigh(L)
-            fiedler = vecs[:, -2]
-            order = jnp.argsort(fiedler)
-        elif sort_mode == 'First_data':
-            order = jnp.argsort(distance[0])
-        else:
-            raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
-        print(f"Data sorted for expert sampling using {sort_mode} method")
-    else:
-        return train_input_ids, train_attention_mask, train_labels
-
-    return train_input_ids[order], train_attention_mask[order], train_labels[order]
-
-
 def _make_expert_step_fn(env: 'TrainingEnv', config: 'Config', *,
                           window_size):
     """Return a ``_train_expert_step(carry, step)`` closure for ``jax.lax.scan``."""
@@ -1270,6 +1202,104 @@ def _make_expert_step_fn(env: 'TrainingEnv', config: 'Config', *,
             {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
     return _train_expert_step
+
+
+
+# ---------------------------------------------------------------------------
+# Expert data handling (embedding computation, sorting)
+# ---------------------------------------------------------------------------
+
+def get_embedding(input_ids, attention_mask, model, params, batch_size = 11):
+    x_ = input_ids[:(matching_limit:=(input_ids.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
+    x_last = input_ids[matching_limit:]
+    x_ = es('(ib)...->ib...', x_, b=batch_size)
+
+    att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
+    att_last = attention_mask[matching_limit:]
+    att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
+    # inp_last = 
+    # @partial(jax.jit, donate_argnums=(0,))
+    def get_embeddings_(params, data):
+        input_ids, attention_mask = data
+        model_output, state = model.apply(freeze(params), input_ids=input_ids, attention_mask=attention_mask, train=False,
+                                capture_intermediates=True, mutable=['intermediates'])
+        embedding = state['intermediates']['norm']['__call__'][0]
+        return params, embedding
+
+    params, embedding = jax.lax.scan(get_embeddings_, params, (x_, att_m_))
+    embedding = es('ib...->(ib)...', embedding, b=batch_size)
+    if x_last.shape[0] > 0:
+        params, embedding_last = get_embeddings_(params, (x_last, att_last))
+        embedding = jnp.concatenate([embedding, embedding_last], axis=0)
+    return embedding
+
+
+def _compute_expert_embeddings(model:QwenTextClassificationWrapper, data, config: 'Config'):
+    """Compute cosine-similarity matrix for expert sorting.
+
+    Callers must already guard on ``ds_sampling == 'expert'`` and a
+    non-Random ``sort_mode``; this function always computes embeddings.
+    Hold params memory twice perhaps a problem.
+    """
+    params = model.init(None, None)
+    hp = config.train_hyper
+    print("compute embeddings for expert sort")
+    train_input_ids, train_attention_mask, _ = data.get('train')
+    embedding = get_embedding(
+        train_input_ids, train_attention_mask,
+        model, params, hp.batch_size)
+    print(f"Computed embeddings for expert sort with shape {embedding.shape}")
+    device = embedding.device
+    embedding = jax.device_put(embedding, jax.devices("cpu")[0])
+    embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
+    embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
+    cosine_sim = jax.device_put(jnp.dot(embedding, embedding.T), device)
+    print(f"Computed cosine similarity matrix with shape {cosine_sim.shape}")
+    del embedding
+    return cosine_sim
+
+
+def _sort_data_for_expert(rng_key, data: 'DataSplits', config: 'Config', model):
+    """Sort training data according to expert sampling configuration.
+
+    Handles ``'Random'``, ``'Hierarchical'``, ``'Spectral'``, and
+    ``'First_data'`` sort modes.  Returns the (possibly reordered)
+    training arrays.
+
+    Returns:
+        ``(train_input_ids, train_attention_mask, train_labels)``
+    """
+    train_input_ids, train_attention_mask, train_labels = data.get('train')
+    sort_mode = config.train_hyper.dataset_sampling['expert'].get('sort_mode', False)
+
+    if sort_mode == 'Random':
+        order = random.permutation(rng_key, train_input_ids.shape[0])
+    elif sort_mode:
+        cosine_sim = _compute_expert_embeddings(model, data, config)
+        assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
+        distance = 1 - cosine_sim
+        if sort_mode == 'Hierarchical':
+            condensed = squareform(distance, checks=False)
+            Z = hierarchy.linkage(condensed, method='average')
+            Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
+            order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
+            order = jnp.array(order)
+        elif sort_mode == 'Spectral':
+            distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
+            D = jnp.diag(distance.sum(axis=1))
+            L = D - distance
+            vals, vecs = jnp.linalg.eigh(L)
+            fiedler = vecs[:, -2]
+            order = jnp.argsort(fiedler)
+        elif sort_mode == 'First_data':
+            order = jnp.argsort(distance[0])
+        else:
+            raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
+        print(f"Data sorted for expert sampling using {sort_mode} method")
+    else:
+        return train_input_ids, train_attention_mask, train_labels
+
+    return train_input_ids[order], train_attention_mask[order], train_labels[order]
 
 
 # ---------------------------------------------------------------------------
@@ -1354,6 +1384,56 @@ def _setup_rho_scheduler(lora_params, num_steps):
         return rho_scheduler
     else:
         return lambda step, base: base
+
+
+def _setup_training_env(config: Config, data):    
+    """Prepare the training environment for a curve or single-point run.
+
+    This function instantiates the model wrapper and the chosen subspace
+    model, configures the t-sampling function and LoRA rho scheduler,
+    prepares validation helpers, and builds the optimizer. The returned
+    `TrainingEnv` bundles the subspace model, optimizer and the helper
+    callables required during training and evaluation.
+
+    Args:
+        config (Config): Experiment configuration containing model and
+            training parameters (including `model_params` and optimizer
+            settings).
+        data (DataSplits): Dataset splits used to configure validation
+            behavior (may be consulted when building validation functions).
+        curve_mask: Optional pytree mask selecting curve control-point
+            parameters (passed to the optimizer builder when applicable).
+        curve_params: Optional pytree of curve parameters (used for
+            dimension inference when constructing parameter masks).
+
+    Returns:
+        TrainingEnv: Container with attributes `s_model`, `optimizer`,
+            `t_sample_fn`, `rho_scheduler`, `valid_metrics_fn`,
+            `empty_metric`, and `get_best_params` used by the training
+            and evaluation loops.
+    """
+    mp = config.model_params
+
+    model = QwenTextClassificationWrapper(**config.net_kwargs)
+    # Instantiate the subspace model
+    logging.info("Using subspace model: %s", mp.subspace_model)
+    s_model_cls = get_subspace_model(mp.subspace_model)
+    s_model = s_model_cls(**mp.get_model_kwargs(model=model))
+    
+    # t sampling, rho scheduler, validation
+    t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
+    rho_scheduler = _setup_rho_scheduler(mp.lora_params, config.train_hyper.num_steps)
+    valid_metrics_fn, empty_metric, get_best_params = _setup_validation(
+                s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
+
+    optimizer = _init_optimizer(config)
+    
+    env = TrainingEnv(
+        s_model=s_model, optimizer=optimizer,
+        t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
+        valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
+        get_best_params=get_best_params)
+    return env
 
 
 def run_training(rng_key, env, params, data, config: 'Config', logger, logger_prefix):
@@ -1524,81 +1604,6 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
     )
 
     return data, unique_target_ids, rng_key
-
-
-def _compute_expert_embeddings(model:QwenTextClassificationWrapper, data, config: 'Config'):
-    """Compute cosine-similarity matrix for expert sorting.
-
-    Callers must already guard on ``ds_sampling == 'expert'`` and a
-    non-Random ``sort_mode``; this function always computes embeddings.
-    Hold params memory twice perhaps a problem.
-    """
-    params = model.init(None, None)
-    hp = config.train_hyper
-    print("compute embeddings for expert sort")
-    train_input_ids, train_attention_mask, _ = data.get('train')
-    embedding = get_embedding(
-        train_input_ids, train_attention_mask,
-        model, params, hp.batch_size)
-    print(f"Computed embeddings for expert sort with shape {embedding.shape}")
-    device = embedding.device
-    embedding = jax.device_put(embedding, jax.devices("cpu")[0])
-    embedding = embedding.reshape(embedding.shape[0], -1).astype(jnp.float32)
-    embedding /= jnp.linalg.norm(embedding, axis=1, keepdims=True)
-    cosine_sim = jax.device_put(jnp.dot(embedding, embedding.T), device)
-    print(f"Computed cosine similarity matrix with shape {cosine_sim.shape}")
-    del embedding
-    return cosine_sim
-
-
-def _setup_training_env(config: Config, data):    
-    """Prepare the training environment for a curve or single-point run.
-
-    This function instantiates the model wrapper and the chosen subspace
-    model, configures the t-sampling function and LoRA rho scheduler,
-    prepares validation helpers, and builds the optimizer. The returned
-    `TrainingEnv` bundles the subspace model, optimizer and the helper
-    callables required during training and evaluation.
-
-    Args:
-        config (Config): Experiment configuration containing model and
-            training parameters (including `model_params` and optimizer
-            settings).
-        data (DataSplits): Dataset splits used to configure validation
-            behavior (may be consulted when building validation functions).
-        curve_mask: Optional pytree mask selecting curve control-point
-            parameters (passed to the optimizer builder when applicable).
-        curve_params: Optional pytree of curve parameters (used for
-            dimension inference when constructing parameter masks).
-
-    Returns:
-        TrainingEnv: Container with attributes `s_model`, `optimizer`,
-            `t_sample_fn`, `rho_scheduler`, `valid_metrics_fn`,
-            `empty_metric`, and `get_best_params` used by the training
-            and evaluation loops.
-    """
-    mp = config.model_params
-
-    model = QwenTextClassificationWrapper(**config.net_kwargs)
-    # Instantiate the subspace model
-    logging.info("Using subspace model: %s", mp.subspace_model)
-    s_model_cls = get_subspace_model(mp.subspace_model)
-    s_model = s_model_cls(**mp.get_model_kwargs(model=model))
-    
-    # t sampling, rho scheduler, validation
-    t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
-    rho_scheduler = _setup_rho_scheduler(mp.lora_params, config.train_hyper.num_steps)
-    valid_metrics_fn, empty_metric, get_best_params = _setup_validation(
-                s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
-
-    optimizer = _init_optimizer(config)
-    
-    env = TrainingEnv(
-        s_model=s_model, optimizer=optimizer,
-        t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
-        valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-        get_best_params=get_best_params)
-    return env
 
 
 def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):

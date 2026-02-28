@@ -1082,9 +1082,9 @@ def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_para
         params (dict, updated in-place)
     """
     lora_params = config.model_params.lora_params
-    params = s_model.model.init(None, None) # base parameters loaded from file
+    params = unfreeze(s_model.model.init(None, None)) # base parameters loaded from file
 
-    curve_mask, train_mask, lora_mask = config.build_masks(params)
+    curve_mask, train_mask, lora_mask = config.build_masks(params['params'])
 
     params = s_model.init_params_from_point(
         init_key, params, curve_mask,
@@ -1141,7 +1141,7 @@ def _init_optimizer(config:Config, curve_mask=None, curve_params=None):
         opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf.grad_clip_norm))
 
     # Freeze already-trained control points during curve fitting
-    if mp.k > 1 and any(mp.cp_fix):
+    if mp.k > 1 and any(mp.cp_fix) and curve_mask is not None:
         def get_dims(param):
             return (-1,) + (1,) * (param.ndim - 1)
         cps_fixed = jnp.array(mp.cp_fix, dtype=bool)
@@ -1574,7 +1574,7 @@ def _run_training_phase(rng_key, env, params, opt_state, data, config: 'Config',
             train_attention_mask = train_attention_mask[order]
             train_labels = train_labels[order]
         elif sort_mode:
-            cosine_sim = _compute_expert_embeddings(s_model.model, params, data, config)
+            cosine_sim = _compute_expert_embeddings(s_model.model, data, config)
             assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
             distance = 1 - cosine_sim
             if sort_mode == 'Hierarchical':

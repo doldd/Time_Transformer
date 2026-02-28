@@ -1526,7 +1526,7 @@ def _run_eval_phase(*, rng_key, env, params, config: 'Config', data,
     return params
 
 
-def _run_training_phase(rng_key, env, params, opt_state, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
+def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
     """Execute one training phase (expert or minibatch) and log metrics.
 
     If *scan_fn* is provided it is reused (avoids JAX retrace across
@@ -1538,6 +1538,11 @@ def _run_training_phase(rng_key, env, params, opt_state, data, config: 'Config',
     hp = config.train_hyper
     s_model = env.s_model
     optimizer = env.optimizer
+
+    only_train = s_model.only_trainable_params(params['params'])
+    opt_state = optimizer.init(only_train)
+    n_trainable = sum(p.size for p in jax.tree.flatten(only_train)[0])
+    print(f"Number of trainable parameters: {n_trainable:_}")
     t_sample_fn = env.t_sample_fn
     rho_scheduler = env.rho_scheduler
     valid_metrics_fn = env.valid_metrics_fn
@@ -1862,11 +1867,8 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
                 params = _init_subspace_params(
                     pt_config, env.s_model, init_key)
 
-                opt_state = env.optimizer.init(
-                    env.s_model.only_trainable_params(params['params']))
-
                 rng_key, params, _, scan_fn = _run_training_phase(
-                    rng_key, env, params, opt_state, data, pt_config, logger,
+                    rng_key, env, params, data, pt_config, logger,
                     f'cp_fixed_{i}_', scan_fn=scan_fn)
 
                 _run_eval_phase(
@@ -1933,11 +1935,6 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     # Rebuild optimizer with curve mask/params so CP-freeze mask is applied
     env.optimizer = _init_optimizer(config, curve_mask=env.s_model.curve_mask, curve_params=params['params'])
 
-    only_train = env.s_model.only_trainable_params(params['params'])
-    opt_state = env.optimizer.init(only_train)
-    n_trainable = sum(p.size for p in jax.tree.flatten(only_train)[0])
-    print(f"Number of trainable parameters: {n_trainable:_}")
-
     # Log parameter stats
     n_params = sum(
         p.size if isinstance(p, jnp.ndarray) else 0
@@ -1945,6 +1942,8 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     param_memory = sum(
         p.size * p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0
         for p in jax.tree.flatten(params)[0])
+    n_trainable = sum(p.size for p in jax.tree.flatten(
+        env.s_model.only_trainable_params(params['params']))[0])
     logger.summary.update({
         'n_params': n_params,
         'memory_params': param_memory,
@@ -1956,7 +1955,7 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
         rng_key, params, last_trainable_params, _ = _run_training_phase(
-            rng_key, env, params, opt_state, data, config, logger, '')
+            rng_key, env, params, data, config, logger, '')
     else:
         last_trainable_params = None
 

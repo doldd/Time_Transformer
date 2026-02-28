@@ -934,8 +934,8 @@ def _eval_best_temperature(*, logits, labels, logger, key_prefix,
 # ---------------------------------------------------------------------------
 
 PRETRAIN_EVAL_FNS = [
-    _eval_summary,
     _eval_post_pred,
+    # _eval_summary,
 ]
 
 CURVE_EVAL_FNS = [
@@ -946,49 +946,49 @@ CURVE_EVAL_FNS = [
 ]
 
 
-def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
-                   batch_size_eval, t_sample_fn=None, temperature=(1.0,),
-                   logger, logger_prefix='', smoke_test=False, k=0,
-                   artifact_weights=None):
+def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
+                   data: 'DataSplits', config: 'Config',
+                   logger, logger_prefix='', artifact_weights=None):
     """Run the modular evaluation pipeline.
 
-    **Two-phase design**: for each entry in *eval_specs* the pipeline first
-    computes logits on the specified dataset, then runs the requested metrics
-    on those logits.  A shared *ctx* dict enables cross-dataset communication
-    (e.g. posterior weights computed on train used by metrics on test).
+    **Two-phase design**: for each entry in the auto-built *eval_specs* the
+    pipeline first computes logits on the specified dataset, then runs the
+    requested metrics on those logits.  A shared *ctx* dict enables
+    cross-dataset communication (e.g. posterior weights computed on train
+    used by metrics on test).
 
     Args:
-        s_model: Subspace model instance.
-        params: Model parameters pytree.
         rng_key: JAX random key.
+        env: ``TrainingEnv`` providing ``s_model`` and ``t_sample_fn``.
+        params: Model parameters pytree.
         data: ``DataSplits`` instance; splits are looked up by name via
             ``data.get(name)``.
-        eval_specs: Ordered list of eval specification dicts.  Each dict may
-            contain:
-
-            - ``name`` (str): Split name passed to ``data.get()`` (``'train'``, ``'val'``, ``'test'``).
-            - ``sampling`` (str): ``'linspace'`` | ``'t_sample'``
-              (default ``'linspace'``).
-            - ``n_samples`` (int): Number of *t* samples
-              (default 20; clipped to 3 for smoke tests / k==0).
-            - ``key_prefix`` (str): Prefix for metric keys
-              (default ``'{name}_'``).
-            - ``metrics`` (list): Callables or dicts ``{'fn': callable, **extra}``
-              to run on this data split.
-            - ``store_logits`` (bool): If True, cache logits in *ctx*.
-
-        batch_size_eval: Batch size for evaluation forward passes.
-        t_sample_fn: Callable for ``'t_sample'`` sampling mode.
-        temperature: Sequence of temperature values for posterior weighting.
+        config: ``Config`` providing model_params (k, curve_sampling_mode)
+            and train_hyper (batch_size_eval, temperature, smoke_test).
         logger: wandb run object.
         logger_prefix: Global prefix prepended to logged keys.
-        smoke_test: Limit *n_samples* to 3.
-        k: Bézier curve degree.
         artifact_weights: Optional wandb artifact with pre-computed weights.
 
     Returns:
         ctx: Context dict accumulated during evaluation.
     """
+    # Disable LoRA noise during evaluation
+    lora_rho, lora_rho_s = config.model_params.lora_rho_values
+    if lora_rho > 0.0 or lora_rho_s > 0.0:
+        params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+
+    s_model = env.s_model
+    t_sample_fn = env.t_sample_fn
+    k = config.model_params.k
+    batch_size_eval = config.train_hyper.batch_size_eval
+    temperature = config.train_hyper.temperature
+    smoke_test = config.train_hyper.smoke_test
+
+    eval_specs = _build_eval_specs(
+        k, config.model_params.curve_sampling_mode,
+        has_train_data=data.has_train, has_val=data.has_val,
+        artifact_weights_use=artifact_weights or False)
+
     t_max = getattr(s_model, 't_max', 1.0)
     ctx = {}
     if artifact_weights is not None:
@@ -1529,52 +1529,7 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
     return eval_specs
 
 
-def _run_eval_phase(*, rng_key, env, params, config: 'Config', data,
-                     logger, logger_prefix, artifact_weights_use=False):
-    """Disable LoRA noise and run the modular evaluation pipeline.
-
-    Reads all eval settings from *env* and *config*:
-    - ``k``, ``curve_sampling_mode`` from ``config.model_params``
-    - ``batch_size_eval``, ``temperature``, ``smoke_test`` from ``config.train_hyper``
-    - ``t_sample_fn``, ``lora_rho``, ``lora_rho_s`` from ``env``
-
-    Args:
-        data: ``DataSplits`` with all dataset arrays.
-
-    Returns:
-        params (possibly modified with LoRA rho set to zero).
-    """
-    s_model = env.s_model
-    k = config.model_params.k
-    curve_sampling_mode = config.model_params.curve_sampling_mode
-    batch_size_eval = config.train_hyper.batch_size_eval
-    t_sample_fn = env.t_sample_fn
-    temperature = config.train_hyper.temperature
-    smoke_test = config.train_hyper.smoke_test
-    lora_rho, lora_rho_s = config.model_params.lora_rho_values
-
-    # Disable LoRA noise for evaluation
-    if lora_rho > 0.0 or lora_rho_s > 0.0:
-        params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
-
-    eval_specs = _build_eval_specs(
-        k, curve_sampling_mode,
-        has_train_data=data.has_train, has_val=data.has_val,
-        artifact_weights_use=artifact_weights_use)
-
-    run_evaluation(
-        s_model=s_model, params=params, rng_key=rng_key,
-        data=data, eval_specs=eval_specs,
-        batch_size_eval=batch_size_eval, t_sample_fn=t_sample_fn,
-        temperature=temperature, logger=logger,
-        logger_prefix=logger_prefix, smoke_test=smoke_test, k=k,
-        artifact_weights=artifact_weights_use if artifact_weights_use else None,
-    )
-
-    return params
-
-
-def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, logger_prefix):
+def run_training(rng_key, env, params, data, config: 'Config', logger, logger_prefix):
     """Execute one training phase (expert or minibatch) and log metrics.
 
     Returns:
@@ -1845,13 +1800,13 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
                 params = _init_subspace_params(
                     pt_config, env.s_model, init_key)
 
-                rng_key, params, _ = _run_training_phase(
+                rng_key, params, _ = run_training(
                     rng_key, env, params, data, pt_config, logger,
                     f'cp_fixed_{i}_')
 
-                _run_eval_phase(
+                run_evaluation(
                     rng_key=rng_key, env=env, params=params,
-                    config=pt_config, data=data,
+                    data=data, config=pt_config,
                     logger=logger, logger_prefix=f'cp_fixed_{i}_')
 
                 train_params.append(
@@ -1930,16 +1885,16 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
 
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
-        rng_key, params, last_trainable_params = _run_training_phase(
+        rng_key, params, last_trainable_params = run_training(
             rng_key, env, params, data, config, logger, '')
     else:
         last_trainable_params = None
 
     # Evaluate
-    _run_eval_phase(
+    run_evaluation(
         rng_key=rng_key, env=env, params=params,
-        config=config, data=data,
-        logger=logger, logger_prefix='')
+        data=data, config=config,
+        logger=logger)
 
     # Save curve params
     if config.train_hyper.save_params:

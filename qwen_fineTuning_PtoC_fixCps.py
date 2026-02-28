@@ -24,10 +24,10 @@ from copy import deepcopy
 from numpyro import distributions as dist
 
 # Project imports
-from src.qwen_jax import load_params_and_config, QwenForCausalLM
+from src.qwen_jax import QwenTextClassificationWrapper
 from src.subspace_curve import (
     masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn, get_subspace_model,
-    RepulsiveMixin, EntropyMixin, EntropyMixin2, JensenShannonMixin,
+    RepulsiveMixin, EntropyMixin, EntropyMixin2, JensenShannonMixin, LoraMixin,
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
@@ -272,7 +272,7 @@ class ModelParams:
         """Bézier curve degree: number of control points minus one."""
         return len(self.cp_fix) - 1
 
-    def get_model_kwargs(self, *, model, k, lora_mask=None, curve_segment=None) -> dict:
+    def get_model_kwargs(self, *, model) -> dict:
         """Return the hard-coded kwargs dict for the subspace model constructor.
 
         All keys are explicitly listed so no automatic signature introspection
@@ -281,21 +281,17 @@ class ModelParams:
 
         Args:
             model: The wrapped neural-network model instance.
-            k: Bézier curve degree (number of control points minus one).
-            lora_mask: Pre-built LoRA mask pytree, or ``None``.
-            curve_segment: Override for ``self.curve_segment`` (e.g. ``False``
-                for k=0 pretraining).  When ``None``, uses the dataclass value.
         """
         s_model_cls = get_subspace_model(self.subspace_model)
         d = dict(
             model=model,
-            k=k,
+            k=self.k,
             weight_decay=self.weight_decay,
             perm_spec=self.perm_spec,
             natural_parameterization=self.natural_parameterization,
             mutuable_param_name=self.mutuable_param_name,
             curve_parameterization=self.curve_parameterization,
-            curve_segment=self.curve_segment if curve_segment is None else curve_segment,
+            curve_segment=self.curve_segment,
             indepent_connected=self.indepent_connected,
         )
         # Mixin params — only included when the model class uses that mixin
@@ -305,9 +301,8 @@ class ModelParams:
                      regularizer=self.regularizer)
         if issubclass(s_model_cls, (EntropyMixin, EntropyMixin2, JensenShannonMixin)):
             d['entropy_weight'] = self.entropy_weight
-        if self.lora_params and lora_mask is not None:
+        if self.lora_params and self.lora_params.use_lora:
             d.update(self.lora_params.model_kwargs())
-            d['lora_mask'] = lora_mask
         return d
 
     def build_curve_mask(self, params_tree, k):
@@ -331,9 +326,6 @@ class OptimizerConf:
     Construct via ``OptimizerConf.from_config_dict(oc)``; the LR schedule is
     compiled from ``kwargs['learning_rate']`` during construction so callers
     never have to call ``_setup_lr_schedule`` separately.
-
-    ``to_dict()`` reconstructs the mutable dict expected by lower-level helpers
-    such as ``_create_subspace_model`` and ``_build_optimizer``.
     """
     name: str
     kwargs: dict                   # contains compiled lr_schedule under 'learning_rate'
@@ -364,15 +356,6 @@ class OptimizerConf:
             grad_clip_norm=oc.get('grad_clip_norm', None),
         )
 
-    def to_dict(self) -> dict:
-        """Return a fresh mutable dict suitable for ``_create_subspace_model`` etc."""
-        d = dict(name=self.name, kwargs=dict(self.kwargs))
-        if self.freeze_other_params:
-            d['freeze_other_params'] = self.freeze_other_params
-        if self.grad_clip_norm is not None:
-            d['grad_clip_norm'] = self.grad_clip_norm
-        return d
-
 
 @dataclass
 class Config:
@@ -391,15 +374,26 @@ class Config:
     model_params: ModelParams
     optimizer_conf: OptimizerConf
 
-    @property
-    def eval_common(self) -> dict:
-        """Shared kwargs for ``_run_eval_phase`` (excludes per-call args)."""
-        return dict(
-            batch_size_eval=self.train_hyper.batch_size_eval,
-            curve_sampling_mode=self.model_params.curve_sampling_mode,
-            temperature=self.train_hyper.temperature,
-            smoke_test=self.train_hyper.smoke_test,
-        )
+    @contextmanager
+    def as_pretrain(self):
+        """Temporarily configure for k=0 single-point training.
+
+        Sets ``cp_fix=[1]`` so that ``_setup_training_env`` derives ``k=0``
+        naturally from ``config.model_params.k``.  Also sets
+        ``curve_segment=False`` so single-point pretraining never uses
+        segmented Bézier curves.  All masks, model construction, and eval
+        flow correctly from config alone — no explicit k argument or
+        post-hoc model patching needed.
+        """
+        original_cp_fix = self.model_params.cp_fix
+        original_curve_segment = self.model_params.curve_segment
+        self.model_params.cp_fix = [1]
+        self.model_params.curve_segment = False
+        try:
+            yield self
+        finally:
+            self.model_params.cp_fix = original_cp_fix
+            self.model_params.curve_segment = original_curve_segment
 
     @classmethod
     def from_dict(cls, d: dict, data: 'DataSplits') -> 'Config':
@@ -421,6 +415,22 @@ class Config:
         if model_params.weight_decay > 0.0 and optimizer_conf.name == 'adamw':
             optimizer_conf.kwargs['weight_decay'] = model_params.weight_decay
             model_params.weight_decay = 0.0
+
+        # Validate curve-segment topology and LoRA mode at construction time
+        cp_fix = model_params.cp_fix
+        lora_params = model_params.lora_params
+        if model_params.curve_segment:
+            all_segments_fixed_endpoints = np.all(
+                [model_params.curve_segment == i for i in np.diff(
+                    np.argwhere(np.array(cp_fix) == 1).flatten())])
+            assert all_segments_fixed_endpoints, (
+                "In curve segment mode, fixed control points must be consecutive "
+                "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
+        if lora_params is not None and np.sum(cp_fix) < len(cp_fix):
+            assert lora_params.lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
+                "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
+                "subspace curves with fixed control points")
+
         return cls(
             rng_seed=d['rng_seed'],
             load_params_path=d.get('load_params_path', False),
@@ -431,15 +441,18 @@ class Config:
             optimizer_conf=optimizer_conf,
         )
 
-    def build_masks(self, params_tree, k):
+    def build_masks(self, params_tree):
         """Build curve / train / LoRA masks from *params_tree*.
+
+        ``k`` is derived from ``self.model_params.k`` (i.e. ``len(cp_fix)-1``),
+        so callers inside ``as_pretrain()`` automatically get the k=0 masks.
 
         Returns ``(curve_mask, train_mask, lora_mask)``.
         """
         mp = self.model_params
         lp = mp.lora_params
 
-        curve_mask = mp.build_curve_mask(params_tree, k)
+        curve_mask = mp.build_curve_mask(params_tree, mp.k)
 
         if self.optimizer_conf.freeze_other_params:
             train_mask = jax.tree.map(lambda x: False, params_tree)
@@ -460,99 +473,18 @@ class Config:
 
 @dataclass
 class TrainingEnv:
-    """Reusable training environment objects created by ``_setup_training_env``.
-
-    For k=0 pretraining ``base_params`` holds a pristine parameter copy so
-    each control-point iteration can re-initialise from it.  For k>0 it is
-    ``None``.
-    """
+    """Reusable training environment — static attributes only (no params/opt_state)."""
     s_model: object
-    params: dict
-    base_params: dict | None
-    curve_mask: object
-    train_mask: object
     optimizer: object
-    opt_state: object
     t_sample_fn: object
     rho_scheduler: object
     valid_metrics_fn: object
     empty_metric: tuple
     get_best_params: object
     cosine_sim: jnp.ndarray | None
-    n_trainable: int
-    lr_schedule: object
-    lora_rho: float
-    lora_rho_s: float
 
 
 # jax.config.update("jax_log_compiles", True)
-
-class QwenTextClassificationWrapper:
-    """
-    Wrapper class for Qwen2.5 model to interface with SubspaceBaseModel
-    """
-    def __init__(self, model_path: str, target_token_ids: jnp.ndarray):
-        """
-        Initialize Qwen wrapper
-        
-        Args:
-            model_path: Path to the converted JAX model
-            target_token_ids: Token IDs for classification targets (e.g., [36, 37] for True/False)
-        """
-        self.params, self.config = load_params_and_config(model_path)
-        # vocab_size removed; use self.config['vocab_size'] when required
-        self.model = QwenForCausalLM(**self.config)
-        self.target_token_ids = target_token_ids.flatten()
-
-    def init(self, key, x):
-        """Initialize model parameters for compatibility with SubspaceBaseModel"""
-        # Return existing converted parameters
-        # Note: key and x are unused but required for interface compatibility
-        params = self.params
-        del self.params
-        return params
-
-    def apply(self, variables, *args, rngs=None, method=None, mutable=False, capture_intermediates=False, **kwargs):
-        """Flexible apply wrapper matching project API.
-
-        Signature: apply(self, variables, *args, rngs=None, method=None, mutable=False,
-                         capture_intermediates=False, **kwargs)
-
-        - `variables` may be a dict containing 'params' or a raw params pytree.
-        - Positional `args` or keyword args may contain input data. Common patterns supported:
-            * first positional arg is an inputs dict {'input_ids', 'attention_mask'}
-            * keyword args 'input_ids' and optional 'attention_mask'
-            * keyword arg 'inputs'
-
-        The extra JAX/Flax kwargs (rngs, method, mutable, capture_intermediates) are forwarded
-        to the underlying model.apply call.
-        """
-        # Call underlying model.apply and forward Flax-specific kwargs
-        if mutable: 
-            out, state = self.model.apply(
-                variables,
-                *args,
-                rngs=rngs,
-                method=method,
-                mutable=mutable,
-                capture_intermediates=capture_intermediates,
-                **kwargs,
-            )
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits, state # Return probabilities for target classes only   
-        else:
-            out = self.model.apply(
-                variables,
-                *args,
-                rngs=rngs,
-                method=method,
-                mutable=mutable,
-                capture_intermediates=capture_intermediates,
-                **kwargs,
-            )
-            # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits # Return probabilities for target classes only     
 
 def load_text_classification_data(dataset_path: str, run=None, test=False):
     """
@@ -1143,7 +1075,7 @@ def _element_wise_mask(element_freeze_mask):
 
 
 def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
-                           jitter_multiplier, lora_params, fixed_cps_train_params=False):
+                           jitter_multiplier, lora_params, lora_mask=None, fixed_cps_train_params=False):
     """Initialize parameters on an existing subspace model.
 
     Calls ``init_params_from_point``, updates the train mask for LoRA,
@@ -1154,7 +1086,8 @@ def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
     """
     params = s_model.init_params_from_point(
         init_key, params, curve_mask,
-        noise_fn=lambda p, key: p + jitter_multiplier * random.normal(key, p.shape, dtype=p.dtype))
+        noise_fn=lambda p, key: p + jitter_multiplier * random.normal(key, p.shape, dtype=p.dtype),
+        lora_mask=lora_mask)
 
     # set train mask according to config
     # Only update mask for LoRA-capable subspaces
@@ -1182,27 +1115,34 @@ def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
 
 
 
-def _build_optimizer(*, optimizer_conf, s_model, params, fixed_cps_train_params):
-    """Create the optimizer chain (gradient clipping, CP freezing, base optimizer)
-    and initialise optimizer state.
+def _build_optimizer(*, optimizer_conf: 'OptimizerConf', s_model, params,
+                      cp_fix: 'list | None'):
+    """Create the optimizer chain (gradient clipping, CP freezing, base optimizer).
+
+    Args:
+        optimizer_conf: ``OptimizerConf`` dataclass (read directly, no dict conversion).
+        s_model: Subspace model instance (provides ``curve_mask``).
+        params: Current parameter pytree.
+        cp_fix: ``config.model_params.cp_fix`` for the curve phase, or ``None``
+            during k=0 pretraining (no CP-freeze mask needed).
 
     Returns:
-        ``(optimizer, opt_state, n_trainable_params)``
+        Configured ``optimizer``.
     """
-    if optimizer_conf['name'].startswith('sam'):
+    if optimizer_conf.name.startswith('sam'):
         raise NotImplementedError("SAM optimizer is not yet implemented for text classification")
 
-    base_optimizer = getattr(optax, optimizer_conf['name'])(**optimizer_conf['kwargs'])
+    base_optimizer = getattr(optax, optimizer_conf.name)(**optimizer_conf.kwargs)
 
     opt_chain_list = []
-    if "grad_clip_norm" in optimizer_conf:
-        opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf["grad_clip_norm"]))
+    if optimizer_conf.grad_clip_norm is not None:
+        opt_chain_list.append(optax.clip_by_global_norm(optimizer_conf.grad_clip_norm))
 
-    # Fix curve parameters during training if specified
-    if fixed_cps_train_params != False:
+    # Freeze already-trained control points during curve fitting
+    if cp_fix is not None and any(cp_fix):
         def get_dims(param):
             return (-1,) + (1,) * (param.ndim - 1)
-        cps_fixed = [True if p != False else False for p in fixed_cps_train_params]
+        cps_fixed = [bool(v) for v in cp_fix]
         fixed_cp_mask = jax.tree.map(
             lambda m, p: jnp.array(cps_fixed).reshape(get_dims(p)) if m else False,
             s_model.curve_mask, params['params'])
@@ -1210,13 +1150,7 @@ def _build_optimizer(*, optimizer_conf, s_model, params, fixed_cps_train_params)
 
     opt_chain_list.append(base_optimizer)
     optimizer = optax.chain(*opt_chain_list)
-
-    only_train_params = s_model.only_trainable_params(params['params'])
-    n_trainable_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
-    print(f"Number of trainable parameters: {n_trainable_params:_}")
-    opt_state = optimizer.init(only_train_params)
-
-    return optimizer, opt_state, n_trainable_params
+    return optimizer
 
 def _make_train_batch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
                           lora_rho, lora_rho_s, rho_scheduler, eval_every_n_batch,
@@ -1397,27 +1331,25 @@ def _setup_t_sample_fn(s_model, curve_sampling_mode):
     return t_sample_fn
 
 
-def _setup_validation(s_model, params, val_input_ids, val_attention_mask,
-                       val_labels, batch_size_eval, k,
-                       lora_rho=0.0, lora_rho_s=0.0):
+def _setup_validation(s_model, data: 'DataSplits', batch_size_eval, k):
     """Set up validation metrics function and best-parameter tracking.
 
-    If *val_input_ids* is ``None``, returns no-op stubs.
+    Uses ``data.val_*`` arrays; returns no-op stubs when ``data.has_val`` is False.
 
     Returns:
         ``(valid_metrics_fn, empty_metric, get_best_params)``
     """
     empty_metric = _empty_val_metric()
-    has_val = val_input_ids is not None
 
-    if has_val:
+    if data.has_val:
         print("save best parameters")
         valid_metrics_fn_inner = setup_metrics(
-            s_model, batch_size_eval, val_input_ids, val_attention_mask, val_labels,
+            s_model, batch_size_eval,
+            data.val_input_ids, data.val_attention_mask, data.val_labels,
             n_samples=10 if k > 0 else 1, key_prefix='val_')
 
         def valid_metrics_fn(rng, params):
-            if lora_rho > 0.0 or lora_rho_s > 0.0:
+            if isinstance(s_model, LoraMixin):
                 params = s_model.set_lora_rho(rho_w=0.0, rho_s=0.0, params=params)
             return valid_metrics_fn_inner(rng, params)
 
@@ -1545,12 +1477,14 @@ def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
     return eval_specs
 
 
-def _run_eval_phase(*, rng_key, s_model, params, k, data,
-                     curve_sampling_mode, batch_size_eval, t_sample_fn,
-                     temperature, lora_rho=0.0, lora_rho_s=0.0,
-                     logger, logger_prefix, smoke_test,
-                     artifact_weights_use=False):
+def _run_eval_phase(*, rng_key, env, params, config: 'Config', data,
+                     logger, logger_prefix, artifact_weights_use=False):
     """Disable LoRA noise and run the modular evaluation pipeline.
+
+    Reads all eval settings from *env* and *config*:
+    - ``k``, ``curve_sampling_mode`` from ``config.model_params``
+    - ``batch_size_eval``, ``temperature``, ``smoke_test`` from ``config.train_hyper``
+    - ``t_sample_fn``, ``lora_rho``, ``lora_rho_s`` from ``env``
 
     Args:
         data: ``DataSplits`` with all dataset arrays.
@@ -1558,6 +1492,17 @@ def _run_eval_phase(*, rng_key, s_model, params, k, data,
     Returns:
         params (possibly modified with LoRA rho set to zero).
     """
+    s_model = env.s_model
+    k = config.model_params.k
+    curve_sampling_mode = config.model_params.curve_sampling_mode
+    batch_size_eval = config.train_hyper.batch_size_eval
+    t_sample_fn = env.t_sample_fn
+    temperature = config.train_hyper.temperature
+    smoke_test = config.train_hyper.smoke_test
+    lora_params = config.model_params.lora_params
+    lora_rho = lora_params.lora_rho if lora_params else 0.0
+    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
+
     # Disable LoRA noise for evaluation
     if lora_rho > 0.0 or lora_rho_s > 0.0:
         params = s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
@@ -1579,12 +1524,8 @@ def _run_eval_phase(*, rng_key, s_model, params, k, data,
     return params
 
 
-def _run_training_phase(rng_key, env, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
+def _run_training_phase(rng_key, env, params, opt_state, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
     """Execute one training phase (expert or minibatch) and log metrics.
-
-    Reads ``params`` and ``opt_state`` from *env*; callers that need to
-    override them (e.g. the per-CP pretrain loop) should mutate those fields
-    on *env* before calling.
 
     If *scan_fn* is provided it is reused (avoids JAX retrace across
     pretraining iterations); otherwise a new ``@jit`` scan wrapper is created.
@@ -1595,8 +1536,6 @@ def _run_training_phase(rng_key, env, data, config: 'Config', logger, logger_pre
     hp = config.train_hyper
     s_model = env.s_model
     optimizer = env.optimizer
-    params = env.params
-    opt_state = env.opt_state
     cosine_sim = env.cosine_sim
     t_sample_fn = env.t_sample_fn
     rho_scheduler = env.rho_scheduler
@@ -1605,9 +1544,10 @@ def _run_training_phase(rng_key, env, data, config: 'Config', logger, logger_pre
     get_best_params = env.get_best_params
 
     k = s_model.k
-    lr_schedule = env.lr_schedule
-    lora_rho = env.lora_rho
-    lora_rho_s = env.lora_rho_s
+    lr_schedule = config.optimizer_conf.lr_schedule
+    lora_params = config.model_params.lora_params
+    lora_rho = lora_params.lora_rho if lora_params else 0.0
+    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
 
     if hp.num_steps <= 0:
         return rng_key, params, None, scan_fn
@@ -1842,175 +1782,116 @@ def _compute_expert_embeddings(model, params, data, config: 'Config'):
     return cosine_sim
 
 
-def _setup_training_env(*, rng_key, k, config: 'Config', data,
+def _setup_training_env(*, rng_key, config: 'Config', data,
                          fixed_cps_train_params=False):
     """Create model, subspace, optimizer, and all training support objects.
 
-    Handles both k=0 (pretraining) and k>0 (curve fitting) cases.
+    Handles both k=0 (pretraining) and k>0 (curve fitting) cases. via context
 
     All configuration is read from *config*: ``train_hyper`` for run-behaviour
     parameters and ``model_params`` / ``optimizer_conf`` / ``net_kwargs`` for
-    object-construction parameters.
+    object-construction parameters.  ``k`` is derived from
+    ``config.model_params.k`` (i.e. ``len(cp_fix)-1``), so callers inside
+    ``Config.as_pretrain()`` automatically see k=0 without any extra argument.
 
     Returns:
-        ``(env, rng_key)`` where *env* is a ``TrainingEnv``.
+        ``(env, params, rng_key)`` where *env* is a ``TrainingEnv``.
     """
     mp = config.model_params
-    lora_params = mp.lora_params
-    optimizer_conf = config.optimizer_conf.to_dict()  # fresh mutable dict for lower-level helpers
-
-    model = QwenTextClassificationWrapper(**config.net_kwargs)
-    base_params = unfreeze(model.init(None, None))
-
     rng_key, init_key = random.split(rng_key)
 
-    # Build curve / train / LoRA masks
-    curve_mask, train_mask, lora_mask = config.build_masks(
-        base_params['params'], k)
-
+    model = QwenTextClassificationWrapper(**config.net_kwargs)
     # Instantiate the subspace model
     logging.info("Using subspace model: %s", mp.subspace_model)
     s_model_cls = get_subspace_model(mp.subspace_model)
-    s_model = s_model_cls(**mp.get_model_kwargs(
-        model=model, k=k,
-        lora_mask=lora_mask if (lora_params and lora_params.use_lora) else None,
-        curve_segment=False if k == 0 else None,
-    ))
-
-    if k == 0:
-        # Init once to set s_model internal state (curve_mask, LoRA structs)
-        params = jax.tree.map(lambda x: x, base_params)
-        params = _init_subspace_params(
-            s_model, params, curve_mask, train_mask, init_key,
-            mp.jitter_multiplier, lora_params)
-    else:
-        params = _init_subspace_params(
-            s_model, base_params, curve_mask, train_mask, init_key,
-            mp.jitter_multiplier, lora_params, fixed_cps_train_params)
-        base_params = None  # not needed for curve phase
-
-    # Build optimizer
-    optimizer, opt_state, n_trainable = _build_optimizer(
-        optimizer_conf=optimizer_conf, s_model=s_model,
-        params=params, fixed_cps_train_params=fixed_cps_train_params)
+    s_model = s_model_cls(**mp.get_model_kwargs(model=model))
+    
+    params = unfreeze(model.init(None, None))
 
     # Expert embeddings
     cosine_sim = _compute_expert_embeddings(model, params, data, config)
 
+    # Build curve / train / LoRA masks — k is read from config.model_params.k
+    curve_mask, train_mask, lora_mask = config.build_masks(params['params'])
+
+
+    params = _init_subspace_params(
+        s_model, params, curve_mask, train_mask, init_key,
+        mp.jitter_multiplier, mp.lora_params, lora_mask, fixed_cps_train_params)
+
+    # Build optimizer — pass cp_fix only for the curve phase (k>0) so the
+    # CP-freeze mask is applied; None during k=0 pretraining.
+    optimizer = _build_optimizer(
+        optimizer_conf=config.optimizer_conf, s_model=s_model,
+        params=params, cp_fix=mp.cp_fix if mp.k > 0 else None)
+
     # t sampling, rho scheduler, validation
     t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
-    rho_scheduler = _setup_rho_scheduler(lora_params, config.train_hyper.num_steps)
-
-    if data.has_train:
-        valid_metrics_fn, empty_metric, get_best_params = \
-            _setup_validation(
-                s_model, params, data.val_input_ids, data.val_attention_mask,
-                data.val_labels, config.train_hyper.batch_size_eval, k=k,
-                lora_rho=lora_rho, lora_rho_s=lora_rho_s)
-    else:
-        empty_metric = _empty_val_metric()
-        valid_metrics_fn = lambda rng, params: empty_metric
-        get_best_params = lambda params: None
+    rho_scheduler = _setup_rho_scheduler(mp.lora_params, config.train_hyper.num_steps)
+    valid_metrics_fn, empty_metric, get_best_params = _setup_validation(
+                s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
 
     env = TrainingEnv(
-        s_model=s_model, params=params, base_params=base_params,
-        curve_mask=curve_mask, train_mask=train_mask,
-        optimizer=optimizer, opt_state=opt_state,
+        s_model=s_model, optimizer=optimizer,
         t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
         valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-        get_best_params=get_best_params,
-        cosine_sim=cosine_sim, n_trainable=n_trainable,
-        lr_schedule=config.optimizer_conf.lr_schedule,
-        lora_rho=lora_params.lora_rho if lora_params else 0.0,
-        lora_rho_s=lora_params.lora_rho_s if lora_params else 0.0)
+        get_best_params=get_best_params, cosine_sim=cosine_sim)
 
-    return env, rng_key
+    return env, params, rng_key
 
-
-@contextmanager
-def single_point_mask(s_model):
-    """Temporarily set k=0 on *s_model* by zeroing its curve mask.
-
-    Saves the original ``k`` and ``curve_mask`` on entry and restores both on
-    exit.  The body of the ``with`` block sees the model as a single-point
-    (k=0) model — useful for pretraining individual fixed control points
-    without altering the outer curve model.
-    """
-    original_k = s_model.k
-    original_curve_mask = s_model.curve_mask
-    s_model.k = 0
-    s_model.curve_mask = jax.tree.map(lambda x: False, original_curve_mask)
-    try:
-        yield s_model
-    finally:
-        s_model.k = original_k
-        s_model.curve_mask = original_curve_mask
 
 
 def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     """Train each fixed control point independently (k=0).
 
+    Uses ``config.as_pretrain()`` to set ``cp_fix=[1]`` and
+    ``curve_segment=False`` temporarily, so ``_setup_training_env`` derives
+    k=0 and disables segmented curves naturally — no separate k argument
+    or post-hoc model patching needed.
+
     Returns:
         ``(train_params, rng_key)``
     """
-    cp_fix = config.model_params.cp_fix
+    cp_fix = config.model_params.cp_fix  # save original before context
     lora_params = config.model_params.lora_params
 
-    # Validation checks
-    if config.model_params.curve_segment:
-        all_segments_fixed_endpoints = np.all(
-            [config.model_params.curve_segment == i for i in np.diff(
-                np.argwhere(np.array(cp_fix) == 1).flatten())])
-        assert all_segments_fixed_endpoints, (
-            "In curve segment mode, fixed control points must be consecutive "
-            "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
-    if lora_params is not None and np.sum(cp_fix) < len(cp_fix):
-        _lora_mode = lora_params.lora_mode
-        assert _lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
-            "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
-            "subspace curves with fixed control points")
-
-    # Setup training environment for k=0
-    env, rng_key = _setup_training_env(
-        k=0, config=config, data=data, rng_key=rng_key)
-
-    # Pretraining loop — single_point_mask makes the k=0 intent explicit and
-    # ensures the model is restored even if an exception is raised.
     train_params = []
     scan_fn = None
     print("Pretraining fixed control points")
-    with single_point_mask(env.s_model):
+
+    with config.as_pretrain() as pt_config:
+        env, _, rng_key = _setup_training_env(
+            rng_key=rng_key, config=pt_config, data=data)
+
+        # Load base params once; reused across CP iterations
+        _tmp_model = QwenTextClassificationWrapper(**pt_config.net_kwargs)
+        base_params = unfreeze(_tmp_model.init(None, None))
+        del _tmp_model
+        curve_mask, train_mask, lora_mask = pt_config.build_masks(base_params['params'])
+
         for i, fixed in enumerate(cp_fix):
             if fixed:
                 print(f"Training cp member {i}")
                 rng_key, init_key = random.split(rng_key)
-                params = jax.tree.map(lambda x: x, env.base_params)
                 params = _init_subspace_params(
-                    env.s_model, params, env.curve_mask, env.train_mask, init_key,
-                    config.model_params.jitter_multiplier,
-                    lora_params)
+                    env.s_model, base_params, curve_mask, train_mask, init_key,
+                    pt_config.model_params.jitter_multiplier,
+                    lora_params, lora_mask)
 
-                # Re-init optimizer state
-                only_train = env.s_model.only_trainable_params(params['params'])
-                opt_state = env.optimizer.init(only_train)
+                opt_state = env.optimizer.init(
+                    env.s_model.only_trainable_params(params['params']))
 
-                # Train
-                env.params = params
-                env.opt_state = opt_state
                 rng_key, params, _, scan_fn = _run_training_phase(
-                    rng_key, env, data, config, logger, f'cp_fixed_{i}_',
-                    scan_fn=scan_fn)
+                    rng_key, env, params, opt_state, data, pt_config, logger,
+                    f'cp_fixed_{i}_', scan_fn=scan_fn)
 
-                # Evaluate
                 _run_eval_phase(
-                    s_model=env.s_model, params=params,
-                    rng_key=rng_key, k=0,
-                    t_sample_fn=env.t_sample_fn,
-                    logger=logger, logger_prefix=f'cp_fixed_{i}_',
-                    data=data, **config.eval_common,
-                    lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
+                    rng_key=rng_key, env=env, params=params,
+                    config=pt_config, data=data,
+                    logger=logger, logger_prefix=f'cp_fixed_{i}_')
 
-                train_params.append(env.s_model.only_trainable_params(params['params']))
+                train_params.append(
+                    env.s_model.only_trainable_params(params['params']))
                 rng_key, _ = random.split(rng_key)
             else:
                 train_params.append(False)
@@ -2034,7 +1915,6 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
         train_params: Pretrained control-point params (list or ``False``).
     """
     cp_fix = config.model_params.cp_fix
-    k = config.model_params.k
     all_fixed = len(cp_fix) == np.sum(cp_fix)
 
     print("Training curve model")
@@ -2046,22 +1926,27 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
                 "optimization only makes sense if all segments are "
                 "independently connected.")
 
-    # Setup training environment for k > 0
-    env, rng_key = _setup_training_env(
-        k=k, config=config, data=data, rng_key=rng_key,
+    # Setup training environment — k is derived from config.model_params.k
+    env, params, rng_key = _setup_training_env(
+        config=config, data=data, rng_key=rng_key,
         fixed_cps_train_params=train_params)
+
+    only_train = env.s_model.only_trainable_params(params['params'])
+    opt_state = env.optimizer.init(only_train)
+    n_trainable = sum(p.size for p in jax.tree.flatten(only_train)[0])
+    print(f"Number of trainable parameters: {n_trainable:_}")
 
     # Log parameter stats
     n_params = sum(
         p.size if isinstance(p, jnp.ndarray) else 0
-        for p in jax.tree.flatten(env.params)[0])
+        for p in jax.tree.flatten(params)[0])
     param_memory = sum(
         p.size * p.dtype.itemsize if isinstance(p, jnp.ndarray) else 0
-        for p in jax.tree.flatten(env.params)[0])
+        for p in jax.tree.flatten(params)[0])
     logger.summary.update({
         'n_params': n_params,
         'memory_params': param_memory,
-        'n_params_trainable': env.n_trainable,
+        'n_params_trainable': n_trainable,
     })
     print(f"Number of parameters: {n_params:_}\n"
           f"Memory of parameters: {param_memory / (1024**2):_}MB")
@@ -2069,19 +1954,15 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
         rng_key, params, last_trainable_params, _ = _run_training_phase(
-            rng_key, env, data, config, logger, '')
+            rng_key, env, params, opt_state, data, config, logger, '')
     else:
-        params = env.params
         last_trainable_params = None
 
     # Evaluate
     _run_eval_phase(
-        s_model=env.s_model, params=params,
-        rng_key=rng_key, k=k,
-        t_sample_fn=env.t_sample_fn,
-        logger=logger, logger_prefix='',
-        data=data, **config.eval_common,
-        lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
+        rng_key=rng_key, env=env, params=params,
+        config=config, data=data,
+        logger=logger, logger_prefix='')
 
     # Save curve params
     if config.train_hyper.save_params:
@@ -2117,11 +1998,10 @@ def train(logger, config_dict):
         net_kwargs['model_path'] = model_artifact.download()
     config_dict['net_kwargs'] = net_kwargs
 
-    data_conf = config_dict.get('data', {})
     data, unique_target_ids, rng_key = _prepare_datasets(
         rng_key,
-        dataset_path=data_conf['dataset_path'],
-        val_percentage=data_conf.get('val_percentage', 0.0),
+        dataset_path=config_dict['data']['dataset_path'],
+        val_percentage=config_dict['data'].get('val_percentage', 0.0),
         batch_size=config_dict['train_hyper']['batch_size'],
         smoke_test=config_dict['train_hyper'].get('smoke_test', False),
         logger=logger)

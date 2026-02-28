@@ -23,7 +23,7 @@ from copy import deepcopy
 from numpyro import distributions as dist
 
 # Project imports
-from src.qwen_jax import load_params_and_config, QwenForCausalLM
+from src.qwen_jax import QwenTextClassificationWrapper
 from src.subspace_curve import (
     masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn,
     LoRARepulsiveCategorySubspace, LoRACategorySubspace, CategorySubspace, RepulsiveCategorySubspace, LoRAEntropyCategorySubspace
@@ -35,98 +35,6 @@ from scipy.spatial.distance import squareform
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # import sys
 # sys.setrecursionlimit(200)
-
-class QwenTextClassificationWrapper:
-    """
-    Wrapper class for Qwen2.5 model to interface with SubspaceBaseModel
-    """
-    def __init__(self, model_path: str, target_token_ids: jnp.ndarray):
-        """
-        Initialize Qwen wrapper
-        
-        Args:
-            model_path: Path to the converted JAX model
-            target_token_ids: Token IDs for classification targets (e.g., [36, 37] for True/False)
-        """
-        self.params, self.config = load_params_and_config(model_path)
-        # vocab_size removed; use self.config['vocab_size'] when required
-        self.model = QwenForCausalLM(**self.config)
-        self.target_token_ids = target_token_ids.flatten()
-
-    def init(self, key, x):
-        """Initialize model parameters for compatibility with SubspaceBaseModel"""
-        # Return existing converted parameters
-        # Note: key and x are unused but required for interface compatibility
-        params = self.params
-        del self.params
-        return params
-
-    def apply(self, variables, *args, rngs=None, method=None, mutable=False, capture_intermediates=False, **kwargs):
-        """Flexible apply wrapper matching project API.
-
-        Signature: apply(self, variables, *args, rngs=None, method=None, mutable=False,
-                         capture_intermediates=False, **kwargs)
-
-        - `variables` may be a dict containing 'params' or a raw params pytree.
-        - Positional `args` or keyword args may contain input data. Common patterns supported:
-            * first positional arg is an inputs dict {'input_ids', 'attention_mask'}
-            * keyword args 'input_ids' and optional 'attention_mask'
-            * keyword arg 'inputs'
-
-        The extra JAX/Flax kwargs (rngs, method, mutable, capture_intermediates) are forwarded
-        to the underlying model.apply call.
-        """
-        # Call underlying model.apply and forward Flax-specific kwargs
-        if mutable: 
-            out, state = self.model.apply(
-                variables,
-                *args,
-                rngs=rngs,
-                method=method,
-                mutable=mutable,
-                capture_intermediates=capture_intermediates,
-                **kwargs,
-            )
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits, state # Return probabilities for target classes only   
-        else:
-            out = self.model.apply(
-                variables,
-                *args,
-                rngs=rngs,
-                method=method,
-                mutable=mutable,
-                capture_intermediates=capture_intermediates,
-                **kwargs,
-            )
-            # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits # Return probabilities for target classes only     
-
-def load_text_classification_data(dataset_path: str, run=None, test=False):
-    """
-    Load text classification dataset
-    
-    Args:
-        dataset_path: Path to the dataset .npz file
-        run: wandb run object for logging to load artifacts
-
-    Returns:
-        Tuple of (input_ids, attention_mask, labels, target_ids)
-    """
-    if run:
-        artifact = run.use_artifact(dataset_path, type='dataset')
-        artifact_dir = artifact.download()
-        dataset_path = os.path.join(artifact_dir, "test_data.npz" if test else "train_data.npz")
-
-    with np.load(dataset_path) as data:
-        input_ids = jnp.array(data['input_ids'])
-        attention_mask = jnp.array(data['attention_mask']) 
-        labels = jnp.array(data['labels'])
-        target_id = jnp.array(data['target_id'])
-        all_target_ids = jnp.array(data['target_ids'])
-
-    return input_ids, attention_mask, labels, target_id, all_target_ids
 
 
 def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15):

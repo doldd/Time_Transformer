@@ -286,7 +286,7 @@ class QwenForCausalLM(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True):
+    def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True) -> jnp.ndarray:
         embed_layer = nn.Embed(
             num_embeddings=self.vocab_size,
             features=self.hidden_size,
@@ -315,6 +315,74 @@ class QwenForCausalLM(nn.Module):
             logits = nn.Dense(self.vocab_size, use_bias=False, name='lm_head')(hidden_states)
 
         return logits
+
+
+class QwenTextClassificationWrapper:
+    """
+    Wrapper class for Qwen2.5 model to interface with SubspaceBaseModel
+    """
+    def __init__(self, model_path: str, target_token_ids: jnp.ndarray):
+        """
+        Initialize Qwen wrapper
+        
+        Args:
+            model_path: Path to the converted JAX model
+            target_token_ids: Token IDs for classification targets (e.g., [36, 37] for True/False)
+        """
+        self.model_path = model_path
+        config = load_model_config(model_path)
+        # vocab_size removed; use self.config['vocab_size'] when required
+        self.model = QwenForCausalLM(**config)
+        self.target_token_ids = target_token_ids.flatten()
+
+    def init(self, key, x):
+        """Initialize model parameters for compatibility with SubspaceBaseModel"""
+        # Return existing converted parameters
+        # Note: key and x are unused but required for interface compatibility
+        params = load_model_params(self.model_path)
+        return params
+
+    def apply(self, variables, *args, rngs=None, method=None, mutable=False, capture_intermediates=False, **kwargs):
+        """Flexible apply wrapper matching project API.
+
+        Signature: apply(self, variables, *args, rngs=None, method=None, mutable=False,
+                         capture_intermediates=False, **kwargs)
+
+        - `variables` may be a dict containing 'params' or a raw params pytree.
+        - Positional `args` or keyword args may contain input data. Common patterns supported:
+            * first positional arg is an inputs dict {'input_ids', 'attention_mask'}
+            * keyword args 'input_ids' and optional 'attention_mask'
+            * keyword arg 'inputs'
+
+        The extra JAX/Flax kwargs (rngs, method, mutable, capture_intermediates) are forwarded
+        to the underlying model.apply call.
+        """
+        # Call underlying model.apply and forward Flax-specific kwargs
+        if mutable: 
+            out, state = self.model.apply(
+                variables,
+                *args,
+                rngs=rngs,
+                method=method,
+                mutable=mutable,
+                capture_intermediates=capture_intermediates,
+                **kwargs,
+            )
+            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
+            return last_token_logits, state # Return probabilities for target classes only   
+        else:
+            out = self.model.apply(
+                variables,
+                *args,
+                rngs=rngs,
+                method=method,
+                mutable=mutable,
+                capture_intermediates=capture_intermediates,
+                **kwargs,
+            )
+            # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
+            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
+            return last_token_logits # Return probabilities for target classes only  
 
 # Utility functions for testing
 
@@ -476,11 +544,25 @@ def save_params_and_config(params, config, path):
         json.dump(config, f, indent=2)
 
 
+def load_model_config(path):
+    '''
+    Load only the model configuration from disk.
+    '''
+    with open(f"{path}/jax_config.json", 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    return config
+
+def load_model_params(path):
+    '''
+    Load only the model parameters from disk.
+    '''
+    params = jnp.load(f"{path}/jax_params.npy", allow_pickle=True).item()
+    return freeze(params)
+
 def load_params_and_config(path):
     '''
     Load JAX model parameters and configuration from disk.
     '''
-    params = jnp.load(f"{path}/jax_params.npy", allow_pickle=True).item()
-    with open(f"{path}/jax_config.json", 'r', encoding='utf-8') as f:
-        config = json.load(f)
-    return freeze(params), config
+    params = load_model_params(path)
+    config = load_model_config(path)
+    return params, config

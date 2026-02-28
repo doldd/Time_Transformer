@@ -1385,14 +1385,13 @@ class LoRAMixin:
     - kwargs: Additional keyword arguments for the parent class.
     """
 
-    def __init__(self, r, lora_mask, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", lora_rho: float=.0, lora_rho_s: float=.0, **kwargs):
+    def __init__(self, r, lora_dtype:str, lora_alpha: float, lora_mode: str="A(t)B", lora_rho: float=.0, lora_rho_s: float=.0, **kwargs):
         logger.info(
             "Using LoRA Mixin with rank=%s, dtype=%s, alpha=%s, mode=%s, rho=%s, rho_s=%s",
             r, lora_dtype, lora_alpha, lora_mode, lora_rho, lora_rho_s,
         )
         super().__init__(**kwargs)
         self.r = r
-        self.lora_mask = lora_mask
         self.w0_params = None  # Placeholder for non-LoRA parameters
         self.lora_dtype = lora_dtype
         self.lora_alpha = lora_alpha
@@ -1451,13 +1450,14 @@ class LoRAMixin:
         mask = jax.tree.map(adapt_mask, mask, is_leaf=lambda x: isinstance(x, LoraAbstractParams))
         return mask
     
-    def init_params_from_point(self, key, params, mask, noise_fn):
+    def init_params_from_point(self, key, params, mask, noise_fn, lora_mask=None):
         """Initialize parameters from a point in the latent space.
 
         Args:
             key (jax.random.PRNGKey): Random key for initialization.
             params (dict): params in the latent space. {params: ...}
             mask (dict): Mask indicating which parameters to be handled by the curve. {...: bool}
+            lora_mask: LoRA mask pytree indicating which parameters to adapt with LoRA.
             jitter (float): Jitter to add to the initialization for the curve params. As A matrix of LoRA is initialized with N(0,1) this could probably be set to 1.
 
         Returns:
@@ -1558,7 +1558,7 @@ class LoRAMixin:
 
             lora_params = jax.tree_util.tree_unflatten(structure, lora_params)
             return lora_params
-        params['params'] = initialize_lora_params(key, params['params'], self.lora_mask, rank=self.r)
+        params['params'] = initialize_lora_params(key, params['params'], lora_mask, rank=self.r)
         params = super().init_params_from_point(key, params, mask, noise_fn)
 
         if (self.lora_mode == "A(t)B(t)") or (self.lora_mode == "A(t)eB(t)") or (self.lora_mode == "Arot(t)sdeBrot(t)"):

@@ -26,11 +26,12 @@ from numpyro import distributions as dist
 # Project imports
 from src.qwen_jax import load_params_and_config, QwenForCausalLM
 from src.subspace_curve import (
-    masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn, get_subspace_model
+    masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn, get_subspace_model,
+    RepulsiveMixin, EntropyMixin, EntropyMixin2, JensenShannonMixin,
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from contextlib import contextmanager
 
@@ -91,23 +92,16 @@ class TrainHyperparams:
     """Pure training hyperparameters for the pipeline.
 
     All stored fields map 1-to-1 to keys inside ``config['train_hyper']``.
-    Construct via ``TrainHyperparams.from_config(config, data)``; ``data``
+    Construct via ``TrainHyperparams.from_config_dict(th, data)``; ``data``
     is only needed to resolve epoch / step counts from data size.
-
-    Object-construction configs (optimizer_conf, model_params, curve_params,
-    lora_params, net_kwargs) are intentionally excluded — those live in their
-    own top-level config groups and are passed where needed.
     """
-    cp_fix: list
     batch_size: int
     eval_every_n_batch: int
     num_epochs: int
     num_steps: int
     save_params: bool
     smoke_test: bool
-    val_percentage: float
     dataset_sampling: dict
-    curve_sampling_mode: str
     temperature: list
 
     # --- computed properties (not stored; derived from above fields) ------
@@ -120,30 +114,15 @@ class TrainHyperparams:
     def ds_sampling(self) -> str:
         return list(self.dataset_sampling.keys())[0]
 
-    @property
-    def eval_common(self) -> dict:
-        """Shared kwargs for ``_run_eval_phase`` (excludes per-call args)."""
-        return dict(
-            batch_size_eval=self.batch_size_eval,
-            curve_sampling_mode=self.curve_sampling_mode,
-            temperature=self.temperature,
-            smoke_test=self.smoke_test,
-        )
-
     @classmethod
-    def from_config(cls, config: dict, data: 'DataSplits') -> 'TrainHyperparams':
-        """Construct from a wandb / inline config dict plus loaded data.
+    def from_config_dict(cls, th: dict, data: 'DataSplits') -> 'TrainHyperparams':
+        """Construct from ``config['train_hyper']`` dict plus loaded data.
 
-        Reads only ``config['train_hyper']``; no other config groups are
-        touched.  ``data`` is needed solely to resolve epoch / step counts
-        from the training-set size.
+        ``data`` is needed solely to resolve epoch / step counts from the
+        training-set size.
         """
-        th = config['train_hyper']
         batch_size = th['batch_size']
         dataset_sampling = th.get('dataset_sampling', {})
-
-        cp_fix = th['cp_fix']
-        print(f"Control point fixed list: {cp_fix}")
 
         # Compute num_epochs / num_steps from data size
         num_epochs_cfg = th.get('num_epochs', -1)
@@ -164,18 +143,319 @@ class TrainHyperparams:
             num_epochs = num_steps = 0
 
         return cls(
-            cp_fix=cp_fix,
             batch_size=batch_size,
             eval_every_n_batch=th.get('eval_every_n_batch', 20),
             num_epochs=num_epochs,
             num_steps=num_steps,
             save_params=th.get('save_params', False),
             smoke_test=th.get('smoke_test', False),
-            val_percentage=th.get('val_percentage', 0.0),
             dataset_sampling=dataset_sampling,
-            curve_sampling_mode=th.get('curve_sampling_mode', 'combined'),
             temperature=th.get('temperature', [1.0]),
         )
+
+
+@dataclass
+class LoraParams:
+    """LoRA adapter configuration.
+
+    All stored fields map 1-to-1 to keys inside ``config['model_params']['lora_params']``.
+    Construct via ``LoraParams.from_config_dict(lp)``.
+    """
+    use_lora: bool = False
+    r: int = 8
+    lora_dtype: str = 'float32'
+    lora_alpha: float = 16.0
+    lora_mode: str = 'A(t)B(t)'
+    rho_scheduler_frequency: float = 0.0
+    lora_rho: float = 0.0
+    lora_rho_s: float = 0.0
+    filter_masks: list = field(default_factory=list)
+
+    @classmethod
+    def from_config_dict(cls, lp: dict) -> 'LoraParams':
+        """Construct from the ``lora_params`` sub-dict of ``config['model_params']``."""
+        return cls(
+            use_lora=lp.get('use_lora', False),
+            r=lp.get('r', 8),
+            lora_dtype=lp.get('lora_dtype', 'float32'),
+            lora_alpha=lp.get('lora_alpha', 16.0),
+            lora_mode=lp.get('lora_mode', 'A(t)B(t)'),
+            rho_scheduler_frequency=lp.get('rho_scheduler_frequency', 0.0),
+            lora_rho=lp.get('lora_rho', 0.0),
+            lora_rho_s=lp.get('lora_rho_s', 0.0),
+            filter_masks=lp.get('filter_masks', []),
+        )
+
+    def model_kwargs(self) -> dict:
+        """Return only the fields consumed by the subspace model constructor."""
+        return dict(
+            r=self.r,
+            lora_dtype=self.lora_dtype,
+            lora_alpha=self.lora_alpha,
+            lora_mode=self.lora_mode,
+            lora_rho=self.lora_rho,
+            lora_rho_s=self.lora_rho_s,
+        )
+
+    def build_lora_mask(self, params_tree):
+        """Build LoRA mask from ``filter_masks`` applied to *params_tree*.
+
+        Returns an all-False pytree when ``use_lora`` is ``False``.
+        """
+        lora_mask = jax.tree.map(lambda x: False, params_tree)
+        if self.use_lora:
+            for f in self.filter_masks:
+                lora_mask = filter_mask(lora_mask, *f['keys'],
+                                        as_curve=np.array(f['dims']),
+                                        BoolschenOperator=eval(f['op']))
+        return lora_mask
+
+
+@dataclass
+class ModelParams:
+    """Architecture and curve topology configuration.
+
+    All stored fields map 1-to-1 to keys inside ``config['model_params']``.
+    Construct via ``ModelParams.from_config_dict(mp)``.
+
+    ``get_model_kwargs()`` returns the flat dict consumed by
+    ``_create_subspace_model`` (excludes high-level routing fields such as
+    ``subspace_model``, ``filter_masks``, ``cp_fix``, ``curve_sampling_mode``,
+    and LoRA noise params).
+    """
+    cp_fix: list
+    curve_sampling_mode: str
+    subspace_model: str
+    filter_masks: list = field(default_factory=list)
+    jitter_multiplier: float = 0.0
+    natural_parameterization: bool = False
+    weight_decay: float = 0.0
+    curve_parameterization: str = 'bezier'
+    curve_segment: int | bool = False
+    indepent_connected: bool = False
+    lora_params: 'LoraParams | None' = None
+    perm_spec: bool = False
+    mutuable_param_name: bool = False
+    # Mixin fields (RepulsiveMixin, EntropyMixin, JensenShannonMixin)
+    gravity: float = 0.0
+    energy_weakening: float = 0.1
+    regularizer: str = 'force'
+    entropy_weight: float = 0.0
+
+    @classmethod
+    def from_config_dict(cls, mp: dict) -> 'ModelParams':
+        """Construct from ``config['model_params']`` dict."""
+        cp_fix = mp['cp_fix']
+        print(f"Control point fixed list: {cp_fix}")
+        return cls(
+            cp_fix=cp_fix,
+            curve_sampling_mode=mp.get('curve_sampling_mode', 'combined'),
+            subspace_model=mp.get('subspace_model', ''),
+            filter_masks=mp.get('filter_masks', []),
+            jitter_multiplier=mp.get('jitter_multiplier', 0.0),
+            natural_parameterization=mp.get('natural_parameterization', False),
+            weight_decay=mp.get('weight_decay', 0.0),
+            curve_parameterization=mp.get('curve_parameterization', 'bezier'),
+            curve_segment=mp.get('curve_segment', False),
+            indepent_connected=mp.get('indepent_connected', False),
+            lora_params=LoraParams.from_config_dict(mp['lora_params']) if mp.get('lora_params') else None,
+            perm_spec=mp.get('perm_spec', False),
+            mutuable_param_name=mp.get('mutuable_param_name', False),
+            gravity=mp.get('gravity', 0.0),
+            energy_weakening=mp.get('energy_weakening', 0.1),
+            regularizer=mp.get('regularizer', 'force'),
+            entropy_weight=mp.get('entropy_weight', 0.0),
+        )
+
+    @property
+    def k(self) -> int:
+        """Bézier curve degree: number of control points minus one."""
+        return len(self.cp_fix) - 1
+
+    def get_model_kwargs(self, *, model, k, lora_mask=None, curve_segment=None) -> dict:
+        """Return the hard-coded kwargs dict for the subspace model constructor.
+
+        All keys are explicitly listed so no automatic signature introspection
+        is needed.  Mixin params are only included when the resolved subspace
+        model class is a subclass of the corresponding mixin.
+
+        Args:
+            model: The wrapped neural-network model instance.
+            k: Bézier curve degree (number of control points minus one).
+            lora_mask: Pre-built LoRA mask pytree, or ``None``.
+            curve_segment: Override for ``self.curve_segment`` (e.g. ``False``
+                for k=0 pretraining).  When ``None``, uses the dataclass value.
+        """
+        s_model_cls = get_subspace_model(self.subspace_model)
+        d = dict(
+            model=model,
+            k=k,
+            weight_decay=self.weight_decay,
+            perm_spec=self.perm_spec,
+            natural_parameterization=self.natural_parameterization,
+            mutuable_param_name=self.mutuable_param_name,
+            curve_parameterization=self.curve_parameterization,
+            curve_segment=self.curve_segment if curve_segment is None else curve_segment,
+            indepent_connected=self.indepent_connected,
+        )
+        # Mixin params — only included when the model class uses that mixin
+        if issubclass(s_model_cls, RepulsiveMixin):
+            d.update(gravity=self.gravity,
+                     energy_weakening=self.energy_weakening,
+                     regularizer=self.regularizer)
+        if issubclass(s_model_cls, (EntropyMixin, EntropyMixin2, JensenShannonMixin)):
+            d['entropy_weight'] = self.entropy_weight
+        if self.lora_params and lora_mask is not None:
+            d.update(self.lora_params.model_kwargs())
+            d['lora_mask'] = lora_mask
+        return d
+
+    def build_curve_mask(self, params_tree, k):
+        """Build the curve mask from ``filter_masks`` applied to *params_tree*.
+
+        Returns an all-False pytree when ``k == 0``.
+        """
+        curve_mask = jax.tree.map(lambda x: False, params_tree)
+        if k > 0:
+            for f in self.filter_masks:
+                curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True,
+                                         BoolschenOperator=eval(f['op']))
+        return curve_mask
+
+
+@dataclass
+class OptimizerConf:
+    """Optimizer configuration, including the compiled learning-rate schedule.
+
+    All stored fields map 1-to-1 to keys inside ``config['optimizer_conf']``.
+    Construct via ``OptimizerConf.from_config_dict(oc)``; the LR schedule is
+    compiled from ``kwargs['learning_rate']`` during construction so callers
+    never have to call ``_setup_lr_schedule`` separately.
+
+    ``to_dict()`` reconstructs the mutable dict expected by lower-level helpers
+    such as ``_create_subspace_model`` and ``_build_optimizer``.
+    """
+    name: str
+    kwargs: dict                   # contains compiled lr_schedule under 'learning_rate'
+    lr_schedule: object            # compiled optax schedule (reference into kwargs)
+    freeze_other_params: bool = False
+    grad_clip_norm: float | None = None
+
+    @classmethod
+    def from_config_dict(cls, oc: dict) -> 'OptimizerConf':
+        """Construct from ``config['optimizer_conf']`` dict.
+
+        Compiles ``kwargs['learning_rate']`` into an optax schedule and stores
+        it both as ``lr_schedule`` and inside ``kwargs`` so downstream helpers
+        receive the already-compiled object.
+        """
+        kwargs = dict(oc['kwargs'])
+        lr_conf = kwargs['learning_rate']
+        if isinstance(lr_conf, dict):
+            lr_schedule = getattr(optax, lr_conf['name'])(**lr_conf['kwargs'])
+        else:
+            lr_schedule = optax.constant_schedule(lr_conf)
+        kwargs['learning_rate'] = lr_schedule
+        return cls(
+            name=oc['name'],
+            kwargs=kwargs,
+            lr_schedule=lr_schedule,
+            freeze_other_params=oc.get('freeze_other_params', False),
+            grad_clip_norm=oc.get('grad_clip_norm', None),
+        )
+
+    def to_dict(self) -> dict:
+        """Return a fresh mutable dict suitable for ``_create_subspace_model`` etc."""
+        d = dict(name=self.name, kwargs=dict(self.kwargs))
+        if self.freeze_other_params:
+            d['freeze_other_params'] = self.freeze_other_params
+        if self.grad_clip_norm is not None:
+            d['grad_clip_norm'] = self.grad_clip_norm
+        return d
+
+
+@dataclass
+class Config:
+    """Top-level configuration object for the training pipeline.
+
+    Construct via ``Config.from_dict(d, data)`` after the dataset has been
+    loaded so that ``train_hyper`` can resolve epoch / step counts.
+    All downstream functions accept a single ``config: Config`` argument
+    instead of separate ``hp`` + ``config`` dict pairs.
+    """
+    rng_seed: int
+    load_params_path: str | bool
+    data: dict
+    net_kwargs: dict
+    train_hyper: TrainHyperparams
+    model_params: ModelParams
+    optimizer_conf: OptimizerConf
+
+    @property
+    def eval_common(self) -> dict:
+        """Shared kwargs for ``_run_eval_phase`` (excludes per-call args)."""
+        return dict(
+            batch_size_eval=self.train_hyper.batch_size_eval,
+            curve_sampling_mode=self.model_params.curve_sampling_mode,
+            temperature=self.train_hyper.temperature,
+            smoke_test=self.train_hyper.smoke_test,
+        )
+
+    @classmethod
+    def from_dict(cls, d: dict, data: 'DataSplits') -> 'Config':
+        """Construct a ``Config`` from a raw dict (e.g. wandb config) and loaded data.
+
+        ``data`` is forwarded to ``TrainHyperparams.from_config_dict`` so that
+        epoch / step counts can be derived from the training-set size.
+
+        Also migrates ``weight_decay`` from ``model_params`` into the adamw
+        optimizer kwargs so it is applied once (by the optimizer) rather than
+        being duplicated inside the subspace model.
+        """
+        d = dict(d)  # shallow copy so we don't mutate the caller's dict
+        model_params = ModelParams.from_config_dict(d['model_params'])
+        optimizer_conf = OptimizerConf.from_config_dict(d['optimizer_conf'])
+        # Migrate weight_decay: if the subspace model carries a non-zero weight
+        # decay AND the optimizer is adamw, move it into the optimizer kwargs so
+        # regularisation is applied exactly once.
+        if model_params.weight_decay > 0.0 and optimizer_conf.name == 'adamw':
+            optimizer_conf.kwargs['weight_decay'] = model_params.weight_decay
+            model_params.weight_decay = 0.0
+        return cls(
+            rng_seed=d['rng_seed'],
+            load_params_path=d.get('load_params_path', False),
+            data=dict(d.get('data', {})),
+            net_kwargs=dict(d['net_kwargs']),
+            train_hyper=TrainHyperparams.from_config_dict(d['train_hyper'], data),
+            model_params=model_params,
+            optimizer_conf=optimizer_conf,
+        )
+
+    def build_masks(self, params_tree, k):
+        """Build curve / train / LoRA masks from *params_tree*.
+
+        Returns ``(curve_mask, train_mask, lora_mask)``.
+        """
+        mp = self.model_params
+        lp = mp.lora_params
+
+        curve_mask = mp.build_curve_mask(params_tree, k)
+
+        if self.optimizer_conf.freeze_other_params:
+            train_mask = jax.tree.map(lambda x: False, params_tree)
+            for f in mp.filter_masks:
+                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
+                                         BoolschenOperator=eval(f['op']))
+            if lp and lp.use_lora:
+                for f in lp.filter_masks:
+                    train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
+                                             BoolschenOperator=eval(f['op']))
+        else:
+            train_mask = jax.tree.map(lambda x: True, params_tree)
+
+        lora_mask = lp.build_lora_mask(params_tree) if lp else jax.tree.map(lambda x: False, params_tree)
+
+        return curve_mask, train_mask, lora_mask
 
 
 @dataclass
@@ -837,38 +1117,6 @@ def run_evaluation(*, rng_key, s_model, params, data: 'DataSplits', eval_specs,
     return ctx
 
 
-def _build_masks(params_tree, k, filter_masks, optimizer_conf, lora_params):
-    """Build the curve / train / LoRA masks from configuration.
-
-    Returns ``(curve_mask, train_mask, lora_mask)``.
-    """
-    curve_mask = jax.tree.map(lambda x: False, params_tree)
-    if k > 0:
-        for f in filter_masks:
-            curve_mask = filter_mask(curve_mask, *f['keys'], as_curve=True,
-                                     BoolschenOperator=eval(f['op']))
-
-    if 'freeze_other_params' in optimizer_conf and optimizer_conf['freeze_other_params']:
-        train_mask = jax.tree.map(lambda x: False, params_tree)
-        for f in filter_masks:
-            train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
-                                     BoolschenOperator=eval(f['op']))
-        if lora_params and lora_params['use_lora']:
-            for f in lora_params['filter_masks']:
-                train_mask = filter_mask(train_mask, *f['keys'], as_curve=True,
-                                         BoolschenOperator=eval(f['op']))
-    else:
-        train_mask = jax.tree.map(lambda x: True, params_tree)
-
-    lora_mask = jax.tree.map(lambda x: False, params_tree)
-    if lora_params and lora_params['use_lora']:
-        for f in lora_params['filter_masks']:
-            lora_mask = filter_mask(lora_mask, *f['keys'],
-                                    as_curve=np.array(f['dims']),
-                                    BoolschenOperator=eval(f['op']))
-    return curve_mask, train_mask, lora_mask
-
-
 # ---------------------------------------------------------------------------
 # Setup helpers – model construction, optimizer, masking
 # ---------------------------------------------------------------------------
@@ -893,35 +1141,6 @@ def _element_wise_mask(element_freeze_mask):
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _create_subspace_model(*, model, params_tree, k, filter_masks, optimizer_conf,
-                            lora_params, model_params, subspace_model):
-    """Create masks and instantiate a subspace model (no parameter initialization).
-
-    Also handles weight_decay migration from model_params to optimizer_conf for
-    adamw optimizers.
-
-    Returns:
-        ``(s_model, curve_mask, train_mask, _model_params)``
-    """
-    curve_mask, train_mask, lora_mask = _build_masks(
-        params_tree, k, filter_masks, optimizer_conf, lora_params)
-
-    # Copy model_params to allow mutation (e.g. zeroing weight_decay passed to optimizer)
-    _model_params = dict(model_params) if model_params else {}
-    weight_decay = _model_params.get('weight_decay', 0.0)
-    if (weight_decay > 0.0) and (optimizer_conf['name'] == 'adamw'):
-        optimizer_conf['kwargs']['weight_decay'] = weight_decay
-        _model_params['weight_decay'] = 0.0  # zero out to avoid double weight decay in model
-
-    logging.info("Using subspace model: %s", subspace_model)
-    _runtime_kwargs = dict(model=model, k=k, perm_spec=False, mutuable_param_name=False)
-    if lora_params and lora_params.get('use_lora', False):
-        _runtime_kwargs['lora_mask'] = lora_mask
-    s_model_cls = get_subspace_model(subspace_model)
-    s_model = s_model_cls(**_runtime_kwargs, **_model_params)
-
-    return s_model, curve_mask, train_mask, _model_params
-
 
 def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
                            jitter_multiplier, lora_params, fixed_cps_train_params=False):
@@ -939,7 +1158,7 @@ def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
 
     # set train mask according to config
     # Only update mask for LoRA-capable subspaces
-    if lora_params and lora_params.get('use_lora', False):
+    if lora_params and lora_params.use_lora:
         updated_train_mask = s_model.update_mask_for_lora(
             train_mask, params['params'], b_off=False, w0_off=True)  # w0 must be off for LoRA
     else:
@@ -961,28 +1180,6 @@ def _init_subspace_params(s_model, params, curve_mask, train_mask, init_key,
 
     return params
 
-
-def _build_subspace_model(*, model, params, k, filter_masks, optimizer_conf,
-                           lora_params, model_params, subspace_model,
-                           jitter_multiplier, init_key, fixed_cps_train_params):
-    """Create masks, instantiate a subspace model, and initialise parameters.
-
-    Convenience wrapper around ``_create_subspace_model`` and
-    ``_init_subspace_params``.
-
-    Returns:
-        ``(s_model, params, _model_params, curve_mask, train_mask)``
-    """
-    s_model, curve_mask, train_mask, _model_params = _create_subspace_model(
-        model=model, params_tree=params['params'], k=k, filter_masks=filter_masks,
-        optimizer_conf=optimizer_conf, lora_params=lora_params,
-        model_params=model_params, subspace_model=subspace_model)
-
-    params = _init_subspace_params(
-        s_model, params, curve_mask, train_mask, init_key,
-        jitter_multiplier, lora_params, fixed_cps_train_params)
-
-    return s_model, params, _model_params, curve_mask, train_mask
 
 
 def _build_optimizer(*, optimizer_conf, s_model, params, fixed_cps_train_params):
@@ -1240,8 +1437,8 @@ def _setup_rho_scheduler(lora_params, num_steps):
     Returns:
         Callable ``(step, base_rho) -> current_rho``.
     """
-    if lora_params and lora_params.get('rho_scheduler_frequency', 0.0) > 0.0:
-        frequency = lora_params['rho_scheduler_frequency']
+    if lora_params and lora_params.rho_scheduler_frequency > 0.0:
+        frequency = lora_params.rho_scheduler_frequency
         base_frequency = num_steps / (2 * frequency)
         print(f"Using cosine rho schedule with total steps {num_steps}")
 
@@ -1382,7 +1579,7 @@ def _run_eval_phase(*, rng_key, s_model, params, k, data,
     return params
 
 
-def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_fn=None):
+def _run_training_phase(rng_key, env, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
     """Execute one training phase (expert or minibatch) and log metrics.
 
     Reads ``params`` and ``opt_state`` from *env*; callers that need to
@@ -1395,6 +1592,7 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
     Returns:
         ``(rng_key, params, last_trainable_params, scan_fn)``
     """
+    hp = config.train_hyper
     s_model = env.s_model
     optimizer = env.optimizer
     params = env.params
@@ -1408,23 +1606,16 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
 
     k = s_model.k
     lr_schedule = env.lr_schedule
-    dataset_sampling = hp.dataset_sampling
     lora_rho = env.lora_rho
     lora_rho_s = env.lora_rho_s
-    eval_every_n_batch = hp.eval_every_n_batch
-    batch_size = hp.batch_size
-    num_epochs = hp.num_epochs
-    num_steps = hp.num_steps
-    smoke_test = hp.smoke_test
 
-    if num_steps <= 0:
+    if hp.num_steps <= 0:
         return rng_key, params, None, scan_fn
 
     # Initialize best-parameter tracking
     best_val_ll = -np.inf
     best_params = s_model.only_trainable_params(params['params']) if data.has_val else None
 
-    ds_sampling = hp.ds_sampling
     train_input_ids = data.train_input_ids
     train_attention_mask = data.train_attention_mask
     train_labels = data.train_labels
@@ -1433,9 +1624,9 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
     cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
     initial_cp_center = cp_w.mean(axis=0)
 
-    if ds_sampling == 'expert':
-        print(f"Start sorted expert training for {num_steps}")
-        sort_mode = dataset_sampling['expert'].get('sort_mode', False)
+    if hp.ds_sampling == 'expert':
+        print(f"Start sorted expert training for {hp.num_steps}")
+        sort_mode = hp.dataset_sampling['expert'].get('sort_mode', False)
         if sort_mode == 'Random':
             order = random.permutation(rng_key, train_input_ids.shape[0])
             train_input_ids = train_input_ids[order]
@@ -1466,14 +1657,14 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
             train_labels = train_labels[order]
             print(f"Data sorted for expert sampling using {sort_mode} method")
 
-        window_size = dataset_sampling['expert']['window_size']
-        window_size = max(batch_size, window_size)
+        window_size = hp.dataset_sampling['expert']['window_size']
+        window_size = max(hp.batch_size, window_size)
         train_expert_step = _make_expert_step_fn(
             s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
-            t_sample_fn=t_sample_fn, eval_every_n_batch=eval_every_n_batch,
+            t_sample_fn=t_sample_fn, eval_every_n_batch=hp.eval_every_n_batch,
             valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-            get_best_params=get_best_params, num_steps=num_steps,
-            batch_size=batch_size, window_size=window_size)
+            get_best_params=get_best_params, num_steps=hp.num_steps,
+            batch_size=hp.batch_size, window_size=window_size)
 
         carry = (rng_key, params, opt_state, best_val_ll, best_params,
                  (train_input_ids, train_attention_mask, train_labels))
@@ -1481,37 +1672,37 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
             @jit
             def scan_fn(carry, xs):
                 return jax.lax.scan(train_expert_step, carry, xs)
-        carry, metrics = scan_fn(carry, jnp.arange(num_steps))
+        carry, metrics = scan_fn(carry, jnp.arange(hp.num_steps))
 
-    elif ds_sampling == 'minibatch':
-        print(f"Start minibatch training for {num_epochs} epochs")
+    elif hp.ds_sampling == 'minibatch':
+        print(f"Start minibatch training for {hp.num_epochs} epochs")
         train_epoch_fn = _make_train_epoch_fn(
             s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
             t_sample_fn=t_sample_fn, lora_rho=lora_rho, lora_rho_s=lora_rho_s,
-            rho_scheduler=rho_scheduler, eval_every_n_batch=eval_every_n_batch,
+            rho_scheduler=rho_scheduler, eval_every_n_batch=hp.eval_every_n_batch,
             valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
             get_best_params=get_best_params,
             initial_cp_center=initial_cp_center, k=k,
             train_input_ids=train_input_ids,
             train_attention_mask=train_attention_mask,
             train_labels=train_labels,
-            batch_size=batch_size, smoke_test=smoke_test,
-            num_epochs=num_epochs)
+            batch_size=hp.batch_size, smoke_test=hp.smoke_test,
+            num_epochs=hp.num_epochs)
 
         carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
         if scan_fn is None:
             @jit
             def scan_fn(carry, xs):
                 return jax.lax.scan(train_epoch_fn, carry, xs)
-        carry, metrics = scan_fn(carry, jnp.arange(num_epochs))
+        carry, metrics = scan_fn(carry, jnp.arange(hp.num_epochs))
     else:
-        raise ValueError(f"Unknown dataset_sampling method {ds_sampling}. Choose 'expert' or 'minibatch'.")
+        raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
         if key.startswith('val_'):
-            metrics[key] = jnp.array(value).flatten()[::eval_every_n_batch].repeat(
-                eval_every_n_batch, axis=0)[:num_steps]
+            metrics[key] = jnp.array(value).flatten()[::hp.eval_every_n_batch].repeat(
+                hp.eval_every_n_batch, axis=0)[:hp.num_steps]
         else:
             metrics[key] = jnp.array(value).flatten()
 
@@ -1519,7 +1710,7 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
     _ = [logger.log(dict(zip(metrics.keys(), m))) for m in zip(*metrics.values())]
 
     # Log metrics as artifact
-    epochs = np.repeat(np.arange(num_epochs), num_steps // batch_size)
+    epochs = np.repeat(np.arange(hp.num_epochs), hp.num_steps // hp.batch_size)
     jnp.savez(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz', **metrics, epochs=epochs)
     art = wandb.Artifact(name="metrics", type="npz")
     art.add_file(f'tmp_files/{logger.id}_{logger_prefix}metrics.npz')
@@ -1547,22 +1738,6 @@ def _run_training_phase(rng_key, env, data, hp, logger, logger_prefix, *, scan_f
 # ---------------------------------------------------------------------------
 # Pipeline stage functions – called by train() orchestrator
 # ---------------------------------------------------------------------------
-
-def _setup_lr_schedule(optimizer_conf):
-    """Build optax learning-rate schedule from the optimizer config dict.
-
-    Mutates ``optimizer_conf['kwargs']['learning_rate']`` in-place (replaces
-    the raw dict/float with the compiled optax schedule object) and returns
-    the schedule.
-    """
-    lr_conf = optimizer_conf['kwargs']['learning_rate']
-    if isinstance(lr_conf, dict):
-        lr_schedule = getattr(optax, lr_conf['name'])(**lr_conf['kwargs'])
-    else:
-        lr_schedule = optax.constant_schedule(lr_conf)
-    optimizer_conf['kwargs']['learning_rate'] = lr_schedule
-    return lr_schedule
-
 
 def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
                       smoke_test, logger):
@@ -1593,12 +1768,11 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
     # Shuffle and split into train / val
     rng_key, split_key = random.split(rng_key)
     perm_idx = random.permutation(split_key, len(input_ids))
-
-    n_train = int(np.floor((1. - val_percentage) * len(input_ids) / batch_size) * batch_size)
     ordered_ids = input_ids[perm_idx]
     ordered_mask = attention_mask[perm_idx]
     ordered_labels = labels[perm_idx]
 
+    n_train = int(np.floor((1. - val_percentage) * len(input_ids) / batch_size) * batch_size)
     train_input_ids = ordered_ids[:n_train]
     train_attention_mask = ordered_mask[:n_train]
     train_labels = ordered_labels[:n_train]
@@ -1642,11 +1816,12 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
     return data, unique_target_ids, rng_key
 
 
-def _compute_expert_embeddings(model, params, data, hp):
+def _compute_expert_embeddings(model, params, data, config: 'Config'):
     """Compute cosine-similarity matrix for expert sorting, if needed.
 
     Returns ``None`` when expert sorting is not configured or not required.
     """
+    hp = config.train_hyper
     if (hp.ds_sampling != 'expert') or (hp.num_steps <= 0) or not data.has_train:
         return None
     sort_mode = hp.dataset_sampling['expert'].get('sort_mode', False)
@@ -1667,63 +1842,51 @@ def _compute_expert_embeddings(model, params, data, hp):
     return cosine_sim
 
 
-def _setup_training_env(*, rng_key, k, hp, config, data,
+def _setup_training_env(*, rng_key, k, config: 'Config', data,
                          fixed_cps_train_params=False):
     """Create model, subspace, optimizer, and all training support objects.
 
     Handles both k=0 (pretraining) and k>0 (curve fitting) cases.
 
-    *hp* carries pure training hyperparameters; object-construction config
-    (model architecture, optimizer, LoRA, masking) is read from the raw
-    *config* groups: ``net_kwargs``, ``model_params``, ``optimizer_conf``,
-    ``curve_params``, ``lora_params``.
+    All configuration is read from *config*: ``train_hyper`` for run-behaviour
+    parameters and ``model_params`` / ``optimizer_conf`` / ``net_kwargs`` for
+    object-construction parameters.
 
     Returns:
         ``(env, rng_key)`` where *env* is a ``TrainingEnv``.
     """
-    net_kwargs = config['net_kwargs']
-    mp = config.get('model_params', {})
-    optimizer_conf = deepcopy(config['optimizer_conf'])
-    model_params = dict(mp)
-    filter_masks = config.get('curve_params', {}).get('filter_masks', [])
-    subspace_model = mp.get('subspace_model', '')
-    jitter_multiplier = mp.get('jitter_multiplier', 0.0)
-    lora_params = config.get('lora_params', None)
-    lr_schedule = optimizer_conf['kwargs']['learning_rate']
-    lora_rho = lora_params.get('lora_rho', 0.0) if lora_params else 0.0
-    lora_rho_s = lora_params.get('lora_rho_s', 0.0) if lora_params else 0.0
+    mp = config.model_params
+    lora_params = mp.lora_params
+    optimizer_conf = config.optimizer_conf.to_dict()  # fresh mutable dict for lower-level helpers
 
-    model = QwenTextClassificationWrapper(**net_kwargs)
+    model = QwenTextClassificationWrapper(**config.net_kwargs)
     base_params = unfreeze(model.init(None, None))
 
     rng_key, init_key = random.split(rng_key)
 
-    if k == 0:
-        model_params['curve_segment'] = False  # no segments at k=0
-        s_model, curve_mask, train_mask, _ = _create_subspace_model(
-            model=model, params_tree=base_params['params'], k=0,
-            filter_masks=filter_masks,
-            optimizer_conf=optimizer_conf,
-            lora_params=lora_params,
-            model_params=model_params,
-            subspace_model=subspace_model)
+    # Build curve / train / LoRA masks
+    curve_mask, train_mask, lora_mask = config.build_masks(
+        base_params['params'], k)
 
+    # Instantiate the subspace model
+    logging.info("Using subspace model: %s", mp.subspace_model)
+    s_model_cls = get_subspace_model(mp.subspace_model)
+    s_model = s_model_cls(**mp.get_model_kwargs(
+        model=model, k=k,
+        lora_mask=lora_mask if (lora_params and lora_params.use_lora) else None,
+        curve_segment=False if k == 0 else None,
+    ))
+
+    if k == 0:
         # Init once to set s_model internal state (curve_mask, LoRA structs)
         params = jax.tree.map(lambda x: x, base_params)
         params = _init_subspace_params(
             s_model, params, curve_mask, train_mask, init_key,
-            jitter_multiplier, lora_params)
+            mp.jitter_multiplier, lora_params)
     else:
-        s_model, params, _, curve_mask, train_mask = _build_subspace_model(
-            model=model, params=base_params, k=k,
-            filter_masks=filter_masks,
-            optimizer_conf=optimizer_conf,
-            lora_params=lora_params,
-            model_params=model_params,
-            subspace_model=subspace_model,
-            jitter_multiplier=jitter_multiplier,
-            init_key=init_key,
-            fixed_cps_train_params=fixed_cps_train_params)
+        params = _init_subspace_params(
+            s_model, base_params, curve_mask, train_mask, init_key,
+            mp.jitter_multiplier, lora_params, fixed_cps_train_params)
         base_params = None  # not needed for curve phase
 
     # Build optimizer
@@ -1732,17 +1895,17 @@ def _setup_training_env(*, rng_key, k, hp, config, data,
         params=params, fixed_cps_train_params=fixed_cps_train_params)
 
     # Expert embeddings
-    cosine_sim = _compute_expert_embeddings(model, params, data, hp)
+    cosine_sim = _compute_expert_embeddings(model, params, data, config)
 
     # t sampling, rho scheduler, validation
-    t_sample_fn = _setup_t_sample_fn(s_model, hp.curve_sampling_mode)
-    rho_scheduler = _setup_rho_scheduler(lora_params, hp.num_steps)
+    t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
+    rho_scheduler = _setup_rho_scheduler(lora_params, config.train_hyper.num_steps)
 
     if data.has_train:
         valid_metrics_fn, empty_metric, get_best_params = \
             _setup_validation(
                 s_model, params, data.val_input_ids, data.val_attention_mask,
-                data.val_labels, hp.batch_size_eval, k=k,
+                data.val_labels, config.train_hyper.batch_size_eval, k=k,
                 lora_rho=lora_rho, lora_rho_s=lora_rho_s)
     else:
         empty_metric = _empty_val_metric()
@@ -1757,7 +1920,9 @@ def _setup_training_env(*, rng_key, k, hp, config, data,
         valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
         get_best_params=get_best_params,
         cosine_sim=cosine_sim, n_trainable=n_trainable,
-        lr_schedule=lr_schedule, lora_rho=lora_rho, lora_rho_s=lora_rho_s)
+        lr_schedule=config.optimizer_conf.lr_schedule,
+        lora_rho=lora_params.lora_rho if lora_params else 0.0,
+        lora_rho_s=lora_params.lora_rho_s if lora_params else 0.0)
 
     return env, rng_key
 
@@ -1782,33 +1947,32 @@ def single_point_mask(s_model):
         s_model.curve_mask = original_curve_mask
 
 
-def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
+def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     """Train each fixed control point independently (k=0).
 
     Returns:
         ``(train_params, rng_key)``
     """
-    cp_fix = hp.cp_fix
-    lora_params = config.get('lora_params', None)
+    cp_fix = config.model_params.cp_fix
+    lora_params = config.model_params.lora_params
 
     # Validation checks
-    deg_segments = config.get('model_params', {}).get('curve_segment', False)
-    if deg_segments:
+    if config.model_params.curve_segment:
         all_segments_fixed_endpoints = np.all(
-            [deg_segments == i for i in np.diff(
+            [config.model_params.curve_segment == i for i in np.diff(
                 np.argwhere(np.array(cp_fix) == 1).flatten())])
         assert all_segments_fixed_endpoints, (
             "In curve segment mode, fixed control points must be consecutive "
             "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
     if lora_params is not None and np.sum(cp_fix) < len(cp_fix):
-        _lora_mode = config.get('model_params', {}).get('lora_mode', '')
+        _lora_mode = lora_params.lora_mode
         assert _lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
             "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
             "subspace curves with fixed control points")
 
     # Setup training environment for k=0
     env, rng_key = _setup_training_env(
-        k=0, hp=hp, config=config, data=data, rng_key=rng_key)
+        k=0, config=config, data=data, rng_key=rng_key)
 
     # Pretraining loop — single_point_mask makes the k=0 intent explicit and
     # ensures the model is restored even if an exception is raised.
@@ -1823,7 +1987,7 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
                 params = jax.tree.map(lambda x: x, env.base_params)
                 params = _init_subspace_params(
                     env.s_model, params, env.curve_mask, env.train_mask, init_key,
-                    config.get('model_params', {}).get('jitter_multiplier', 0.0),
+                    config.model_params.jitter_multiplier,
                     lora_params)
 
                 # Re-init optimizer state
@@ -1834,7 +1998,7 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
                 env.params = params
                 env.opt_state = opt_state
                 rng_key, params, _, scan_fn = _run_training_phase(
-                    rng_key, env, data, hp, logger, f'cp_fixed_{i}_',
+                    rng_key, env, data, config, logger, f'cp_fixed_{i}_',
                     scan_fn=scan_fn)
 
                 # Evaluate
@@ -1843,7 +2007,7 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
                     rng_key=rng_key, k=0,
                     t_sample_fn=env.t_sample_fn,
                     logger=logger, logger_prefix=f'cp_fixed_{i}_',
-                    data=data, **hp.eval_common,
+                    data=data, **config.eval_common,
                     lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
 
                 train_params.append(env.s_model.only_trainable_params(params['params']))
@@ -1853,7 +2017,7 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
 
     del env  # free GPU memory before curve phase
 
-    if hp.save_params:
+    if config.train_hyper.save_params:
         print("Save pretrained trainable params ...")
         np.save(f'tmp_files/{logger.id}_pretrained_params.npy', train_params)
         time.sleep(1)
@@ -1863,30 +2027,28 @@ def _pretrain_fixed_cps(rng_key, hp, config, data, logger, artifact):
     return train_params, rng_key
 
 
-def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact):
+def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, artifact):
     """Fit the full Bézier curve (k > 0), evaluate, and save parameters.
 
     Args:
         train_params: Pretrained control-point params (list or ``False``).
     """
-    cp_fix = hp.cp_fix
-    k = len(cp_fix) - 1
+    cp_fix = config.model_params.cp_fix
+    k = config.model_params.k
     all_fixed = len(cp_fix) == np.sum(cp_fix)
 
-    deg_segments = config.get('model_params', {}).get('curve_segment', False)
-    indep_connected = config.get('model_params', {}).get('indepent_connected', False)
     print("Training curve model")
     if np.sum(cp_fix) == 0:
         print("No fixed control points, training full curve with all control points free.")
-        if deg_segments:
-            assert indep_connected is True, (
+        if config.model_params.curve_segment:
+            assert config.model_params.indepent_connected is True, (
                 "In curve segment mode with no fixed control points, curve "
                 "optimization only makes sense if all segments are "
                 "independently connected.")
 
     # Setup training environment for k > 0
     env, rng_key = _setup_training_env(
-        k=k, hp=hp, config=config, data=data, rng_key=rng_key,
+        k=k, config=config, data=data, rng_key=rng_key,
         fixed_cps_train_params=train_params)
 
     # Log parameter stats
@@ -1907,7 +2069,7 @@ def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact)
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
         rng_key, params, last_trainable_params, _ = _run_training_phase(
-            rng_key, env, data, hp, logger, '')
+            rng_key, env, data, config, logger, '')
     else:
         params = env.params
         last_trainable_params = None
@@ -1918,11 +2080,11 @@ def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact)
         rng_key=rng_key, k=k,
         t_sample_fn=env.t_sample_fn,
         logger=logger, logger_prefix='',
-        data=data, **hp.eval_common,
+        data=data, **config.eval_common,
         lora_rho=env.lora_rho, lora_rho_s=env.lora_rho_s)
 
     # Save curve params
-    if hp.save_params:
+    if config.train_hyper.save_params:
         print("Save final trainable params ...")
         np.save(f'tmp_files/{logger.id}_trainable_params.npy',
                 env.s_model.only_trainable_params(params['params']))
@@ -1938,41 +2100,44 @@ def _train_full_curve(rng_key, hp, config, data, train_params, logger, artifact)
 
 def main():
     logger = wandb.init()
-    config = wandb.config
-    train(logger, config)
+    config_dict = dict(wandb.config)
+    train(logger, config_dict)
 
 
-def train(logger, config):
+def train(logger, config_dict):
     """Main training orchestrator for Qwen curve fine-tuning."""
-    rng_key = random.PRNGKey(config['rng_seed'])
+    config_dict = dict(config_dict)  # shallow copy so we can mutate
+    rng_key = random.PRNGKey(config_dict['rng_seed'])
     artifact = wandb.Artifact(name="params", type="pytree")
 
     # Resolve model path from wandb if a local path is not given
-    if config['net_kwargs']['model_path'].startswith('ddold/'):
-        model_artifact = logger.use_artifact(config['net_kwargs']['model_path'], type='model')
-        config['net_kwargs']['model_path'] = model_artifact.download()
+    net_kwargs = dict(config_dict['net_kwargs'])
+    if net_kwargs['model_path'].startswith('ddold/'):
+        model_artifact = logger.use_artifact(net_kwargs['model_path'], type='model')
+        net_kwargs['model_path'] = model_artifact.download()
+    config_dict['net_kwargs'] = net_kwargs
 
+    data_conf = config_dict.get('data', {})
     data, unique_target_ids, rng_key = _prepare_datasets(
         rng_key,
-        dataset_path=config['dataset_path'],
-        val_percentage=config['train_hyper'].get('val_percentage', 0.0),
-        batch_size=config['train_hyper']['batch_size'],
-        smoke_test=config['train_hyper'].get('smoke_test', False),
+        dataset_path=data_conf['dataset_path'],
+        val_percentage=data_conf.get('val_percentage', 0.0),
+        batch_size=config_dict['train_hyper']['batch_size'],
+        smoke_test=config_dict['train_hyper'].get('smoke_test', False),
         logger=logger)
 
-    _setup_lr_schedule(config['optimizer_conf'])
-    config['net_kwargs']['target_token_ids'] = unique_target_ids
-    hp = TrainHyperparams.from_config(config, data)
+    config_dict['net_kwargs']['target_token_ids'] = unique_target_ids
+    config = Config.from_dict(config_dict, data)
 
-    pretrained_params = [False] * len(hp.cp_fix)
-    if any(hp.cp_fix):
+    pretrained_params = [False] * len(config.model_params.cp_fix)
+    if any(config.model_params.cp_fix):
         pretrained_params, rng_key = _pretrain_fixed_cps(
-            rng_key, hp, config, data, logger, artifact)
+            rng_key, config, data, logger, artifact)
 
-    if len(hp.cp_fix) > 1:
-        _train_full_curve(rng_key, hp, config, data, pretrained_params, logger, artifact)
+    if len(config.model_params.cp_fix) > 1:
+        _train_full_curve(rng_key, config, data, pretrained_params, logger, artifact)
 
-    if hp.save_params:
+    if config.train_hyper.save_params:
         logger.log_artifact(artifact)
         time.sleep(5)
         print("Logged artifact with parameters.")
@@ -2009,35 +2174,38 @@ if __name__ == '__main__':
             'load_params_path': False,
 
             # --- Data --------------------------------------------------------------
-            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
-            # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
-            # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-            # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+            'data': {
+                'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
+                # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+                'val_percentage': 0.1,
+            },
 
             # --- Base model (QwenTextClassificationWrapper) ------------------------
+            # 'target_token_ids' is injected automatically after dataset load
             'net_kwargs': {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"},
             # 'net_kwargs': {'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"},
 
             # --- Training hyperparameters → TrainHyperparams ----------------------
             # These control *how* training runs, not *what* is built.
             'train_hyper': {
-                'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
                 'batch_size': args.batch_size,
                 'num_epochs': -1,             # -1 means use num_steps instead
                 'num_steps': 10 if args.smoke_test else 5_000,
                 'eval_every_n_batch': 20,
                 'temperature': [1.0],
-                'curve_sampling_mode': 'combined_noBMA',  # 'per_leave' | 'combined' | 'combined_noBMA'
                 'dataset_sampling': {'minibatch': {}},
                 # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
                 'save_params': True,
                 'smoke_test': args.smoke_test,
-                'val_percentage': 0.1,
             },
 
-            # --- Subspace model + LoRA architecture (→ _create_subspace_model) ----
+            # --- Subspace model + LoRA architecture → ModelParams -----------------
             # All parameters that determine *what* the subspace model is.
             'model_params': {
+                'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
+                'curve_sampling_mode': 'combined_noBMA',  # 'per_leave' | 'combined' | 'combined_noBMA'
                 'subspace_model': 'lora_category',
                 'jitter_multiplier': 0.,      # weight-init noise scale
                 'natural_parameterization': False,
@@ -2047,21 +2215,32 @@ if __name__ == '__main__':
                 'indepent_connected': False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,
-                'r': 8,
-                'lora_dtype': 'float32',
-                'lora_alpha': 16.0,
-                'lora_mode': 'A(t)B(t)',
-                # 'lora_mode': 'Arotsd(t)eB',
-                # 'lora_mode': 'Arot(t)sdeBrot(t)',
-            },
 
-            # --- Curve topology (which parameters become the Bézier curve) --------
-            'curve_params': {
+                # curve topology: which parameters become the Bézier curve
                 'filter_masks': [
                     {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
                     {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
                     {'keys': ["lm_head", "kernel"], 'op': 'all'},
                 ],
+
+                # LoRA sub-config (architecture + noise scheduling)
+                'lora_params': {
+                    'use_lora': True,
+                    'r': 8,
+                    'lora_dtype': 'float32',
+                    'lora_alpha': 16.0,
+                    'lora_mode': 'A(t)B(t)',
+                    # 'lora_mode': 'Arotsd(t)eB',
+                    # 'lora_mode': 'Arot(t)sdeBrot(t)',
+                    'rho_scheduler_frequency': 100.,
+                    'lora_rho': .25,
+                    'lora_rho_s': .5,
+                    'filter_masks': [
+                        {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                        {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                        {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                    ],
+                },
             },
 
             # --- Optimizer ---------------------------------------------------------
@@ -2086,21 +2265,6 @@ if __name__ == '__main__':
                 # 'name': "sgd",
                 # 'kwargs': {'learning_rate': 0.0001, 'momentum': 0.9, 'nesterov': True},
                 # 'grad_clip_norm': 100.0,
-            },
-
-            # --- LoRA noise / scheduling -------------------------------------------
-            # lora_rho / lora_rho_s are training hyperparameters but sourced here
-            # to keep all LoRA config in one place.
-            'lora_params': {
-                'use_lora': True,
-                'rho_scheduler_frequency': 100.,
-                'lora_rho': .25,
-                'lora_rho_s': .5,
-                'filter_masks': [
-                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                    {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                ],
             },
         }
         logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)

@@ -1085,7 +1085,7 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
         if lora_rho > 0.0 or lora_rho_s > 0.0:
             current_rho = rho_scheduler(update_idx, lora_rho)
             current_rho_s = rho_scheduler(update_idx, lora_rho_s)
-            params = s_model.set_lora_rho(current_rho, current_rho_s, params)
+            params = s_model.set_lora_rho(current_rho, current_rho_s, params)  # type: ignore[attr-defined]
         loss, params, opt_state, (grad_, logs) = s_model.train_step(
             subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
         current_lr = lr_schedule(update_idx)

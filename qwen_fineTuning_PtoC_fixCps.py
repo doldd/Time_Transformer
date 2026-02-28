@@ -31,7 +31,7 @@ from src.subspace_curve import (
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import time
 from contextlib import contextmanager
 
@@ -1154,12 +1154,23 @@ def _init_optimizer(config:Config, curve_mask=None, curve_params=None):
     optimizer = optax.chain(*opt_chain_list)
     return optimizer
 
-def _make_train_batch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
-                          lora_rho, lora_rho_s, rho_scheduler, eval_every_n_batch,
-                          valid_metrics_fn, empty_metric, get_best_params,
-                          initial_cp_center, k,
-                          train_input_ids, train_attention_mask, train_labels):
+def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
+                          train_input_ids, train_attention_mask, train_labels,
+                          initial_cp_center):
     """Return a ``train_batch(carry, batch_idx)`` closure for ``jax.lax.scan``."""
+    s_model = env.s_model
+    optimizer = env.optimizer
+    lr_schedule = config.optimizer_conf.lr_schedule
+    t_sample_fn = env.t_sample_fn
+    rho_scheduler = env.rho_scheduler
+    valid_metrics_fn = env.valid_metrics_fn
+    empty_metric = env.empty_metric
+    get_best_params = env.get_best_params
+    eval_every_n_batch = config.train_hyper.eval_every_n_batch
+    k = s_model.k
+    lora_params = config.model_params.lora_params
+    lora_rho = lora_params.lora_rho if lora_params else 0.0
+    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
 
     def train_batch(carry, batch_idx):
         rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
@@ -1170,14 +1181,12 @@ def _make_train_batch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
 
         rng_key, subkey = random.split(rng_key)
         t = t_sample_fn(subkey)
-        # t = random.uniform(subkey, (1,), minval=0., maxval=1.)
         if lora_rho > 0.0 or lora_rho_s > 0.0:
             current_rho = rho_scheduler(update_idx, lora_rho)
             current_rho_s = rho_scheduler(update_idx, lora_rho_s)
             params = s_model.set_lora_rho(current_rho, current_rho_s, params)
         loss, params, opt_state, (grad_, logs) = s_model.train_step(
             subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-        # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
         current_lr = lr_schedule(update_idx)
         # validate
         rng_key, valid_key = random.split(rng_key)
@@ -1208,27 +1217,23 @@ def _make_train_batch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
     return train_batch
 
 
-def _make_train_epoch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
-                           lora_rho, lora_rho_s, rho_scheduler, eval_every_n_batch,
-                           valid_metrics_fn, empty_metric, get_best_params,
-                           initial_cp_center, k,
-                           train_input_ids, train_attention_mask, train_labels,
-                           batch_size, smoke_test, num_epochs):
+def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
+                          train_input_ids, train_attention_mask, train_labels,
+                          initial_cp_center):
     """Return a ``train_epoch(carry, epoch)`` closure for ``jax.lax.scan``.
 
     Internally creates the per-batch function via ``_make_train_batch_fn``.
     """
+    hp = config.train_hyper
     train_batch_fn = _make_train_batch_fn(
-        s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
-        t_sample_fn=t_sample_fn, lora_rho=lora_rho, lora_rho_s=lora_rho_s,
-        rho_scheduler=rho_scheduler, eval_every_n_batch=eval_every_n_batch,
-        valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-        get_best_params=get_best_params,
-        initial_cp_center=initial_cp_center, k=k,
+        env, config,
         train_input_ids=train_input_ids,
         train_attention_mask=train_attention_mask,
-        train_labels=train_labels)
+        train_labels=train_labels,
+        initial_cp_center=initial_cp_center)
     n_train_samples = train_labels.shape[0]
+    batch_size = hp.batch_size
+    num_epochs = hp.num_epochs
 
     def _inf_mean(x):
         mask = jnp.isfinite(x)
@@ -1241,13 +1246,6 @@ def _make_train_epoch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
         shuffel_idx = random.permutation(subkey, n_train_samples)
         shuffel_idx = es('(ib)->ib', shuffel_idx, b=batch_size)
 
-        # Limit number of batches for smoke test
-        if smoke_test:
-            smoke_batch_limit = 3
-            n_batches = min(smoke_batch_limit, shuffel_idx.shape[0])
-            shuffel_idx = shuffel_idx[:n_batches]
-            jax.debug.print(f"Smoke test: Limited to {n_batches} batches per epoch")
-
         # train on batches
         carry, metrics = jax.lax.scan(train_batch_fn, carry, shuffel_idx)
         val_loss_ = _inf_mean(metrics['val_loss'])
@@ -1259,10 +1257,62 @@ def _make_train_epoch_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
     return train_epoch
 
 
-def _make_expert_step_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
-                           eval_every_n_batch, valid_metrics_fn, empty_metric,
-                           get_best_params, num_steps, batch_size, window_size):
+def _sort_data_for_expert(rng_key, data: 'DataSplits', config: 'Config', model):
+    """Sort training data according to expert sampling configuration.
+
+    Handles ``'Random'``, ``'Hierarchical'``, ``'Spectral'``, and
+    ``'First_data'`` sort modes.  Returns the (possibly reordered)
+    training arrays.
+
+    Returns:
+        ``(train_input_ids, train_attention_mask, train_labels)``
+    """
+    train_input_ids, train_attention_mask, train_labels = data.get('train')
+    sort_mode = config.train_hyper.dataset_sampling['expert'].get('sort_mode', False)
+
+    if sort_mode == 'Random':
+        order = random.permutation(rng_key, train_input_ids.shape[0])
+    elif sort_mode:
+        cosine_sim = _compute_expert_embeddings(model, data, config)
+        assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
+        distance = 1 - cosine_sim
+        if sort_mode == 'Hierarchical':
+            condensed = squareform(distance, checks=False)
+            Z = hierarchy.linkage(condensed, method='average')
+            Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
+            order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
+            order = jnp.array(order)
+        elif sort_mode == 'Spectral':
+            distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
+            D = jnp.diag(distance.sum(axis=1))
+            L = D - distance
+            vals, vecs = jnp.linalg.eigh(L)
+            fiedler = vecs[:, -2]
+            order = jnp.argsort(fiedler)
+        elif sort_mode == 'First_data':
+            order = jnp.argsort(distance[0])
+        else:
+            raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
+        print(f"Data sorted for expert sampling using {sort_mode} method")
+    else:
+        return train_input_ids, train_attention_mask, train_labels
+
+    return train_input_ids[order], train_attention_mask[order], train_labels[order]
+
+
+def _make_expert_step_fn(env: 'TrainingEnv', config: 'Config', *,
+                          window_size):
     """Return a ``_train_expert_step(carry, step)`` closure for ``jax.lax.scan``."""
+    s_model = env.s_model
+    optimizer = env.optimizer
+    lr_schedule = config.optimizer_conf.lr_schedule
+    t_sample_fn = env.t_sample_fn
+    valid_metrics_fn = env.valid_metrics_fn
+    empty_metric = env.empty_metric
+    get_best_params = env.get_best_params
+    eval_every_n_batch = config.train_hyper.eval_every_n_batch
+    batch_size = config.train_hyper.batch_size
+    num_steps = config.train_hyper.num_steps
 
     @scan_tqdm(num_steps)
     def _train_expert_step(carry, step):
@@ -1283,7 +1333,6 @@ def _make_expert_step_fn(*, s_model, optimizer, lr_schedule, t_sample_fn,
         t = t_sample_fn(subkey)
         loss, params, opt_state, (grad_, logs) = s_model.train_step(
             subkey, t, params, (x_batch, atten_batch), y_, opt_state, optimizer)
-        # because of optax.chain [-1] gets state of optimizer and next [-1] gets state of learning rate scheduler
         current_lr = lr_schedule(step)
 
         # validate
@@ -1345,9 +1394,10 @@ def _setup_validation(s_model, data: 'DataSplits', batch_size_eval, k):
 
     if data.has_val:
         print("save best parameters")
+        val_input_ids, val_attention_mask, val_labels = data.get('val')
         valid_metrics_fn_inner = setup_metrics(
             s_model, batch_size_eval,
-            data.val_input_ids, data.val_attention_mask, data.val_labels,
+            val_input_ids, val_attention_mask, val_labels,
             n_samples=10 if k > 0 else 1, key_prefix='val_')
 
         def valid_metrics_fn(rng, params):
@@ -1526,124 +1576,54 @@ def _run_eval_phase(*, rng_key, env, params, config: 'Config', data,
     return params
 
 
-def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, logger_prefix, *, scan_fn=None):
+def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, logger_prefix):
     """Execute one training phase (expert or minibatch) and log metrics.
 
-    If *scan_fn* is provided it is reused (avoids JAX retrace across
-    pretraining iterations); otherwise a new ``@jit`` scan wrapper is created.
-
     Returns:
-        ``(rng_key, params, last_trainable_params, scan_fn)``
+        ``(rng_key, params, last_trainable_params)``
     """
     hp = config.train_hyper
     s_model = env.s_model
-    optimizer = env.optimizer
 
     only_train = s_model.only_trainable_params(params['params'])
-    opt_state = optimizer.init(only_train)
+    opt_state = env.optimizer.init(only_train)
     n_trainable = sum(p.size for p in jax.tree.flatten(only_train)[0])
     print(f"Number of trainable parameters: {n_trainable:_}")
-    t_sample_fn = env.t_sample_fn
-    rho_scheduler = env.rho_scheduler
-    valid_metrics_fn = env.valid_metrics_fn
-    empty_metric = env.empty_metric
-    get_best_params = env.get_best_params
-
-    k = s_model.k
-    lr_schedule = config.optimizer_conf.lr_schedule
-    lora_params = config.model_params.lora_params
-    lora_rho = lora_params.lora_rho if lora_params else 0.0
-    lora_rho_s = lora_params.lora_rho_s if lora_params else 0.0
 
     if hp.num_steps <= 0:
-        return rng_key, params, None, scan_fn
+        return rng_key, params, None
 
     # Initialize best-parameter tracking
     best_val_ll = -np.inf
     best_params = s_model.only_trainable_params(params['params']) if data.has_val else None
 
-    train_input_ids = data.train_input_ids
-    train_attention_mask = data.train_attention_mask
-    train_labels = data.train_labels
-
     # Initial CP center for curve metrics
-    cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+    cp_w = masked_pytree_to_matrix(params['params'], s_model.curve_mask, s_model.k)
     initial_cp_center = cp_w.mean(axis=0)
 
     if hp.ds_sampling == 'expert':
         print(f"Start sorted expert training for {hp.num_steps}")
-        sort_mode = hp.dataset_sampling['expert'].get('sort_mode', False)
-        if sort_mode == 'Random':
-            order = random.permutation(rng_key, train_input_ids.shape[0])
-            train_input_ids = train_input_ids[order]
-            train_attention_mask = train_attention_mask[order]
-            train_labels = train_labels[order]
-        elif sort_mode:
-            cosine_sim = _compute_expert_embeddings(s_model.model, data, config)
-            assert cosine_sim is not None, "cosine_sim required for non-Random expert sort"
-            distance = 1 - cosine_sim
-            if sort_mode == 'Hierarchical':
-                condensed = squareform(distance, checks=False)
-                Z = hierarchy.linkage(condensed, method='average')
-                Z_opt = hierarchy.optimal_leaf_ordering(Z, condensed)
-                order = hierarchy.dendrogram(Z_opt.astype(np.float64), no_plot=True)['leaves']
-                order = jnp.array(order)
-            elif sort_mode == 'Spectral':
-                distance = distance.at[jnp.diag_indices(distance.shape[0])].set(0.0)
-                D = jnp.diag(distance.sum(axis=1))
-                L = D - distance
-                vals, vecs = jnp.linalg.eigh(L)
-                fiedler = vecs[:, -2]
-                order = jnp.argsort(fiedler)
-            elif sort_mode == 'First_data':
-                order = jnp.argsort(distance[0])
-            else:
-                raise ValueError(f"Unknown sort_mode {sort_mode} for expert sampling.")
-            train_input_ids = train_input_ids[order]
-            train_attention_mask = train_attention_mask[order]
-            train_labels = train_labels[order]
-            print(f"Data sorted for expert sampling using {sort_mode} method")
-
         window_size = hp.dataset_sampling['expert']['window_size']
         window_size = max(hp.batch_size, window_size)
-        train_expert_step = _make_expert_step_fn(
-            s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
-            t_sample_fn=t_sample_fn, eval_every_n_batch=hp.eval_every_n_batch,
-            valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-            get_best_params=get_best_params, num_steps=hp.num_steps,
-            batch_size=hp.batch_size, window_size=window_size)
-
-        carry = (rng_key, params, opt_state, best_val_ll, best_params,
-                 (train_input_ids, train_attention_mask, train_labels))
-        if scan_fn is None:
-            @jit
-            def scan_fn(carry, xs):
-                return jax.lax.scan(train_expert_step, carry, xs)
-        carry, metrics = scan_fn(carry, jnp.arange(hp.num_steps))
+        train_step = _make_expert_step_fn(env, config, window_size=window_size)
+        carry = (rng_key, params, opt_state, best_val_ll, best_params, data.get('train'))
 
     elif hp.ds_sampling == 'minibatch':
         print(f"Start minibatch training for {hp.num_epochs} epochs")
-        train_epoch_fn = _make_train_epoch_fn(
-            s_model=s_model, optimizer=optimizer, lr_schedule=lr_schedule,
-            t_sample_fn=t_sample_fn, lora_rho=lora_rho, lora_rho_s=lora_rho_s,
-            rho_scheduler=rho_scheduler, eval_every_n_batch=hp.eval_every_n_batch,
-            valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
-            get_best_params=get_best_params,
-            initial_cp_center=initial_cp_center, k=k,
+        train_input_ids, train_attention_mask, train_labels = data.get('train')
+        train_step = _make_train_epoch_fn(
+            env, config,
             train_input_ids=train_input_ids,
             train_attention_mask=train_attention_mask,
             train_labels=train_labels,
-            batch_size=hp.batch_size, smoke_test=hp.smoke_test,
-            num_epochs=hp.num_epochs)
+            initial_cp_center=initial_cp_center)
 
         carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
-        if scan_fn is None:
-            @jit
-            def scan_fn(carry, xs):
-                return jax.lax.scan(train_epoch_fn, carry, xs)
-        carry, metrics = scan_fn(carry, jnp.arange(hp.num_epochs))
     else:
         raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
+
+    # run training loop and collect metrics
+    carry, metrics = jax.lax.scan(train_step, carry, jnp.arange(hp.num_steps))
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
@@ -1674,12 +1654,12 @@ def _run_training_phase(rng_key, env, params, data, config: 'Config', logger, lo
             lambda x, y, m: x if m else y,
             best_curve_params, params['params'], s_model.train_mask)
 
-    if k > 0:
-        cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
+    if s_model.k > 0:
+        cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, s_model.k)
         length = _bezier_length(cp)
         logger.summary.update({'Curve length': length})
 
-    return rng_key, params, last_trainable_params, scan_fn
+    return rng_key, params, last_trainable_params
 
 
 # ---------------------------------------------------------------------------
@@ -1776,8 +1756,9 @@ def _compute_expert_embeddings(model:QwenTextClassificationWrapper, data, config
     if not sort_mode or sort_mode == 'Random':
         return None
     print("compute embeddings for expert sort")
+    train_input_ids, train_attention_mask, _ = data.get('train')
     embedding = get_embedding(
-        data.train_input_ids, data.train_attention_mask,
+        train_input_ids, train_attention_mask,
         model, params, hp.batch_size)
     print(f"Computed embeddings for expert sort with shape {embedding.shape}")
     device = embedding.device
@@ -1854,7 +1835,6 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     cp_fix = config.model_params.cp_fix  # save original before context
 
     train_params = []
-    scan_fn = None
     print("Pretraining fixed control points")
 
     with config.as_pretrain() as pt_config:
@@ -1867,9 +1847,9 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
                 params = _init_subspace_params(
                     pt_config, env.s_model, init_key)
 
-                rng_key, params, _, scan_fn = _run_training_phase(
+                rng_key, params, _ = _run_training_phase(
                     rng_key, env, params, data, pt_config, logger,
-                    f'cp_fixed_{i}_', scan_fn=scan_fn)
+                    f'cp_fixed_{i}_')
 
                 _run_eval_phase(
                     rng_key=rng_key, env=env, params=params,
@@ -1954,7 +1934,7 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
 
     # Train (unless all CPs are fixed → eval-only)
     if not all_fixed:
-        rng_key, params, last_trainable_params, _ = _run_training_phase(
+        rng_key, params, last_trainable_params = _run_training_phase(
             rng_key, env, params, data, config, logger, '')
     else:
         last_trainable_params = None
@@ -2009,6 +1989,16 @@ def train(logger, config_dict):
 
     config_dict['net_kwargs']['target_token_ids'] = unique_target_ids
     config = Config.from_dict(config_dict, data)
+
+    # sort data for expert sampling, if needed
+    if config.train_hyper.ds_sampling == 'expert':
+        base_model = QwenTextClassificationWrapper(**config.net_kwargs)
+        train_input_ids, train_attention_mask, train_labels = \
+            _sort_data_for_expert(rng_key, data, config, base_model)
+        data = replace(data,
+                       train_input_ids=train_input_ids,
+                       train_attention_mask=train_attention_mask,
+                       train_labels=train_labels)
 
     pretrained_params = [False] * len(config.model_params.cp_fix)
     if any(config.model_params.cp_fix):

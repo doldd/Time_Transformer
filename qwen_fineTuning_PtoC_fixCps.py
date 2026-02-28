@@ -23,13 +23,14 @@ from src.utils import calibration_error as ece_fn, post_pred_performance
 from src.qwen_jax import QwenTextClassificationWrapper
 from src.subspace_curve import (
     SubspaceBaseModel, masked_pytree_to_matrix, bezier_curve, filter_mask, bezier_coeff_fn, get_subspace_model,
-    RepulsiveMixin, EntropyMixin, EntropyMixin2, JensenShannonMixin, LoraMixin,
+    RepulsiveMixin, EntropyMixin, EntropyMixin2, JensenShannonMixin, LoRAMixin,
 )
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
 from dataclasses import dataclass, field, replace
 import time
 from contextlib import contextmanager
+from typing import Any
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -127,6 +128,7 @@ class TrainHyperparams:
             "Only one of num_epochs or num_steps should be > 0"
         has_train_data = (num_epochs_cfg > 0 or num_steps_cfg > 0)
         if has_train_data:
+            assert data.train_input_ids is not None
             n_train = len(data.train_input_ids)
             num_epochs = num_epochs_cfg
             num_steps = num_steps_cfg
@@ -331,7 +333,7 @@ class OptimizerConf:
     """
     name: str
     kwargs: dict                   # contains compiled lr_schedule under 'learning_rate'
-    lr_schedule: object            # compiled optax schedule (reference into kwargs)
+    lr_schedule: Any               # compiled optax schedule (reference into kwargs)
     freeze_other_params: bool = False
     grad_clip_norm: float | None = None
 
@@ -478,11 +480,11 @@ class TrainingEnv:
     """Reusable training environment — static attributes only (no params/opt_state)."""
     s_model: SubspaceBaseModel
     optimizer: optax.GradientTransformation
-    t_sample_fn: object
-    rho_scheduler: object
-    valid_metrics_fn: object
+    t_sample_fn: Any
+    rho_scheduler: Any
+    valid_metrics_fn: Any
     empty_metric: tuple
-    get_best_params: object
+    get_best_params: Any
 
 
 # jax.config.update("jax_log_compiles", True)
@@ -586,7 +588,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     return acc_fn
 
 
-def mutual_information(logits, weights:np.ndarray|bool=False):
+def mutual_information(logits, weights: jnp.ndarray | np.ndarray | None = None):
     """Compute mutual information from logits over samples
 
     Args:
@@ -594,7 +596,7 @@ def mutual_information(logits, weights:np.ndarray|bool=False):
     Returns:
         mi: float mutual information averaged over each data point
     """
-    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = weights is not None
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
     if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
@@ -608,7 +610,7 @@ def mutual_information(logits, weights:np.ndarray|bool=False):
     mi = entropy_pred - expected_nentropy  # (n_data,)
     return jnp.mean(mi)
 
-def mean_entropy(logits, weights:np.ndarray|bool=False):
+def mean_entropy(logits, weights: jnp.ndarray | np.ndarray | None = None):
     """Compute curve entropy from logits over samples
 
     Args:
@@ -616,7 +618,7 @@ def mean_entropy(logits, weights:np.ndarray|bool=False):
     Returns:
         entropy: float predictive entropy averaged over each data point
     """
-    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = weights is not None
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
     if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
@@ -766,7 +768,7 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     # Disable LoRA noise during evaluation
     lora_rho, lora_rho_s = config.model_params.lora_rho_values
     if lora_rho > 0.0 or lora_rho_s > 0.0:
-        params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+        params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)  # type: ignore[attr-defined]
 
     s_model = env.s_model
     t_sample_fn = env.t_sample_fn
@@ -972,7 +974,7 @@ def _element_wise_mask(element_freeze_mask):
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_params=False):
+def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_params: list | bool = False):
     """Initialize parameters on an existing subspace model.
 
     Calls ``init_params_from_point``, updates the train mask for LoRA,
@@ -1002,6 +1004,7 @@ def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_para
 
     # Map pretrained control points which are fixed into params vector
     if fixed_cps_train_params != False:
+        assert isinstance(fixed_cps_train_params, list)
         k = s_model.k
         assert (len(fixed_cps_train_params) == (k + 1)), \
             "fixed_cps_train_params length must match k or be False"
@@ -1135,7 +1138,7 @@ def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
 
     def _inf_mean(x):
         mask = jnp.isfinite(x)
-        return jnp.where(mask, x, 0).sum() / mask.sum()
+        return jnp.where(mask, x, 0).sum() / mask.sum()  # type: ignore[union-attr]
 
     @scan_tqdm(num_epochs)
     def train_epoch(carry, epoch):
@@ -1270,6 +1273,7 @@ def _sort_data_for_expert(rng_key, data: 'DataSplits', config: 'Config', model):
         ``(train_input_ids, train_attention_mask, train_labels)``
     """
     train_input_ids, train_attention_mask, train_labels = data.get('train')
+    assert train_input_ids is not None and train_attention_mask is not None and train_labels is not None
     sort_mode = config.train_hyper.dataset_sampling['expert'].get('sort_mode', False)
 
     if sort_mode == 'Random':
@@ -1330,8 +1334,7 @@ def _setup_t_sample_fn(s_model, curve_sampling_mode):
                                    is_leaf=lambda x: x is None)
             return t_tree
     else:
-        def t_sample_fn(key):
-            return random.uniform(key, (1,), minval=0., maxval=t_max)
+        t_sample_fn = lambda key: random.uniform(key, (1,), minval=0., maxval=t_max)
     return t_sample_fn
 
 
@@ -1354,16 +1357,15 @@ def _setup_validation(s_model, data: 'DataSplits', batch_size_eval, k):
             n_samples=10 if k > 0 else 1, key_prefix='val_')
 
         def valid_metrics_fn(rng, params):
-            if isinstance(s_model, LoraMixin):
-                params = s_model.set_lora_rho(rho_w=0.0, rho_s=0.0, params=params)
+            if isinstance(s_model, LoRAMixin):
+                params = s_model.set_lora_rho(rho_w=0.0, rho_s=0.0, params=params)  # type: ignore[attr-defined]
             return valid_metrics_fn_inner(rng, params)
 
         def get_best_params(params):
             return s_model.only_trainable_params(params['params'])
     else:
         valid_metrics_fn = lambda rng, params: empty_metric
-        def get_best_params(params):
-            return None
+        get_best_params = lambda params: None
 
     return valid_metrics_fn, empty_metric, get_best_params
 
@@ -1577,6 +1579,7 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
         train_attention_mask = train_attention_mask[:n_smoke]
         train_labels = train_labels[:n_smoke]
         if val_input_ids is not None:
+            assert val_attention_mask is not None and val_labels is not None
             val_input_ids = val_input_ids[:batch_size]
             val_attention_mask = val_attention_mask[:batch_size]
             val_labels = val_labels[:batch_size]
@@ -1589,7 +1592,7 @@ def _prepare_datasets(rng_key, dataset_path, val_percentage, batch_size,
     if has_val:
         print("Validation data are used")
     print(f"Training data: {len(train_input_ids)} samples, "
-          f"Validation data: {len(val_input_ids) if has_val else 0} samples")
+          f"Validation data: {len(val_input_ids) if val_input_ids is not None else 0} samples")
 
     data = DataSplits(
         train_input_ids=train_input_ids,
@@ -1745,7 +1748,7 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
 
 def main():
     logger = wandb.init()
-    config_dict = dict(wandb.config)
+    config_dict = dict(wandb.config)  # type: ignore[arg-type]
     train(logger, config_dict)
 
 
@@ -1800,7 +1803,7 @@ def train(logger, config_dict):
 
 if __name__ == '__main__':
         # Add requirement for wandb core
-    wandb.require("core")
+    wandb.require("core")  # type: ignore[attr-defined]
     os.makedirs('tmp_files', exist_ok=True)
     
     parser = argparse.ArgumentParser(description="Train a single model or a curve model.")
@@ -1865,7 +1868,7 @@ if __name__ == '__main__':
                 'natural_parameterization': False,
                 'weight_decay': 0.,
                 'curve_parameterization': 'bezier',
-                'curve_segment': 3,           # int → segmented degree; False → full curve
+                'curve_segment': False,           # int → segmented degree; False → full curve
                 'indepent_connected': False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,

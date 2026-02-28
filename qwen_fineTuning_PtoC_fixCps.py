@@ -755,222 +755,38 @@ def _plot_curve_along_t(t_space, loss, acc, ece, title='Curve Predictive',
 
 
 # ---------------------------------------------------------------------------
-# Evaluation pipeline – compute logits per dataset, then apply metrics
+# Evaluation pipeline
 # ---------------------------------------------------------------------------
 
-# --- Individual metric functions ---------------------------------------------------
-# Each receives keyword arguments from the orchestrator and may read/write *ctx*.
-# Defined here as plain functions; grouped into preset lists at the end of this
-# section (PRETRAIN_EVAL_FNS, CURVE_EVAL_FNS).
+def _compute_posterior_weights(log_like, temperature):
+    """Softmax posterior weights at each temperature.
 
-def _eval_summary(*, base_metrics, logger, logger_prefix='', **_kw):
-    """Log the mean of every base metric to ``logger.summary``."""
-    logger.summary.update({
-        f'{logger_prefix}{mk}_mean': v.mean()
-        for mk, v in base_metrics.items()
-    })
+    Args:
+        log_like: Per-sample log-likelihood, shape ``(n_samples,)``.
+        temperature: Sequence of temperature scalars.
 
-
-def _eval_post_pred(*, logits, labels, logger, key_prefix, ctx, weight_key=None, **_kw):
-    """BMA post-predictive performance (uniform or weighted via *weight_key*)."""
-    weights = ctx.get(weight_key, False) if weight_key else False
-    pp = post_pred_performance(logits, labels, weights=weights)
-    logger.summary.update({f'{key_prefix}{mk}': v for mk, v in pp.items()})
-
-
-def _eval_plot_curve(*, base_metrics, key_prefix, t_space, logger,
-                     plot_title=None, **_kw):
-    """Plot loss / accuracy / ECE along the curve parameter *t*."""
-    if t_space is None:
-        logging.warning("plot_curve requires linspace sampling — skipping.")
-        return
-    fig = _plot_curve_along_t(
-        t_space,
-        base_metrics[key_prefix + 'loss'],
-        base_metrics[key_prefix + 'acc'],
-        base_metrics[key_prefix + 'ece'],
-        title=plot_title or f'{key_prefix}set')
-    logger.log({f'Curve Predictive {plot_title or key_prefix}': wandb.Image(fig)})
-
-
-def _eval_entropy_along_curve(*, logits, logger, key_prefix, **_kw):
-    """Compute std / mean of per-sample entropy along the curve."""
-    entrop = entropy(logits.astype(jnp.float32))
-    logger.summary.update({
-        f'{key_prefix}std_entropy_along_curve': entrop.mean(-1).std(),
-        f'{key_prefix}mean_entropy_along_curve': entrop.mean(),
-    })
-
-
-def _eval_mutual_info(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
-    """Mutual information across curve samples (optionally weighted)."""
-    weights = ctx.get(weight_key, False) if weight_key else False
-    mi = mutual_information(logits.astype(jnp.float32), weights=weights)
-    logger.summary.update({f'{key_prefix}mutual_information': mi})
-
-
-def _eval_mean_entropy(*, logits, logger, key_prefix, ctx, weight_key=None, **_kw):
-    """Predictive entropy of the BMA mixture (optionally weighted)."""
-    weights = ctx.get(weight_key, False) if weight_key else False
-    me = mean_entropy(logits.astype(jnp.float32), weights=weights)
-    logger.summary.update({f'{key_prefix}mean_entropy': me})
-
-
-def _eval_compute_posterior_weights(*, base_metrics, key_prefix, logger,
-                                    temperature, t_space, ctx, **_kw):
-    """Derive posterior weights from the per-sample loss and cache in *ctx*.
-
-    Also saves a wandb ``bma_weights`` artifact.
+    Returns:
+        Array of shape ``(len(temperature), n_samples)``.
     """
-    print("Temperature:", temperature)
-
-    def _compute_weights(log_like, t):
+    def _single(log_like, t):
         log_post = log_like / t
         log_post -= jax.scipy.special.logsumexp(log_post)
         return jnp.exp(log_post)
-
-    log_like = -base_metrics[key_prefix + 'loss']
-    weights = jax.vmap(_compute_weights, in_axes=(None, 0))(
-        log_like, jnp.array(temperature))
-    ctx['posterior_weights'] = weights
-
-    # Save artifact
-    art_w = wandb.Artifact(name="bma_weights", type="npz")
-    jnp.savez(f'tmp_files/{logger.id}_weights.npz',
-              weights=weights, t_space=t_space,
-              log_like=log_like, temperature=temperature)
-    art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
-    logger.log_artifact(art_w)
-    print("Saved posterior weights artifact")
-
-
-def _eval_load_posterior_weights(*, logger, temperature, ctx, **_kw):
-    """Load posterior weights from a wandb artifact stored in ``ctx['_artifact_weights']``."""
-    artifact = ctx.get('_artifact_weights')
-    if artifact is None:
-        raise RuntimeError("'load_posterior_weights' requires artifact_weights in run_evaluation")
-
-    def _compute_weights(log_like, t):
-        log_post = log_like / t
-        log_post -= jax.scipy.special.logsumexp(log_post)
-        return jnp.exp(log_post)
-
-    for f in artifact.files():
-        if 'weights' in f.name:
-            wf = np.load(artifact.get_entry(f.name).download(), allow_pickle=True)
-            weights = jax.vmap(_compute_weights, in_axes=(None, 0))(
-                wf['log_like'], jnp.array(temperature))
-            ctx['posterior_weights'] = weights
-            print("Loaded posterior weights from artifact")
-            return
-    raise RuntimeError("No weights file found in artifact")
-
-
-def _eval_post_pred_per_temp(*, logits, labels, logger, key_prefix,
-                              temperature, ctx, **_kw):
-    """BMA post-predictive for each temperature using posterior weights."""
-    weights_all = ctx.get('posterior_weights')
-    if weights_all is None:
-        raise RuntimeError("'post_pred_per_temp' requires 'compute_posterior_weights' first")
-    for weight, temp in zip(weights_all, temperature):
-        pp = post_pred_performance(logits, labels, weight)
-        logger.summary.update({
-            f'{key_prefix}ppd_t{temp}_{mk}': v for mk, v in pp.items()
-        })
-
-
-def _eval_mutual_info_per_temp(*, logits, logger, key_prefix,
-                                temperature, ctx, **_kw):
-    """Mutual information for each temperature using posterior weights."""
-    weights_all = ctx.get('posterior_weights')
-    if weights_all is None:
-        raise RuntimeError("'mutual_info_per_temp' requires 'compute_posterior_weights' first")
-    for weight, temp in zip(weights_all, temperature):
-        mi = mutual_information(logits.astype(jnp.float32), weights=weight)
-        logger.summary.update({f'{key_prefix}mutual_information_ppd_t{temp}': mi})
-
-
-def _eval_mean_entropy_per_temp(*, logits, logger, key_prefix,
-                                 temperature, ctx, **_kw):
-    """Mean predictive entropy for each temperature using posterior weights."""
-    weights_all = ctx.get('posterior_weights')
-    if weights_all is None:
-        raise RuntimeError("'mean_entropy_per_temp' requires 'compute_posterior_weights' first")
-    for weight, temp in zip(weights_all, temperature):
-        me = mean_entropy(logits.astype(jnp.float32), weights=weight)
-        logger.summary.update({f'{key_prefix}mean_entropy_ppd_t{temp}': me})
-
-
-def _eval_best_temperature(*, logits, labels, logger, key_prefix,
-                            temperature, ctx, **_kw):
-    """Find the best temperature on this dataset and store the best weight in *ctx*.
-
-    Iterates over temperatures, computing BMA post-predictive performance
-    for each, and caches the weight with the highest log-likelihood as
-    ``ctx['best_weight']`` and ``ctx['best_temperature']``.
-    """
-    weights_all = ctx.get('posterior_weights')
-    if weights_all is None:
-        raise RuntimeError("'best_temperature' requires 'compute_posterior_weights' first")
-    best = {'ll': -jnp.inf, 'temp': None, 'weight': None}
-    for weight, temp in zip(weights_all, temperature):
-        pp = post_pred_performance(logits, labels, weight)
-        if pp['ll'] > best['ll']:
-            best = {'ll': pp['ll'], 'temp': temp, 'weight': weight}
-        logger.summary.update({
-            f'{key_prefix}ppd_t{temp}_{mk}': v for mk, v in pp.items()
-        })
-    ctx['best_weight'] = best['weight']
-    ctx['best_temperature'] = best['temp']
-    logger.summary.update({
-        f'{key_prefix}best_log_like_temp': best['temp'],
-        f'{key_prefix}best_log_like': best['ll'],
-    })
-
-
-# ---------------------------------------------------------------------------
-# Preset eval-function lists – pass these into _run_eval_phase / run_evaluation
-# to declare which metrics to compute without touching run_evaluation internals.
-# ---------------------------------------------------------------------------
-
-PRETRAIN_EVAL_FNS = [
-    _eval_post_pred,
-    # _eval_summary,
-]
-
-CURVE_EVAL_FNS = [
-    _eval_post_pred,
-    _eval_mutual_info,
-    _eval_mean_entropy,
-    _eval_entropy_along_curve,
-]
+    return jax.vmap(_single, in_axes=(None, 0))(log_like, jnp.array(temperature))
 
 
 def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
                    data: 'DataSplits', config: 'Config',
                    logger, logger_prefix='', artifact_weights=None):
-    """Run the modular evaluation pipeline.
+    """Evaluate model and log metrics to wandb.
 
-    **Two-phase design**: for each entry in the auto-built *eval_specs* the
-    pipeline first computes logits on the specified dataset, then runs the
-    requested metrics on those logits.  A shared *ctx* dict enables
-    cross-dataset communication (e.g. posterior weights computed on train
-    used by metrics on test).
-
-    Args:
-        rng_key: JAX random key.
-        env: ``TrainingEnv`` providing ``s_model`` and ``t_sample_fn``.
-        params: Model parameters pytree.
-        data: ``DataSplits`` instance; splits are looked up by name via
-            ``data.get(name)``.
-        config: ``Config`` providing model_params (k, curve_sampling_mode)
-            and train_hyper (batch_size_eval, temperature, smoke_test).
-        logger: wandb run object.
-        logger_prefix: Global prefix prepended to logged keys.
-        artifact_weights: Optional wandb artifact with pre-computed weights.
-
-    Returns:
-        ctx: Context dict accumulated during evaluation.
+    k == 0:  Compute test logits, report test ll / acc / ece.
+    k > 0:
+        combined mode — compute BMA weights on train, plot train curve,
+            optimise temperature on val (if available).
+        Compute test logits (once).
+        Plot test curve (unless per_leave).
+        Report test metrics (weighted in combined mode, uniform otherwise).
     """
     # Disable LoRA noise during evaluation
     lora_rho, lora_rho_s = config.model_params.lora_rho_values
@@ -983,71 +799,178 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     batch_size_eval = config.train_hyper.batch_size_eval
     temperature = config.train_hyper.temperature
     smoke_test = config.train_hyper.smoke_test
-
-    eval_specs = _build_eval_specs(
-        k, config.model_params.curve_sampling_mode,
-        has_train_data=data.has_train, has_val=data.has_val,
-        artifact_weights_use=artifact_weights or False)
-
+    curve_sampling_mode = config.model_params.curve_sampling_mode
     t_max = getattr(s_model, 't_max', 1.0)
-    ctx = {}
-    if artifact_weights is not None:
-        ctx['_artifact_weights'] = artifact_weights
+    n_samples = 3 if (smoke_test or k == 0) else 20
 
-    for spec in eval_specs:
-        ds_name = spec['name']
-        split = data.get(ds_name)
-        if split is None:
-            logging.warning(
-                "Eval spec references dataset '%s' not available — skipping.",
-                ds_name)
-            continue
-
-        input_ids, attention_mask, labels_ = split
-        sampling = spec.get('sampling', 'linspace')
-        n_samples = spec.get('n_samples', 20)
-        if smoke_test or k == 0:
-            n_samples = min(n_samples, 3)
-        key_prefix = spec.get('key_prefix', f'{ds_name}_')
-
-        t_space = (jnp.linspace(0, t_max, n_samples)
-                   if sampling == 'linspace' else None)
-
-        # Phase 1 – compute logits
-        print(f"Evaluating '{ds_name}' ({sampling}, {n_samples} samples)")
-        use_linspace = (sampling == 'linspace')
+    def _logits(input_ids, attention_mask, labels,
+                n_samples, use_linspace=True, key_prefix=''):
+        """Compute per-sample metrics and logits for one dataset split."""
         metrics_fn = setup_metrics(
-            s_model, max(batch_size_eval, 1), input_ids, attention_mask, labels_,
+            s_model, max(batch_size_eval, 1), input_ids, attention_mask, labels,
             n_samples=n_samples, use_linspace=use_linspace, average=False,
             key_prefix=key_prefix,
             t_sample_fn=None if use_linspace else t_sample_fn)
-        base_metrics, logits = metrics_fn(rng_key, params)
+        return metrics_fn(rng_key, params)
 
-        # Optionally cache logits in ctx
-        if spec.get('store_logits'):
-            ctx[f'{ds_name}_logits'] = logits
-            ctx[f'{ds_name}_base_metrics'] = base_metrics
+    # ---- k == 0: simple single-point evaluation ----
+    if k == 0:
+        test_ids, test_mask, test_labels = data.get('test')
+        print("Evaluating test set (k=0)")
+        _, logits = _logits(test_ids, test_mask, test_labels,
+                            n_samples=n_samples, key_prefix='final_')
+        pp = post_pred_performance(logits, test_labels)
+        logger.summary.update({
+            f'{logger_prefix}final_{mk}': v for mk, v in pp.items()})
+        return {}
 
-        # Phase 2 – run requested metrics
-        metric_kwargs = dict(
-            logits=logits, labels=labels_, base_metrics=base_metrics,
-            key_prefix=key_prefix, t_space=t_space, logger=logger,
-            logger_prefix=logger_prefix, temperature=temperature,
-            ctx=ctx, k=k)
+    # ---- k > 0: curve evaluation ----
+    t_space = jnp.linspace(0, t_max, n_samples)
+    best_weight = False          # stays False → uniform BMA
+    weights_all = None
 
-        for metric_spec in spec.get('metrics', []):
-            if callable(metric_spec):
-                metric_spec(**metric_kwargs)
-            elif isinstance(metric_spec, dict):
-                extra = dict(metric_spec)
-                fn = extra.pop('fn')
-                fn(**metric_kwargs, **extra)
+    if curve_sampling_mode == 'combined':
+        # -- Compute BMA weights on train set --
+        if data.has_train:
+            print("Computing posterior weights on train set")
+            train_ids, train_mask, train_labels = data.get('train')
+            train_metrics, train_logits = _logits(
+                train_ids, train_mask, train_labels,
+                n_samples=n_samples, key_prefix='f_train_')
+
+            train_pp = post_pred_performance(train_logits, train_labels)
+            logger.summary.update({
+                f'{logger_prefix}f_train_{mk}': v
+                for mk, v in train_pp.items()})
+
+            # Plot train curve
+            fig = _plot_curve_along_t(
+                t_space, train_metrics['f_train_loss'],
+                train_metrics['f_train_acc'], train_metrics['f_train_ece'],
+                title='Final trainset')
+            logger.log({'Curve Predictive Train': wandb.Image(fig)})
+            plt.close(fig)
+
+            # Posterior weights
+            log_like = -train_metrics['f_train_loss']
+            weights_all = _compute_posterior_weights(log_like, temperature)
+
+            # Save weights artifact
+            art_w = wandb.Artifact(name="bma_weights", type="npz")
+            jnp.savez(f'tmp_files/{logger.id}_weights.npz',
+                      weights=weights_all, t_space=t_space,
+                      log_like=log_like, temperature=temperature)
+            art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
+            logger.log_artifact(art_w)
+            print("Saved posterior weights artifact")
+
+        elif artifact_weights is not None:
+            for f in artifact_weights.files():
+                if 'weights' in f.name:
+                    wf = np.load(
+                        artifact_weights.get_entry(f.name).download(),
+                        allow_pickle=True)
+                    weights_all = _compute_posterior_weights(
+                        wf['log_like'], temperature)
+                    print("Loaded posterior weights from artifact")
+                    break
             else:
-                raise ValueError(
-                    f"Invalid metric spec {metric_spec!r}: "
-                    "must be a callable or a dict with a 'fn' key.")
+                raise RuntimeError("No weights file found in artifact")
 
-    return ctx
+        # -- Optimise temperature on val set --
+        if weights_all is not None and data.has_val:
+            val_ids, val_mask, val_labels = data.get('val')
+            print("Optimising temperature on validation set")
+            _, val_logits = _logits(
+                val_ids, val_mask, val_labels,
+                n_samples=n_samples, key_prefix='final_valid_')
+
+            best_ll, best_temp = -jnp.inf, None
+            for weight, temp in zip(weights_all, temperature):
+                pp = post_pred_performance(val_logits, val_labels, weight)
+                logger.summary.update({
+                    f'{logger_prefix}final_valid_ppd_t{temp}_{mk}': v
+                    for mk, v in pp.items()})
+                if pp['ll'] > best_ll:
+                    best_ll, best_temp, best_weight = pp['ll'], temp, weight
+            logger.summary.update({
+                f'{logger_prefix}best_val_log_like_temp': best_temp,
+                f'{logger_prefix}best_val_log_like': best_ll,
+            })
+            print(f"Best temperature: {best_temp}")
+
+    # -- Compute test logits (once) --
+    use_linspace = (curve_sampling_mode != 'per_leave')
+    key_prefix = 'final_' if use_linspace else 'approx_'
+    print(f"Evaluating test set ({'linspace' if use_linspace else 't_sample'}, "
+          f"{n_samples} samples)")
+    test_ids, test_mask, test_labels = data.get('test')
+    test_metrics, test_logits = _logits(
+        test_ids, test_mask, test_labels,
+        n_samples=n_samples, use_linspace=use_linspace,
+        key_prefix=key_prefix)
+
+    # -- Plot test performance along curve (not per_leave) --
+    if use_linspace:
+        fig = _plot_curve_along_t(
+            t_space, test_metrics[key_prefix + 'loss'],
+            test_metrics[key_prefix + 'acc'],
+            test_metrics[key_prefix + 'ece'],
+            title='Final testset')
+        logger.log({'Curve Predictive': wandb.Image(fig)})
+        plt.close(fig)
+
+    # -- Report test performance --
+    # Always log uniform-BMA test metrics
+    pp = post_pred_performance(test_logits, test_labels)
+    logger.summary.update({
+        f'{logger_prefix}{key_prefix}{mk}': v for mk, v in pp.items()})
+
+    # Weighted metrics (combined mode with posterior weights)
+    if curve_sampling_mode == 'combined' and weights_all is not None:
+        if isinstance(best_weight, jnp.ndarray):
+            # Best temperature was found on val — use it
+            pp_w = post_pred_performance(test_logits, test_labels, best_weight)
+            logger.summary.update({
+                f'{logger_prefix}post_pred_test_ppd_{mk}': v
+                for mk, v in pp_w.items()})
+            mi = mutual_information(
+                test_logits.astype(jnp.float32), weights=best_weight)
+            me = mean_entropy(
+                test_logits.astype(jnp.float32), weights=best_weight)
+            logger.summary.update({
+                f'{logger_prefix}test_mutual_information_ppd': mi,
+                f'{logger_prefix}test_mean_entropy_ppd': me,
+            })
+        else:
+            # No val set — report per temperature
+            for weight, temp in zip(weights_all, temperature):
+                pp_w = post_pred_performance(
+                    test_logits, test_labels, weight)
+                logger.summary.update({
+                    f'{logger_prefix}post_pred_test_ppd_t{temp}_{mk}': v
+                    for mk, v in pp_w.items()})
+                mi = mutual_information(
+                    test_logits.astype(jnp.float32), weights=weight)
+                me = mean_entropy(
+                    test_logits.astype(jnp.float32), weights=weight)
+                logger.summary.update({
+                    f'{logger_prefix}test_mutual_information_ppd_t{temp}': mi,
+                    f'{logger_prefix}test_mean_entropy_ppd_t{temp}': me,
+                })
+
+    # Uncertainty metrics (always for k > 0)
+    mi = mutual_information(test_logits.astype(jnp.float32))
+    me = mean_entropy(test_logits.astype(jnp.float32))
+    entrop = entropy(test_logits.astype(jnp.float32))
+    logger.summary.update({
+        f'{logger_prefix}test_mutual_information': mi,
+        f'{logger_prefix}test_mean_entropy': me,
+        f'{logger_prefix}std_entropy_along_curve': entrop.mean(-1).std(),
+        f'{logger_prefix}mean_entropy_along_curve': entrop.mean(),
+    })
+
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1431,102 +1354,6 @@ def _setup_rho_scheduler(lora_params, num_steps):
         return rho_scheduler
     else:
         return lambda step, base: base
-
-
-def _build_eval_specs(k, curve_sampling_mode, has_train_data, has_val,
-                       artifact_weights_use=False):
-    """Build evaluation specification list based on curve degree.
-
-    Args:
-        k: Bézier curve degree (0 = single point / pretraining).
-        curve_sampling_mode: ``'combined'``, ``'per_leave'``, ``'combined_noBMA'``, etc.
-        has_train_data: Whether training data is available for eval.
-        has_val: Whether validation data is available.
-        artifact_weights_use: Pre-computed weights artifact, if any.
-
-    Returns:
-        Ordered list of eval specification dicts for ``run_evaluation``.
-    """
-    eval_specs = []
-
-    # 1) Always: test with linspace -> summary (+ plot_curve if k > 0)
-    _test_metrics = list(PRETRAIN_EVAL_FNS)
-    if k > 0:
-        _test_metrics.append({'fn': _eval_plot_curve, 'plot_title': 'Final testset'})
-    eval_specs.append({
-        'name': 'test', 'sampling': 'linspace', 'key_prefix': 'final_',
-        'metrics': _test_metrics,
-    })
-
-    # 2) Curve-specific evaluation (k > 0)
-    if k > 0:
-        if curve_sampling_mode == 'combined':
-            # Posterior weights from train data
-            if has_train_data:
-                print("Compute posterior weights on train set")
-                eval_specs.append({
-                    'name': 'train', 'sampling': 'linspace',
-                    'key_prefix': 'f_train_',
-                    'metrics': [
-                        _eval_post_pred, _eval_mutual_info, _eval_entropy_along_curve,
-                        {'fn': _eval_plot_curve, 'plot_title': 'Final trainset'},
-                        _eval_compute_posterior_weights,
-                    ],
-                })
-            elif artifact_weights_use:
-                eval_specs.append({
-                    'name': 'test', 'sampling': 'linspace',
-                    'key_prefix': '_tmp_',
-                    'metrics': [_eval_load_posterior_weights],
-                })
-
-            if has_val:
-                # Find best temperature on validation set
-                eval_specs.append({
-                    'name': 'val', 'sampling': 'linspace',
-                    'key_prefix': 'final_valid_',
-                    'metrics': [_eval_best_temperature],
-                })
-                # Apply best weight from val to test
-                eval_specs.append({
-                    'name': 'test', 'sampling': 'linspace',
-                    'key_prefix': 'post_pred_test_ppd_',
-                    'metrics': [
-                        {'fn': _eval_post_pred, 'weight_key': 'best_weight'},
-                        {'fn': _eval_mutual_info, 'weight_key': 'best_weight'},
-                        {'fn': _eval_mean_entropy, 'weight_key': 'best_weight'},
-                    ],
-                })
-            else:
-                # Per-temperature analysis on test
-                eval_specs.append({
-                    'name': 'test', 'sampling': 'linspace',
-                    'key_prefix': 'post_pred_test_ppd_',
-                    'metrics': [
-                        _eval_post_pred_per_temp,
-                        _eval_mutual_info_per_temp,
-                        _eval_mean_entropy_per_temp,
-                    ],
-                })
-
-            # Entropy along curve on test (always for combined mode)
-            eval_specs.append({
-                'name': 'test', 'sampling': 'linspace',
-                'key_prefix': '',
-                'metrics': [_eval_entropy_along_curve],
-            })
-
-        else:
-            # Non-combined mode (per_leaf, combined_noBMA, etc.)
-            use_t_sample = 'combined' not in curve_sampling_mode
-            eval_specs.append({
-                'name': 'test',
-                'sampling': 't_sample' if use_t_sample else 'linspace',
-                'key_prefix': 'approx_',
-                'metrics': list(CURVE_EVAL_FNS),
-            })
-
-    return eval_specs
 
 
 def run_training(rng_key, env, params, data, config: 'Config', logger, logger_prefix):

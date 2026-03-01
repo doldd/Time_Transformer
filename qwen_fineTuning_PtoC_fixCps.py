@@ -999,7 +999,7 @@ def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_para
         params (dict, updated in-place)
     """
     lora_params = config.model_params.lora_params
-    params = unfreeze(s_model.model.init(None, None)) # base parameters loaded from file
+    params = s_model.model.init(None, None) # base parameters loaded from file
 
     curve_mask, train_mask, lora_mask = config.build_masks(params['params'])
 
@@ -1664,15 +1664,11 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     print("Pretraining fixed control points")
 
     with config.as_pretrain() as pt_config:
-        env, _, rng_key = _setup_training_env(config=pt_config, data=data, rng_key=rng_key)
+        env, params, rng_key = _setup_training_env(config=pt_config, data=data, rng_key=rng_key)
 
         for i, fixed in enumerate(cp_fix):
             if fixed:
                 print(f"Training cp member {i}")
-                rng_key, init_key = random.split(rng_key)
-                params = _init_subspace_params(
-                    pt_config, env.s_model, init_key)
-
                 rng_key, params, _ = run_training(
                     rng_key, env, params, data, pt_config, logger,
                     f'cp_fixed_{i}_')
@@ -1684,6 +1680,12 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
 
                 train_params.append(
                     env.s_model.only_trainable_params(params['params']))
+
+                # Free params before re-allocating for the next CP so both
+                # copies never exist in memory simultaneously.
+                del params
+                rng_key, init_key = random.split(rng_key)
+                params = _init_subspace_params(pt_config, env.s_model, init_key)
             else:
                 train_params.append(False)
 

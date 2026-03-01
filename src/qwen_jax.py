@@ -557,7 +557,7 @@ def load_model_params(path):
     Load only the model parameters from disk.
     '''
     params = jnp.load(f"{path}/jax_params.npy", allow_pickle=True).item()
-    return freeze(params)
+    return params
 
 def load_params_and_config(path):
     '''

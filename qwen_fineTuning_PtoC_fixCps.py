@@ -3,6 +3,7 @@ Qwen2.5 Fine-tuning with LoRA Subspace for Text Classification
 Following the PtoC (Point-to-Curve) pattern from other models
 """
 
+from copy import deepcopy
 import os
 import logging
 import argparse
@@ -336,6 +337,7 @@ class OptimizerConf:
     lr_schedule: Any               # compiled optax schedule (reference into kwargs)
     freeze_other_params: bool = False
     grad_clip_norm: float | None = None
+    orig_dict: dict = field(default_factory=dict)  # for logging / debugging only
 
     @classmethod
     def from_config_dict(cls, oc: dict) -> 'OptimizerConf':
@@ -345,6 +347,7 @@ class OptimizerConf:
         it both as ``lr_schedule`` and inside ``kwargs`` so downstream helpers
         receive the already-compiled object.
         """
+        orig = deepcopy(oc)
         kwargs = dict(oc['kwargs'])
         lr_conf = kwargs['learning_rate']
         if isinstance(lr_conf, dict):
@@ -358,6 +361,7 @@ class OptimizerConf:
             lr_schedule=lr_schedule,
             freeze_other_params=oc.get('freeze_other_params', False),
             grad_clip_norm=oc.get('grad_clip_norm', None),
+            orig_dict=orig,
         )
 
 
@@ -391,6 +395,15 @@ class Config:
         """
         original_cp_fix = self.model_params.cp_fix
         original_curve_segment = self.model_params.curve_segment
+        orig_opt_conf = self.optimizer_conf
+        # set half learning rate for pretraining
+        opt_dict = deepcopy(self.optimizer_conf.orig_dict)
+        if isinstance(opt_dict['kwargs']['learning_rate'], dict):
+            opt_dict['kwargs']['learning_rate']['kwargs']['peak_value'] /= 2.0
+        else:
+            opt_dict['kwargs']['learning_rate'] /= 2.0
+        opt_conf = OptimizerConf.from_config_dict(opt_dict)
+        self.optimizer_conf = opt_conf
         self.model_params.cp_fix = [1]
         self.model_params.curve_segment = False
         try:
@@ -398,7 +411,7 @@ class Config:
         finally:
             self.model_params.cp_fix = original_cp_fix
             self.model_params.curve_segment = original_curve_segment
-
+            self.optimizer_conf = orig_opt_conf
     @classmethod
     def from_dict(cls, d: dict, data: 'DataSplits') -> 'Config':
         """Construct a ``Config`` from a raw dict (e.g. wandb config) and loaded data.
@@ -431,7 +444,7 @@ class Config:
                 "In curve segment mode, fixed control points must be consecutive "
                 "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
         # no check for all 0 [0,0,0,0] or single fixed point [1] since they are valid for other loraModes
-        if lora_params is not None and (model_params.k == 0 or np.sum(cp_fix) == 0):
+        if lora_params is not None and (model_params.k > 0) and (np.sum(cp_fix) > 0):
             assert lora_params.lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
                 "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
                 "subspace curves with fixed control points")
@@ -1705,9 +1718,7 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
         print("No fixed control points, training full curve with all control points free.")
         if config.model_params.curve_segment:
             assert config.model_params.indepent_connected is True, (
-                "In curve segment mode with no fixed control points, curve "
-                "optimization only makes sense if all segments are "
-                "independently connected.")
+                "Set indepentend connected to True in curve segment mode with no fixed control points")
 
     # Setup training environment — k is derived from config.model_params.k
     env = _setup_training_env(config=config, data=data)
@@ -1764,6 +1775,7 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
 
 
 def main():
+    jax.config.update("jax_explain_cache_misses", True)
     logger = wandb.init()
     config_dict = dict(wandb.config)  # type: ignore[arg-type]
     train(logger, config_dict)
@@ -1886,7 +1898,7 @@ if __name__ == '__main__':
                 'weight_decay': 0.,
                 'curve_parameterization': 'bezier',
                 'curve_segment': 3,           # int → segmented degree; False → full curve
-                'indepent_connected': True,  # True → independently connected segments
+                'indepent_connected': False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,
 
@@ -1925,7 +1937,7 @@ if __name__ == '__main__':
                         'name': "linear_onecycle_schedule",
                         'kwargs': {
                             'transition_steps': 5_000,
-                            'peak_value': 1e-4,
+                            'peak_value': 4e-4,
                             'pct_start': 0.12,
                             'pct_final': 1.,
                             'div_factor': 300.0,
@@ -1941,6 +1953,94 @@ if __name__ == '__main__':
                 # 'grad_clip_norm': 100.0,
             },
         }
+
+        config = {
+        # --- Run / experiment --------------------------------------------------
+        'rng_seed': 1,
+        'load_params_path': False,
+
+        # --- Data --------------------------------------------------------------
+        'data': {
+            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+            'val_percentage': 0.1,
+        },
+
+        # --- Base model (QwenTextClassificationWrapper) ------------------------
+        'net_kwargs': {
+            'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"
+        },
+
+        # --- Training hyperparameters → TrainHyperparams ----------------------
+        'train_hyper': {
+            'batch_size': 4,
+            'num_epochs': -1,
+            'num_steps': 5000,
+            'eval_every_n_batch': 20,
+            'temperature': [1.0],
+            'dataset_sampling': {'minibatch': {}},
+            'save_params': True,
+            'smoke_test': False,
+        },
+
+        # --- Subspace model + LoRA architecture → ModelParams -----------------
+        'model_params': {
+            'cp_fix': [0, 0, 0],  # Updated from JSON
+            'curve_sampling_mode': 'combined_noBMA',
+            'subspace_model': 'lora_category',
+            'jitter_multiplier': 0.0,
+            'natural_parameterization': False,
+            'weight_decay': 0.0,
+            'curve_parameterization': 'bezier',
+            'curve_segment': False,
+            'indepent_connected': False, # Matched to JSON behavior
+            'gravity': 5.0,
+            'energy_weakening': 4.0,
+
+            # curve topology
+            'filter_masks': [
+                {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+                {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
+                {'keys': ["lm_head", "kernel"], 'op': 'all'},
+            ],
+
+            # LoRA sub-config
+            'lora_params': {
+                'use_lora': True,
+                'r': 8,
+                'lora_dtype': 'float32',
+                'lora_alpha': 16.0,
+                'lora_mode': 'Asd(t)eB',  # Updated from JSON
+                'rho_scheduler_frequency': 100,
+                'lora_rho': 0.25,
+                'lora_rho_s': 0.5,
+                'filter_masks': [
+                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                    {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
+                ],
+            },
+        },
+
+        # --- Optimizer ---------------------------------------------------------
+        'optimizer_conf': {
+            'name': "adamw",
+            'kwargs': {
+                'learning_rate': {
+                    'name': "linear_onecycle_schedule",
+                    'kwargs': {
+                        'transition_steps': 5000,
+                        'peak_value': 0.0001, # Matched to 1e-4 from JSON
+                        'pct_start': 0.12,
+                        'pct_final': 1.0,
+                        'div_factor': 300.0,
+                        'final_div_factor': 300.0,
+                    },
+                },
+                'weight_decay': 0.0,
+            },
+            'freeze_other_params': True,
+        },
+    }
         logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)
         train(logger, config)
 

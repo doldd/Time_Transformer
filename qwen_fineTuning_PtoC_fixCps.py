@@ -395,23 +395,31 @@ class Config:
         """
         original_cp_fix = self.model_params.cp_fix
         original_curve_segment = self.model_params.curve_segment
-        orig_opt_conf = self.optimizer_conf
+        orig_opt_conf = deepcopy(self.optimizer_conf)
+        orig_num_epochs = self.train_hyper.num_epochs
+        orig_num_steps = self.train_hyper.num_steps
         # set half learning rate for pretraining
         opt_dict = deepcopy(self.optimizer_conf.orig_dict)
         if isinstance(opt_dict['kwargs']['learning_rate'], dict):
-            opt_dict['kwargs']['learning_rate']['kwargs']['peak_value'] /= 2.0
+            opt_dict['kwargs']['learning_rate']['kwargs']['peak_value'] /= float(self.model_params.curve_segment) if self.model_params.curve_segment else 2.
         else:
-            opt_dict['kwargs']['learning_rate'] /= 2.0
+            opt_dict['kwargs']['learning_rate'] /= float(self.model_params.curve_segment) if self.model_params.curve_segment else 2.
         opt_conf = OptimizerConf.from_config_dict(opt_dict)
         self.optimizer_conf = opt_conf
         self.model_params.cp_fix = [1]
         self.model_params.curve_segment = False
+        if orig_num_epochs > 0:
+            self.train_hyper.num_epochs = max(1, int(orig_num_epochs * 0.75))  # set small number of epochs for pretraining
+            num_steps_per_epoch = orig_num_steps // orig_num_epochs
+            self.train_hyper.num_steps = num_steps_per_epoch * self.train_hyper.num_epochs
         try:
             yield self
         finally:
             self.model_params.cp_fix = original_cp_fix
             self.model_params.curve_segment = original_curve_segment
             self.optimizer_conf = orig_opt_conf
+            self.train_hyper.num_epochs = orig_num_epochs
+            self.train_hyper.num_steps = orig_num_steps
     @classmethod
     def from_dict(cls, d: dict, data: 'DataSplits') -> 'Config':
         """Construct a ``Config`` from a raw dict (e.g. wandb config) and loaded data.

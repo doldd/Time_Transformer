@@ -31,7 +31,7 @@ parameters:
       num_epochs:
         value: -1
       num_steps:
-        value: 5000
+        value: 7000
       save_params:
         value: True
       dataset_sampling:
@@ -45,6 +45,7 @@ parameters:
       cp_fix:
         values:
           - [1, 0, 0, 1, 0, 0, 1,]
+          - [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
       curve_sampling_mode:
         values: ["combined_noBMA"]
       subspace_model:
@@ -92,10 +93,10 @@ parameters:
           lora_rho:
             values: [0.5]
           lora_rho_s:
-            values: [0.0]
+            values: [0.0, 0.25]
   optimizer_conf:
     values:
-      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 5000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: true}
+      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 7000, peak_value: 6e-4, pct_start: 0.12, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: true}
 
 command:
 - ${env}

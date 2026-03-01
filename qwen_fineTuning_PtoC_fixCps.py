@@ -1074,9 +1074,13 @@ def _init_optimizer(config:Config, curve_mask=None, curve_params=None):
     return optimizer
 
 def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
-                          train_input_ids, train_attention_mask, train_labels,
-                          initial_cp_center):
-    """Return a ``train_batch(carry, batch_idx)`` closure for ``jax.lax.scan``."""
+                          train_input_ids, train_attention_mask, train_labels):
+    """Return a ``train_batch(carry, batch_idx)`` closure for ``jax.lax.scan``.
+
+    ``initial_cp_center`` is passed via the carry tuple so it is not a closure
+    variable and the compiled function can be reused across ``run_training`` calls.
+    carry: ``(rng_key, params, opt_state, best_val_ll, best_params, update_idx, initial_cp_center)``
+    """
     s_model = env.s_model
     optimizer = env.optimizer
     lr_schedule = config.optimizer_conf.lr_schedule
@@ -1090,7 +1094,7 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
     lora_rho, lora_rho_s = config.model_params.lora_rho_values
 
     def train_batch(carry, batch_idx):
-        rng_key, params, opt_state, best_val_ll, best_params, update_idx = carry
+        rng_key, params, opt_state, best_val_ll, best_params, update_idx, initial_cp_center = carry
 
         x_batch = jnp.take(train_input_ids, batch_idx, axis=0)
         atten_batch = jnp.take(train_attention_mask, batch_idx, axis=0)
@@ -1122,32 +1126,31 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
             gyration_radius = _bezier_gyration(cp)
             rel_center = _bezier_rel_center(cp, initial_cp_center)
 
-            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1), \
+            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1, initial_cp_center), \
                 {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length,
                  'lower_length': lower_length, 'mean_center': mean_center,
                  'gyration_radius': gyration_radius, 'rel_center': rel_center,
                  **metrics, **logs}
         else:
-            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1), \
+            return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1, initial_cp_center), \
                 {'loss': loss, 'current_lr': current_lr, **metrics, **logs}
 
     return train_batch
 
 
 def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
-                          train_input_ids, train_attention_mask, train_labels,
-                          initial_cp_center):
+                          train_input_ids, train_attention_mask, train_labels):
     """Return a ``train_epoch(carry, epoch)`` closure for ``jax.lax.scan``.
 
     Internally creates the per-batch function via ``_make_train_batch_fn``.
+    ``initial_cp_center`` is expected in position 6 of the carry tuple.
     """
     hp = config.train_hyper
     train_batch_fn = _make_train_batch_fn(
         env, config,
         train_input_ids=train_input_ids,
         train_attention_mask=train_attention_mask,
-        train_labels=train_labels,
-        initial_cp_center=initial_cp_center)
+        train_labels=train_labels)
     n_train_samples = train_labels.shape[0]
     batch_size = hp.batch_size
     num_epochs = hp.num_epochs
@@ -1497,7 +1500,7 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
     elif hp.ds_sampling == 'minibatch':
         print(f"Start minibatch training for {hp.num_epochs} epochs")
         train_input_ids, train_attention_mask, train_labels = data.get('train')
-        carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
+        carry = (rng_key, params, opt_state, best_val_ll, best_params, 0, initial_cp_center)
         scan_length = hp.num_epochs
         # Build train_step + JIT wrapper once; reuse on subsequent calls
         if env._cached_scan_jit is None:
@@ -1505,8 +1508,7 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
                 env, config,
                 train_input_ids=train_input_ids,
                 train_attention_mask=train_attention_mask,
-                train_labels=train_labels,
-                initial_cp_center=initial_cp_center)
+                train_labels=train_labels)
             env._cached_train_step = train_step
             @jax.jit
             def _scan_jit(carry, xs):

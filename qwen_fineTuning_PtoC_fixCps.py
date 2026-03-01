@@ -499,8 +499,7 @@ class TrainingEnv:
     valid_metrics_fn: Any
     empty_metric: tuple
     get_best_params: Any
-    _cached_train_step: Any = None  # lazily built; reused across run_training calls
-    _cached_scan_jit: Any = None   # @jit wrapper closing over _cached_train_step
+    train_step: Any = None   # @jit wrapper around _scan_step; call this to train
 
 
 # jax.config.update("jax_log_compiles", True)
@@ -1407,31 +1406,21 @@ def _setup_rho_scheduler(lora_params, num_steps):
         return lambda step, base: base
 
 
-def _setup_training_env(config: Config, data):    
+def _setup_training_env(config: Config, data: 'DataSplits'):
     """Prepare the training environment for a curve or single-point run.
 
-    This function instantiates the model wrapper and the chosen subspace
-    model, configures the t-sampling function and LoRA rho scheduler,
-    prepares validation helpers, and builds the optimizer. The returned
-    `TrainingEnv` bundles the subspace model, optimizer and the helper
-    callables required during training and evaluation.
+    Instantiates the model wrapper and subspace model, configures the
+    t-sampling function and LoRA rho scheduler, prepares validation
+    helpers, builds the optimizer, and eagerly compiles the scan step
+    function so subsequent ``run_training`` calls always get a JAX
+    trace-cache hit.
 
-    Args:
-        config (Config): Experiment configuration containing model and
-            training parameters (including `model_params` and optimizer
-            settings).
-        data (DataSplits): Dataset splits used to configure validation
-            behavior (may be consulted when building validation functions).
-        curve_mask: Optional pytree mask selecting curve control-point
-            parameters (passed to the optimizer builder when applicable).
-        curve_params: Optional pytree of curve parameters (used for
-            dimension inference when constructing parameter masks).
+    Note: ``_train_full_curve`` replaces ``env.optimizer`` after this call
+    (to add the CP-freeze mask) and then rebuilds the step function
+    again to re-close the closure over the updated optimizer.
 
     Returns:
-        TrainingEnv: Container with attributes `s_model`, `optimizer`,
-            `t_sample_fn`, `rho_scheduler`, `valid_metrics_fn`,
-            `empty_metric`, and `get_best_params` used by the training
-            and evaluation loops.
+        TrainingEnv with all fields populated, including ``train_step``.
     """
     mp = config.model_params
 
@@ -1440,20 +1429,45 @@ def _setup_training_env(config: Config, data):
     logging.info("Using subspace model: %s", mp.subspace_model)
     s_model_cls = get_subspace_model(mp.subspace_model)
     s_model = s_model_cls(**mp.get_model_kwargs(model=model))
-    
+
     # t sampling, rho scheduler, validation
     t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
     rho_scheduler = _setup_rho_scheduler(mp.lora_params, config.train_hyper.num_steps)
     valid_metrics_fn, empty_metric, get_best_params = _setup_validation(
-                s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
+        s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
 
     optimizer = _init_optimizer(config)
-    
+
     env = TrainingEnv(
         s_model=s_model, optimizer=optimizer,
         t_sample_fn=t_sample_fn, rho_scheduler=rho_scheduler,
         valid_metrics_fn=valid_metrics_fn, empty_metric=empty_metric,
         get_best_params=get_best_params)
+
+    # Eagerly build + JIT the scan step function
+    if data.has_train:
+        hp = config.train_hyper
+        if hp.ds_sampling == 'expert':
+            window_size = hp.dataset_sampling['expert']['window_size']
+            window_size = max(hp.batch_size, window_size)
+            train_step = _make_expert_step_fn(env, config, window_size=window_size)
+        elif hp.ds_sampling == 'minibatch':
+            train_input_ids, train_attention_mask, train_labels = data.get('train')
+            train_step = _make_train_epoch_fn(
+                env, config,
+                train_input_ids=train_input_ids,
+                train_attention_mask=train_attention_mask,
+                train_labels=train_labels)
+        else:
+            raise ValueError(
+                f"Unknown dataset_sampling method {hp.ds_sampling}. "
+                "Choose 'expert' or 'minibatch'.")
+
+        @jax.jit
+        def _scan_jit(carry, xs):
+            return jax.lax.scan(train_step, carry, xs)
+
+        env.train_step = _scan_jit
     return env
 
 
@@ -1484,42 +1498,18 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
 
     if hp.ds_sampling == 'expert':
         print(f"Start sorted expert training for {hp.num_steps}")
-        window_size = hp.dataset_sampling['expert']['window_size']
-        window_size = max(hp.batch_size, window_size)
         carry = (rng_key, params, opt_state, best_val_ll, best_params, data.get('train'))
         scan_length = hp.num_steps
-        # Build train_step + JIT wrapper once; reuse on subsequent calls
-        if env._cached_scan_jit is None:
-            train_step = _make_expert_step_fn(env, config, window_size=window_size)
-            env._cached_train_step = train_step
-            @jax.jit
-            def _scan_jit(carry, xs):
-                return jax.lax.scan(train_step, carry, xs)
-            env._cached_scan_jit = _scan_jit
-
     elif hp.ds_sampling == 'minibatch':
         print(f"Start minibatch training for {hp.num_epochs} epochs")
-        train_input_ids, train_attention_mask, train_labels = data.get('train')
         carry = (rng_key, params, opt_state, best_val_ll, best_params, 0, initial_cp_center)
         scan_length = hp.num_epochs
-        # Build train_step + JIT wrapper once; reuse on subsequent calls
-        if env._cached_scan_jit is None:
-            train_step = _make_train_epoch_fn(
-                env, config,
-                train_input_ids=train_input_ids,
-                train_attention_mask=train_attention_mask,
-                train_labels=train_labels)
-            env._cached_train_step = train_step
-            @jax.jit
-            def _scan_jit(carry, xs):
-                return jax.lax.scan(train_step, carry, xs)
-            env._cached_scan_jit = _scan_jit
     else:
         raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
 
-    # run training loop — uses the cached @jit wrapper so the 2nd+ call
-    # with the same env gets a JAX trace-cache hit (same function identity).
-    carry, metrics = env._cached_scan_jit(carry, jnp.arange(scan_length))
+    # Step fn is pre-built in _setup_training_env (and re-built in _train_full_curve
+    # after the optimizer rebuild). Calling the cached JIT gives a trace-cache hit.
+    carry, metrics = env.train_step(carry, jnp.arange(scan_length))
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
@@ -1731,6 +1721,30 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
 
     # Rebuild optimizer with curve mask/params so CP-freeze mask is applied
     env.optimizer = _init_optimizer(config, curve_mask=env.s_model.curve_mask, curve_params=params['params'])
+    # Re-close the step function over the updated optimizer
+    if not all_fixed:
+        hp = config.train_hyper
+        if hp.ds_sampling == 'expert':
+            window_size = hp.dataset_sampling['expert']['window_size']
+            window_size = max(hp.batch_size, window_size)
+            train_step = _make_expert_step_fn(env, config, window_size=window_size)
+        elif hp.ds_sampling == 'minibatch':
+            train_input_ids, train_attention_mask, train_labels = data.get('train')
+            train_step = _make_train_epoch_fn(
+                env, config,
+                train_input_ids=train_input_ids,
+                train_attention_mask=train_attention_mask,
+                train_labels=train_labels)
+        else:
+            raise ValueError(
+                f"Unknown dataset_sampling method {hp.ds_sampling}. "
+                "Choose 'expert' or 'minibatch'.")
+
+        @jax.jit
+        def _scan_jit(carry, xs):
+            return jax.lax.scan(train_step, carry, xs)
+
+        env.train_step = _scan_jit
 
     # Log parameter stats
     flat_params = jax.tree.flatten(params)[0]
@@ -1956,93 +1970,93 @@ if __name__ == '__main__':
             },
         }
 
-        config = {
-        # --- Run / experiment --------------------------------------------------
-        'rng_seed': 1,
-        'load_params_path': False,
+    #     config = {
+    #     # --- Run / experiment --------------------------------------------------
+    #     'rng_seed': 1,
+    #     'load_params_path': False,
 
-        # --- Data --------------------------------------------------------------
-        'data': {
-            'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
-            'val_percentage': 0.1,
-        },
+    #     # --- Data --------------------------------------------------------------
+    #     'data': {
+    #         'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+    #         'val_percentage': 0.1,
+    #     },
 
-        # --- Base model (QwenTextClassificationWrapper) ------------------------
-        'net_kwargs': {
-            'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"
-        },
+    #     # --- Base model (QwenTextClassificationWrapper) ------------------------
+    #     'net_kwargs': {
+    #         'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"
+    #     },
 
-        # --- Training hyperparameters → TrainHyperparams ----------------------
-        'train_hyper': {
-            'batch_size': 4,
-            'num_epochs': -1,
-            'num_steps': 5000,
-            'eval_every_n_batch': 20,
-            'temperature': [1.0],
-            'dataset_sampling': {'minibatch': {}},
-            'save_params': True,
-            'smoke_test': False,
-        },
+    #     # --- Training hyperparameters → TrainHyperparams ----------------------
+    #     'train_hyper': {
+    #         'batch_size': 4,
+    #         'num_epochs': -1,
+    #         'num_steps': 5000,
+    #         'eval_every_n_batch': 20,
+    #         'temperature': [1.0],
+    #         'dataset_sampling': {'minibatch': {}},
+    #         'save_params': True,
+    #         'smoke_test': False,
+    #     },
 
-        # --- Subspace model + LoRA architecture → ModelParams -----------------
-        'model_params': {
-            'cp_fix': [0, 0, 0],  # Updated from JSON
-            'curve_sampling_mode': 'combined_noBMA',
-            'subspace_model': 'lora_category',
-            'jitter_multiplier': 0.0,
-            'natural_parameterization': False,
-            'weight_decay': 0.0,
-            'curve_parameterization': 'bezier',
-            'curve_segment': False,
-            'indepent_connected': False, # Matched to JSON behavior
-            'gravity': 5.0,
-            'energy_weakening': 4.0,
+    #     # --- Subspace model + LoRA architecture → ModelParams -----------------
+    #     'model_params': {
+    #         'cp_fix': [0, 0, 0],  # Updated from JSON
+    #         'curve_sampling_mode': 'combined_noBMA',
+    #         'subspace_model': 'lora_category',
+    #         'jitter_multiplier': 0.0,
+    #         'natural_parameterization': False,
+    #         'weight_decay': 0.0,
+    #         'curve_parameterization': 'bezier',
+    #         'curve_segment': False,
+    #         'indepent_connected': False, # Matched to JSON behavior
+    #         'gravity': 5.0,
+    #         'energy_weakening': 4.0,
 
-            # curve topology
-            'filter_masks': [
-                {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
-                {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
-                {'keys': ["lm_head", "kernel"], 'op': 'all'},
-            ],
+    #         # curve topology
+    #         'filter_masks': [
+    #             {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+    #             {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
+    #             {'keys': ["lm_head", "kernel"], 'op': 'all'},
+    #         ],
 
-            # LoRA sub-config
-            'lora_params': {
-                'use_lora': True,
-                'r': 8,
-                'lora_dtype': 'float32',
-                'lora_alpha': 16.0,
-                'lora_mode': 'Asd(t)eB',  # Updated from JSON
-                'rho_scheduler_frequency': 100,
-                'lora_rho': 0.25,
-                'lora_rho_s': 0.5,
-                'filter_masks': [
-                    {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                    {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                    {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
-                ],
-            },
-        },
+    #         # LoRA sub-config
+    #         'lora_params': {
+    #             'use_lora': True,
+    #             'r': 8,
+    #             'lora_dtype': 'float32',
+    #             'lora_alpha': 16.0,
+    #             'lora_mode': 'Asd(t)eB',  # Updated from JSON
+    #             'rho_scheduler_frequency': 100,
+    #             'lora_rho': 0.25,
+    #             'lora_rho_s': 0.5,
+    #             'filter_masks': [
+    #                 {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+    #                 {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+    #                 {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
+    #             ],
+    #         },
+    #     },
 
-        # --- Optimizer ---------------------------------------------------------
-        'optimizer_conf': {
-            'name': "adamw",
-            'kwargs': {
-                'learning_rate': {
-                    'name': "linear_onecycle_schedule",
-                    'kwargs': {
-                        'transition_steps': 5000,
-                        'peak_value': 0.0001, # Matched to 1e-4 from JSON
-                        'pct_start': 0.12,
-                        'pct_final': 1.0,
-                        'div_factor': 300.0,
-                        'final_div_factor': 300.0,
-                    },
-                },
-                'weight_decay': 0.0,
-            },
-            'freeze_other_params': True,
-        },
-    }
+    #     # --- Optimizer ---------------------------------------------------------
+    #     'optimizer_conf': {
+    #         'name': "adamw",
+    #         'kwargs': {
+    #             'learning_rate': {
+    #                 'name': "linear_onecycle_schedule",
+    #                 'kwargs': {
+    #                     'transition_steps': 5000,
+    #                     'peak_value': 0.0001, # Matched to 1e-4 from JSON
+    #                     'pct_start': 0.12,
+    #                     'pct_final': 1.0,
+    #                     'div_factor': 300.0,
+    #                     'final_div_factor': 300.0,
+    #                 },
+    #             },
+    #             'weight_decay': 0.0,
+    #         },
+    #         'freeze_other_params': True,
+    #     },
+    # }
         logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)
         train(logger, config)
 

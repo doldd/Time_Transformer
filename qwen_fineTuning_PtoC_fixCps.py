@@ -1034,7 +1034,7 @@ def _init_subspace_params(config:Config, s_model, init_key, fixed_cps_train_para
     return params
 
 
-def _init_optimizer(config:Config, curve_mask=None, curve_params=None):
+def _init_optimizer(config:Config, curve_mask, curve_params):
     """Create the optimizer chain (gradient clipping, CP freezing, base optimizer).
 
     Args:
@@ -1406,21 +1406,29 @@ def _setup_rho_scheduler(lora_params, num_steps):
         return lambda step, base: base
 
 
-def _setup_training_env(config: Config, data: 'DataSplits'):
+def _setup_training_env(config: Config, data: 'DataSplits', rng_key,
+                        fixed_cps_train_params=False):
     """Prepare the training environment for a curve or single-point run.
 
-    Instantiates the model wrapper and subspace model, configures the
-    t-sampling function and LoRA rho scheduler, prepares validation
-    helpers, builds the optimizer, and eagerly compiles the scan step
-    function so subsequent ``run_training`` calls always get a JAX
+    Instantiates the model wrapper and subspace model, initialises parameters
+    (optionally loading pretrained control-point weights), builds the optimizer
+    with the CP-freeze mask already applied, configures the t-sampling function
+    and LoRA rho scheduler, prepares validation helpers, and eagerly compiles
+    the scan step function so subsequent ``run_training`` calls always get a JAX
     trace-cache hit.
 
-    Note: ``_train_full_curve`` replaces ``env.optimizer`` after this call
-    (to add the CP-freeze mask) and then rebuilds the step function
-    again to re-close the closure over the updated optimizer.
+    Args:
+        config: Experiment configuration.
+        data: Train / val / test dataset splits.
+        rng_key: JAX random key (consumed to produce the parameter init key).
+        fixed_cps_train_params: List of pretrained CP parameter pytrees (or
+            ``False`` per entry) as returned by ``_pretrain_fixed_cps``.  Pass
+            the default ``False`` for k=0 pretraining or free-curve training.
 
     Returns:
-        TrainingEnv with all fields populated, including ``train_step``.
+        ``(env, params, rng_key)`` — ``TrainingEnv`` with all fields populated
+        (including ``train_step``), initialised parameters, and the updated
+        random key.
     """
     mp = config.model_params
 
@@ -1430,13 +1438,21 @@ def _setup_training_env(config: Config, data: 'DataSplits'):
     s_model_cls = get_subspace_model(mp.subspace_model)
     s_model = s_model_cls(**mp.get_model_kwargs(model=model))
 
+    # Initialise parameters — must happen before optimizer build so
+    # curve_mask and params are available for the CP-freeze mask.
+    rng_key, init_key = random.split(rng_key)
+    params = _init_subspace_params(config, s_model, init_key, fixed_cps_train_params)
+
     # t sampling, rho scheduler, validation
     t_sample_fn = _setup_t_sample_fn(s_model, mp.curve_sampling_mode)
     rho_scheduler = _setup_rho_scheduler(mp.lora_params, config.train_hyper.num_steps)
     valid_metrics_fn, empty_metric, get_best_params = _setup_validation(
         s_model, data, config.train_hyper.batch_size_eval, k=mp.k)
 
-    optimizer = _init_optimizer(config)
+    # Build optimizer with curve_mask/params so the CP-freeze mask is correct
+    # from the start. For k=0 (pretrain), curve_mask is all-False so no
+    # CP-freeze is added and this is equivalent to _init_optimizer(config).
+    optimizer = _init_optimizer(config, curve_mask=s_model.curve_mask, curve_params=params['params'])
 
     env = TrainingEnv(
         s_model=s_model, optimizer=optimizer,
@@ -1468,7 +1484,7 @@ def _setup_training_env(config: Config, data: 'DataSplits'):
             return jax.lax.scan(train_step, carry, xs)
 
         env.train_step = _scan_jit
-    return env
+    return env, params, rng_key
 
 
 def run_training(rng_key, env, params, data, config: 'Config', logger, logger_prefix):
@@ -1507,8 +1523,8 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
     else:
         raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
 
-    # Step fn is pre-built in _setup_training_env (and re-built in _train_full_curve
-    # after the optimizer rebuild). Calling the cached JIT gives a trace-cache hit.
+    # Step fn is pre-built in _setup_training_env with the correct optimizer;
+    # calling the cached JIT gives a trace-cache hit.
     carry, metrics = env.train_step(carry, jnp.arange(scan_length))
 
     # Clean up inf values from lazy validation
@@ -1648,7 +1664,7 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     print("Pretraining fixed control points")
 
     with config.as_pretrain() as pt_config:
-        env = _setup_training_env(config=pt_config, data=data)
+        env, _, rng_key = _setup_training_env(config=pt_config, data=data, rng_key=rng_key)
 
         for i, fixed in enumerate(cp_fix):
             if fixed:
@@ -1712,39 +1728,12 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
             assert config.model_params.indepent_connected is True, (
                 "Set indepentend connected to True in curve segment mode with no fixed control points")
 
-    # Setup training environment — k is derived from config.model_params.k
-    env = _setup_training_env(config=config, data=data)
-
-    # Initialize subspace parameters from pretrained control-point params
-    rng_key, init_key = random.split(rng_key)
-    params = _init_subspace_params(config, env.s_model, init_key, fixed_cps_train_params=train_params)
-
-    # Rebuild optimizer with curve mask/params so CP-freeze mask is applied
-    env.optimizer = _init_optimizer(config, curve_mask=env.s_model.curve_mask, curve_params=params['params'])
-    # Re-close the step function over the updated optimizer
-    if not all_fixed:
-        hp = config.train_hyper
-        if hp.ds_sampling == 'expert':
-            window_size = hp.dataset_sampling['expert']['window_size']
-            window_size = max(hp.batch_size, window_size)
-            train_step = _make_expert_step_fn(env, config, window_size=window_size)
-        elif hp.ds_sampling == 'minibatch':
-            train_input_ids, train_attention_mask, train_labels = data.get('train')
-            train_step = _make_train_epoch_fn(
-                env, config,
-                train_input_ids=train_input_ids,
-                train_attention_mask=train_attention_mask,
-                train_labels=train_labels)
-        else:
-            raise ValueError(
-                f"Unknown dataset_sampling method {hp.ds_sampling}. "
-                "Choose 'expert' or 'minibatch'.")
-
-        @jax.jit
-        def _scan_jit(carry, xs):
-            return jax.lax.scan(train_step, carry, xs)
-
-        env.train_step = _scan_jit
+    # Setup training environment — k is derived from config.model_params.k.
+    # Passes train_params so params are initialised and the optimizer is built
+    # with the correct CP-freeze mask in one shot; no rebuild needed.
+    env, params, rng_key = _setup_training_env(
+        config=config, data=data, rng_key=rng_key,
+        fixed_cps_train_params=train_params)
 
     # Log parameter stats
     flat_params = jax.tree.flatten(params)[0]

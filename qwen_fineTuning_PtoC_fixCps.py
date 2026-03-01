@@ -430,7 +430,8 @@ class Config:
             assert all_segments_fixed_endpoints, (
                 "In curve segment mode, fixed control points must be consecutive "
                 "and include endpoints, e.g. [1,0,1,0,1] with deg 2.")
-        if lora_params is not None and np.sum(cp_fix) < len(cp_fix):
+        # no check for all 0 [0,0,0,0] or single fixed point [1] since they are valid for other loraModes
+        if lora_params is not None and (model_params.k == 0 or np.sum(cp_fix) == 0):
             assert lora_params.lora_mode in ('A(t)B(t)', 'A(t)eB(t)'), (
                 "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for "
                 "subspace curves with fixed control points")
@@ -485,6 +486,8 @@ class TrainingEnv:
     valid_metrics_fn: Any
     empty_metric: tuple
     get_best_params: Any
+    _cached_train_step: Any = None  # lazily built; reused across run_training calls
+    _cached_scan_jit: Any = None   # @jit wrapper closing over _cached_train_step
 
 
 # jax.config.update("jax_log_compiles", True)
@@ -1467,27 +1470,41 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
         print(f"Start sorted expert training for {hp.num_steps}")
         window_size = hp.dataset_sampling['expert']['window_size']
         window_size = max(hp.batch_size, window_size)
-        train_step = _make_expert_step_fn(env, config, window_size=window_size)
         carry = (rng_key, params, opt_state, best_val_ll, best_params, data.get('train'))
         scan_length = hp.num_steps
+        # Build train_step + JIT wrapper once; reuse on subsequent calls
+        if env._cached_scan_jit is None:
+            train_step = _make_expert_step_fn(env, config, window_size=window_size)
+            env._cached_train_step = train_step
+            @jax.jit
+            def _scan_jit(carry, xs):
+                return jax.lax.scan(train_step, carry, xs)
+            env._cached_scan_jit = _scan_jit
 
     elif hp.ds_sampling == 'minibatch':
         print(f"Start minibatch training for {hp.num_epochs} epochs")
         train_input_ids, train_attention_mask, train_labels = data.get('train')
-        train_step = _make_train_epoch_fn(
-            env, config,
-            train_input_ids=train_input_ids,
-            train_attention_mask=train_attention_mask,
-            train_labels=train_labels,
-            initial_cp_center=initial_cp_center)
-
         carry = (rng_key, params, opt_state, best_val_ll, best_params, 0)
         scan_length = hp.num_epochs
+        # Build train_step + JIT wrapper once; reuse on subsequent calls
+        if env._cached_scan_jit is None:
+            train_step = _make_train_epoch_fn(
+                env, config,
+                train_input_ids=train_input_ids,
+                train_attention_mask=train_attention_mask,
+                train_labels=train_labels,
+                initial_cp_center=initial_cp_center)
+            env._cached_train_step = train_step
+            @jax.jit
+            def _scan_jit(carry, xs):
+                return jax.lax.scan(train_step, carry, xs)
+            env._cached_scan_jit = _scan_jit
     else:
         raise ValueError(f"Unknown dataset_sampling method {hp.ds_sampling}. Choose 'expert' or 'minibatch'.")
 
-    # run training loop and collect metrics
-    carry, metrics = jax.lax.scan(train_step, carry, jnp.arange(scan_length))
+    # run training loop — uses the cached @jit wrapper so the 2nd+ call
+    # with the same env gets a JAX trace-cache hit (same function identity).
+    carry, metrics = env._cached_scan_jit(carry, jnp.arange(scan_length))
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
@@ -1868,8 +1885,8 @@ if __name__ == '__main__':
                 'natural_parameterization': False,
                 'weight_decay': 0.,
                 'curve_parameterization': 'bezier',
-                'curve_segment': False,           # int → segmented degree; False → full curve
-                'indepent_connected': False,  # True → independently connected segments
+                'curve_segment': 3,           # int → segmented degree; False → full curve
+                'indepent_connected': True,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,
 

@@ -1,96 +1,70 @@
-program: qwen_fineTuning_PtoC.py
+program: qwen_fineTuning_PtoC_fixCps.py
 name: Qwen LoRA test
 method: grid
 metric:
   goal: maximize
   name: acc_val_curve
 parameters:
-  save_params:
-    value: False
-  dataset_path:
-    value: "ddold/qwen_PtoC/winogrande_m_dataset:v0"
+  rng_seed:
+    values: [1]
+  data:
+    parameters:
+      dataset_path:
+        value: "ddold/qwen_PtoC/winogrande_m_dataset:v0"
   net_kwargs:
     parameters:
       model_path:
         value: "ddold/qwen_PtoC/qwen2.5_0.5B_bfloat16:v0"
-  eval_every_n_batch:
-    value: 25
-  lora_params:
+  train_hyper:
     parameters:
-      use_lora:
-        value: True
-      r:
-        value: 8
-      filter_masks:
-        values:
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [0, 1]}, 
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [0, 1]}]          
-          # - [{keys: ["value", "w"], op: "all", dims: [0, 2]},]          
-          # - [{keys: ["value", "w"], op: "all", dims: [2, 0]},]          
-          # - [{keys: ["value", "w"], op: "all", dims: [0, 2]}, {keys: ["query", "w"], op: "all", dims: [0, 2]}]          
-  curve_params:
-    parameters:
-      k:
-        values: [0,2]
       batch_size:
         values: [16, 64]
-      natural_parameterization:
+      eval_every_n_batch:
+        value: 25
+      num_epochs:
+        value: 50
+      save_params:
         value: False
-      gravity:
-        value: 0.0
-      energy_weakening:
-        value: 1.
-      regularizer:
+  model_params:
+    parameters:
+      cp_fix:
+        values:
+          - [1]
+          - [0, 0, 0]
+      filter_masks:
+        values:
+          - [{keys: ["self_attn", "q_proj", "kernel"], op: all}, {keys: ["self_attn", "v_proj", "kernel"], op: all}]
+          - [{keys: ["self_attn", "q_proj", "kernel"], op: all}, {keys: ["self_attn", "q_proj", "bias"], op: all}]
+      natural_parameterization:
         value: False
       weight_decay:
         value: 0.0
-      jitter:
-        value: 1e-2
-      num_epochs:
-        value: 50
-
-      filter_masks:
-        values: 
-          # - [{keys: ["input_ff_layer",], op: "all"},]
-          # - [{keys: ["input_ff_layer", "horizon_ff_layer"], op: "any"},]
-          # - [{keys: ["horizon_ff_layer",], op: "all"},]
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all"},
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all"}]
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all"},
-             {keys: ["self_attn", "q_proj", "bias"], op: "all"}]
-          # - [{keys: ["value"], op: "all"},]
-          # - [{keys: ["query"], op: "all"}, {keys: ["value"], op: "all"}]
-
-      optimizer_conf:
-          values:
-            - {name: "adamw", kwargs: {learning_rate: 0.0001, weight_decay: 1e-3}, grad_clip_norm: 150.0, freeze_other_params: True}
-            - {name: "sgd", kwargs: {learning_rate: 0.01, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            - {name: "sgd", kwargs: {learning_rate: 0.001, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            - {name: "sgd", kwargs: {learning_rate: 0.0001, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            # - {name: "sgd", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 3_000, peak_value: 0.0003, pct_start: 0.30, pct_final: 0.8, div_factor: 10.0, final_div_factor: 0.2}}, momentum: 0.9, nesterov: True}, grad_clip_norm: 15.0, freeze_non_curve_params: True}
-        # parameters:
-        #   name:
-        #     value: "sgd"
-        #   kwargs:
-        #     parameters:
-        #       learning_rate:
-        #         value: 0.0001
-        #       momentum:
-        #         value: 0.9
-        #       nesterov:
-        #         value: True
-        #   grad_clip_norm:
-        #     value: 15.0
-        #   freeze_non_curve_params:
-        #     value: True
-  rng_seed:
-    values: [1,]
+      jitter_multiplier:
+        value: "1e-2"
+      gravity:
+        value: 0.0
+      energy_weakening:
+        value: 1.0
+      regularizer:
+        value: False
+      lora_params:
+        parameters:
+          use_lora:
+            value: True
+          r:
+            value: 8
+          filter_masks:
+            values:
+              - [{keys: ["self_attn", "q_proj", "kernel"], op: all, dims: [0, 1]}, {keys: ["self_attn", "v_proj", "kernel"], op: all, dims: [0, 1]}]
+  optimizer_conf:
+    values:
+      - {name: adamw, kwargs: {learning_rate: 0.0001, weight_decay: 1e-3}, grad_clip_norm: 150.0, freeze_other_params: true}
+      - {name: sgd, kwargs: {learning_rate: 0.01, momentum: 0.9, nesterov: true}, grad_clip_norm: 150.0, freeze_other_params: true}
+      - {name: sgd, kwargs: {learning_rate: 0.001, momentum: 0.9, nesterov: true}, grad_clip_norm: 150.0, freeze_other_params: true}
+      - {name: sgd, kwargs: {learning_rate: 0.0001, momentum: 0.9, nesterov: true}, grad_clip_norm: 150.0, freeze_other_params: true}
 
 command:
 - ${env}
 - ${interpreter}
 - ${program}
-- "--train"
-- "curve"
-- "--use-sweep"
-#- ${args}
+- --use-sweep

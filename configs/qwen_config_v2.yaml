@@ -1,4 +1,4 @@
-program: qwen_fineTuning_PtoC copy.py
+program: qwen_fineTuning_PtoC_fixCps.py
 name: Qwen LoRA Valid B-spline
 description: "Compare validation loss with no curve vs curve. Pick best model and temperature according to val loss. Then evaluate on test set. Use B-spline with degree=2"
 method: grid
@@ -6,138 +6,85 @@ metric:
   goal: maximize
   name: acc_val_curve
 parameters:
-  save_params:
-    value: False
-  dataset_path:
-    values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0",
-            #  "ddold/qwen_PtoC/winogrande_s_dataset:v0",
-            #  "ddold/qwen_PtoC/boolq_dataset:v0",
-             "ddold/qwen_PtoC/obqa_dataset:v0",
-             "ddold/qwen_PtoC/ARC-Challenge_dataset:v0",
-            #  "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
-             ]
+  rng_seed:
+    values: [1, 2, 4, 8]
   load_params_path:
     value: False
+  data:
+    parameters:
+      dataset_path:
+        values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0", "ddold/qwen_PtoC/obqa_dataset:v0", "ddold/qwen_PtoC/ARC-Challenge_dataset:v0"]
+      val_percentage:
+        value: 0.1
   net_kwargs:
     parameters:
       model_path:
         value: "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"
-  eval_every_n_batch:
-    value: 25
-  dataset_sampling:
+  train_hyper:
     parameters:
-      minibatch:
-        value: False
-  # dataset_sampling:
-  #   parameters:
-  #     expert:
-  #       parameters:
-  #         window_size:
-  #           values: [4,]
-  #         sort_mode:
-  #           values: [False,]  # "Hierarchical", "Spectral", "Random", "First_data"]
-  lora_params:
-    parameters:
-      use_lora:
-        value: True
-      r:
-        values: [8, 32]
-      lora_dtype:
-        value: "float32"  # ["original", "float16", "bfloat16", "float32"]
-      lora_alpha:
-        value: 16.0
-      lora_mode:
-        # values: ["A(t)B", "A(t)B(t)", "As(t)B"]
-        value: "A(t)B(t)"
-      filter_masks:
-        values:
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all", dims: [1, 0]}, 
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all", dims: [1, 0]},
-             {keys: ["lm_head", "kernel"], op: "all", dims: [1, 0]}]
-          # - [{keys: ["value", "w"], op: "all", dims: [0, 2]},]          
-          # - [{keys: ["value", "w"], op: "all", dims: [2, 0]},]          
-          # - [{keys: ["value", "w"], op: "all", dims: [0, 2]}, {keys: ["query", "w"], op: "all", dims: [0, 2]}]          
-  curve_params:
-    parameters:
-      k:
-        values: [2, 5, 10]
       batch_size:
-        values: [4,]
-      natural_parameterization:
-        value: False
-      gravity:
-        value: 0.0
-      energy_weakening:
-        value: 1.
-      regularizer:
-        value: False
-      weight_decay:
-        value: 0.0
-      jitter_multiplier:
-        values: [0.,] 
-        # fan_in is internal to apply_noise, so we set jitter to 1.
-        # np.sqrt(2/3584) np.sqrt(2./fan_in, dtype=np.float32) fan_in= 3584 for q_proj
+        values: [4]
+      eval_every_n_batch:
+        value: 25
       num_epochs:
         value: -1
       num_steps:
-        value: 5_000
+        value: 5000
+      save_params:
+        value: False
+      dataset_sampling:
+        parameters:
+          minibatch:
+            value: False
       temperature:
-        value: [0.5, 1.0, 2.0, 4.0, 8.0, 16., 32.0,]
-      val_percentage:
-        value: 0.1
-      entropy_maxim:
-        # values: [0.1, 1., 2.5, 5.0, 7.5, 10]
-        values: [0., 2.5, 5.0, 7.5]
-        # value: 5.
-      curve_parameterization:
-        value: "bezier"  # ["bezier", "b-spline",] #  "chebyshev", "fourier"]
-
+        value: [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+  model_params:
+    parameters:
+      cp_fix:
+        values:
+          - [0, 0, 0]
+          - [0, 0, 0, 0, 0, 0]
+          - [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       filter_masks:
-        values: 
-          # - [{keys: ["input_ff_layer",], op: "all"},]
-          # - [{keys: ["input_ff_layer", "horizon_ff_layer"], op: "any"},]
-          # - [{keys: ["horizon_ff_layer",], op: "all"},]
-          - [{keys: ["self_attn", "q_proj", "kernel"], op: "all"},
-             {keys: ["self_attn", "v_proj", "kernel"], op: "all"},
-             {keys: ["lm_head", "kernel"], op: "all"}]
-          # - [{keys: ["self_attn", "q_proj"], op: "all"}]
-          # - [{keys: ["value"], op: "all"},]
-          # - [{keys: ["query"], op: "all"}, {keys: ["value"], op: "all"}]
-
-      optimizer_conf:
-          values:
-            # - {name: "adamw", kwargs: {learning_rate: 0.0001, weight_decay: 1e-3}, grad_clip_norm: 100.0, freeze_other_params: True}
-            # - {name: "sgd", kwargs: {learning_rate: 0.01, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            # - {name: "sgd", kwargs: {learning_rate: 0.001, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            # - {name: "sgd", kwargs: {learning_rate: 0.0001, momentum: 0.9, nesterov: True}, grad_clip_norm: 150.0, freeze_other_params: True}
-            # - {name: "sgd", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, momentum: 0.9, nesterov: True}, grad_clip_norm: 100.0, freeze_other_params: True}
-            # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 1e-4}, grad_clip_norm: 100.0, freeze_other_params: True}
-            # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
-            - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: True}
-            # - {name: "adamw", kwargs: {learning_rate: {name: "linear_onecycle_schedule", kwargs: {transition_steps: 5_000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1., div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.0}, freeze_other_params: True}
-        # parameters:
-        #   name:
-        #     value: "sgd"
-        #   kwargs:
-        #     parameters:
-        #       learning_rate:
-        #         value: 0.0001
-        #       momentum:
-        #         value: 0.9
-        #       nesterov:
-        #         value: True
-        #   grad_clip_norm:
-        #     value: 15.0
-        #   freeze_non_curve_params:
-        #     value: True
-  rng_seed:
-    values: [1, 2, 4, 8]
+        values:
+          - [{keys: ["self_attn", "q_proj", "kernel"], op: all}, {keys: ["self_attn", "v_proj", "kernel"], op: all}, {keys: ["lm_head", "kernel"], op: all}]
+      natural_parameterization:
+        value: False
+      weight_decay:
+        value: 0.0
+      curve_parameterization:
+        value: "bezier"
+      jitter_multiplier:
+        values: [0.0]
+      gravity:
+        value: 0.0
+      energy_weakening:
+        value: 1.0
+      regularizer:
+        value: False
+      entropy_weight:
+        values: [0.0, 2.5, 5.0, 7.5]
+      lora_params:
+        parameters:
+          use_lora:
+            value: True
+          r:
+            values: [8, 32]
+          lora_dtype:
+            value: "float32"
+          lora_alpha:
+            value: 16.0
+          lora_mode:
+            value: "A(t)B(t)"
+          filter_masks:
+            values:
+              - [{keys: ["self_attn", "q_proj", "kernel"], op: all, dims: [1, 0]}, {keys: ["self_attn", "v_proj", "kernel"], op: all, dims: [1, 0]}, {keys: ["lm_head", "kernel"], op: all, dims: [1, 0]}]
+  optimizer_conf:
+    values:
+      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 5000, peak_value: 1e-4, pct_start: 0.06, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.01}, freeze_other_params: true}
 
 command:
 - ${env}
 - ${interpreter}
 - ${program}
-# - "--train"
-# - "curve"
-- "--use-sweep"
-#- ${args}
+- --use-sweep

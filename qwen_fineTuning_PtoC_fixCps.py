@@ -94,14 +94,14 @@ class TrainHyperparams:
     Construct via ``TrainHyperparams.from_config_dict(th, data)``; ``data``
     is only needed to resolve epoch / step counts from data size.
     """
-    batch_size: int
-    eval_every_n_batch: int
-    num_epochs: int
-    num_steps: int
-    save_params: bool
-    smoke_test: bool
-    dataset_sampling: dict
-    temperature: list
+    batch_size: int = 4
+    eval_every_n_batch: int = 50
+    num_epochs: int = 0
+    num_steps: int = 10
+    save_params: bool = False
+    smoke_test: bool = False
+    dataset_sampling: dict = field(default_factory=lambda: {'minibatch': {}})
+    temperature: list = field(default_factory=lambda: [1.0,])
 
     # --- computed properties (not stored; derived from above fields) ------
 
@@ -161,7 +161,7 @@ class LoraParams:
     All stored fields map 1-to-1 to keys inside ``config['model_params']['lora_params']``.
     Construct via ``LoraParams.from_config_dict(lp)``.
     """
-    use_lora: bool = False
+    use_lora: bool = True
     r: int = 8
     lora_dtype: str = 'float32'
     lora_alpha: float = 16.0
@@ -169,7 +169,11 @@ class LoraParams:
     rho_scheduler_frequency: float = 0.0
     lora_rho: float = 0.0
     lora_rho_s: float = 0.0
-    filter_masks: list = field(default_factory=list)
+    filter_masks: list = field(default_factory=lambda: [
+        {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+        {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
+        {'keys': ["lm_head", "kernel"], 'op': 'all', 'dims': [1, 0]},
+    ])
 
     @classmethod
     def from_config_dict(cls, lp: dict) -> 'LoraParams':
@@ -223,17 +227,21 @@ class ModelParams:
     ``subspace_model``, ``filter_masks``, ``cp_fix``, ``curve_sampling_mode``,
     and LoRA noise params).
     """
-    cp_fix: list
-    curve_sampling_mode: str
-    subspace_model: str
-    filter_masks: list = field(default_factory=list)
+    cp_fix: list = field(default_factory=lambda: [0, 0, 0])
+    curve_sampling_mode: str = 'combined_noBMA'
+    subspace_model: str = 'lora_category'
+    filter_masks: list = field(default_factory=lambda: [
+        {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all'},
+        {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all'},
+        {'keys': ["lm_head", "kernel"], 'op': 'all'},
+    ])
     jitter_multiplier: float = 0.0
-    natural_parameterization: bool = False
+    natural_parameterization: bool = False  
     weight_decay: float = 0.0
     curve_parameterization: str = 'bezier'
     curve_segment: int | bool = False
     indepent_connected: bool = False
-    lora_params: 'LoraParams | None' = None
+    lora_params: 'LoraParams | None' = field(default_factory=LoraParams)
     perm_spec: bool = False
     mutuable_param_name: bool = False
     # Mixin fields (RepulsiveMixin, EntropyMixin, JensenShannonMixin)
@@ -333,9 +341,12 @@ class OptimizerConf:
     compiled from ``kwargs['learning_rate']`` during construction so callers
     never have to call ``_setup_lr_schedule`` separately.
     """
-    name: str
-    kwargs: dict                   # contains compiled lr_schedule under 'learning_rate'
-    lr_schedule: Any               # compiled optax schedule (reference into kwargs)
+    name: str = 'adamw'
+    kwargs: dict = field(default_factory=lambda: {
+        'learning_rate': 1e-4,
+        'weight_decay': 0.001,
+    })                   # contains compiled lr_schedule under 'learning_rate'
+    lr_schedule: Any = None               # compiled optax schedule (reference into kwargs)
     freeze_other_params: bool = False
     grad_clip_norm: float | None = None
     orig_dict: dict = field(default_factory=dict)  # for logging / debugging only
@@ -375,13 +386,16 @@ class Config:
     All downstream functions accept a single ``config: Config`` argument
     instead of separate ``hp`` + ``config`` dict pairs.
     """
-    rng_seed: int
-    load_params_path: str | bool
-    data: dict
-    net_kwargs: dict
-    train_hyper: TrainHyperparams
-    model_params: ModelParams
-    optimizer_conf: OptimizerConf
+    rng_seed: int = 1
+    load_params_path: str | bool = False
+    data: dict = field(default_factory=lambda: {
+        'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+        'val_percentage': 0.1,
+    })
+    net_kwargs: dict = field(default_factory=lambda: {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"})
+    train_hyper: TrainHyperparams = field(default_factory=TrainHyperparams)
+    model_params: ModelParams = field(default_factory=ModelParams)
+    optimizer_conf: OptimizerConf = field(default_factory=OptimizerConf)
 
     @contextmanager
     def as_pretrain(self):
@@ -528,9 +542,9 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
     """
     if run:
         artifact = run.use_artifact(dataset_path, type='dataset')
-        artifact_dir = artifact.download()
-        dataset_path = os.path.join(artifact_dir, "test_data.npz" if test else "train_data.npz")
+        dataset_path = artifact.download()
 
+    dataset_path = os.path.join(dataset_path, "test_data.npz" if test else "train_data.npz")
     with np.load(dataset_path) as data:
         input_ids = jnp.array(data['input_ids'])
         attention_mask = jnp.array(data['attention_mask']) 
@@ -1946,7 +1960,7 @@ if __name__ == '__main__':
             # All parameters that determine *what* the subspace model is.
             'model_params': {
                 'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
-                'curve_sampling_mode': 'combined_noBMA',  # 'per_leave' | 'combined' | 'combined_noBMA'
+                'curve_sampling_mode': 'combined',  # 'per_leave' | 'combined' | 'combined_noBMA'
                 'subspace_model': 'lora_category',
                 'jitter_multiplier': 0.,      # weight-init noise scale
                 'natural_parameterization': False,

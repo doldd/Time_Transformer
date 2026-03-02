@@ -393,24 +393,26 @@ class Config:
         flow correctly from config alone — no explicit k argument or
         post-hoc model patching needed.
         """
+        # save state to restore after pretraining
         original_cp_fix = self.model_params.cp_fix
         original_curve_segment = self.model_params.curve_segment
         orig_opt_conf = deepcopy(self.optimizer_conf)
         orig_num_epochs = self.train_hyper.num_epochs
         orig_num_steps = self.train_hyper.num_steps
+        num_steps_per_epoch = orig_num_steps // orig_num_epochs
+        
         # set half learning rate for pretraining
         opt_dict = deepcopy(self.optimizer_conf.orig_dict)
         if isinstance(opt_dict['kwargs']['learning_rate'], dict):
-            opt_dict['kwargs']['learning_rate']['kwargs']['peak_value'] /= float(self.model_params.curve_segment) if self.model_params.curve_segment else 2.
+            opt_dict['kwargs']['learning_rate']['kwargs']['peak_value'] /= 2.
         else:
-            opt_dict['kwargs']['learning_rate'] /= float(self.model_params.curve_segment) if self.model_params.curve_segment else 2.
+            opt_dict['kwargs']['learning_rate'] /= 2.
         opt_conf = OptimizerConf.from_config_dict(opt_dict)
         self.optimizer_conf = opt_conf
         self.model_params.cp_fix = [1]
         self.model_params.curve_segment = False
         if orig_num_epochs > 0:
-            self.train_hyper.num_epochs = max(1, int(orig_num_epochs * 0.75))  # set small number of epochs for pretraining
-            num_steps_per_epoch = orig_num_steps // orig_num_epochs
+            self.train_hyper.num_epochs = max(1, int(orig_num_epochs * 0.5))  # set small number of epochs for pretraining
             self.train_hyper.num_steps = num_steps_per_epoch * self.train_hyper.num_epochs
         try:
             yield self

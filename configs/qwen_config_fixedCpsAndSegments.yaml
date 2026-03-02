@@ -1,5 +1,5 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Lora Bezier Segment open
+name: Lora Bezier pretrain + Segment
 description: "Test with fixed control points and bezier segments (non smooth traversion from one to next segment (Approach 2 (easy)). E.g. [1,0,1,0,1] wiht two independent segments. "
 method: grid
 metric:
@@ -13,9 +13,11 @@ parameters:
   data:
     parameters:
       dataset_path:
-        values: ["ddold/qwen_PtoC/winogrande_m_dataset:v0", 
+        values: [
+                 "ddold/qwen_PtoC/winogrande_m_dataset:v0", 
                  "ddold/qwen_PtoC/obqa_dataset:v0", 
-                 "ddold/qwen_PtoC/ARC-Challenge_dataset:v0"]
+                 "ddold/qwen_PtoC/ARC-Challenge_dataset:v0"
+                 ]
       val_percentage:
         value: 0.1
   net_kwargs:
@@ -31,7 +33,7 @@ parameters:
       num_epochs:
         value: -1
       num_steps:
-        value: 7000
+        value: 10000
       save_params:
         value: True
       dataset_sampling:
@@ -96,7 +98,7 @@ parameters:
             values: [0.0, 0.25]
   optimizer_conf:
     values:
-      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 7000, peak_value: 6e-4, pct_start: 0.12, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: true}
+      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 10000, peak_value: 2e-4, pct_start: 0.12, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: true}
 
 command:
 - ${env}

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field, replace
 import time
 from contextlib import contextmanager
 from typing import Any
+from functools import partial
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
@@ -539,77 +540,113 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
 
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
+
+def _pad_to_batch(x, attention_mask, target, batch_size):
+    """Pad *x*, *attention_mask*, *target* to a multiple of *batch_size*.
+
+    Padding uses zeros and does not contribute to metrics because callers
+    use the returned ``n_valid`` integer to slice / mask results.  The padded
+    arrays have a fully static shape (no Python branching on dataset size),
+    which prevents JAX from recompiling ``jax.lax.scan`` bodies.
+
+    Returns:
+        ``(x_padded, attn_padded, target_padded, n_valid)``
+        where ``n_valid`` is the original (unpadded) number of samples.
+    """
+    n = x.shape[0]
+    n_padded = int(np.ceil(n / batch_size)) * batch_size
+    pad_len = n_padded - n
+    if pad_len == 0:
+        return x, attention_mask, target, n
+    x_p = jnp.concatenate([
+        x,
+        jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype),
+    ], axis=0)
+    attn_p = jnp.concatenate([
+        attention_mask,
+        jnp.zeros((pad_len,) + attention_mask.shape[1:], dtype=attention_mask.dtype),
+    ], axis=0)
+    target_p = jnp.concatenate([
+        target,
+        jnp.zeros((pad_len,) + target.shape[1:], dtype=target.dtype),
+    ], axis=0)
+    return x_p, attn_p, target_p, n
+
+
 def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None, t_max=None):
     if t_max is None:
         t_max = getattr(model, 't_max', 1.0)
+
+    # Fix 2: pad to full batches once at setup time — eliminates the
+    # ``if len(idx_last) > 0`` Python branch inside acc_fn, which used to
+    # produce arrays of different shapes and trigger JAX recompilation.
+    x_pad, attn_pad, target_pad, n_valid = _pad_to_batch(x, attention_mask, target, batch_size)
+    idx_ = jnp.arange(x_pad.shape[0]).reshape(-1, batch_size)  # always full batches
+
+    # Build the t-sampling closure (n_s passed explicitly so get_t is shape-generic).
     if t_sample_fn is None:
         if use_linspace:
-            get_t = lambda key: jnp.linspace(0, t_max, n_samples)
+            get_t = lambda key, n_s: jnp.linspace(0, t_max, n_s)
         else:
-            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=t_max)
+            get_t = lambda key, n_s: random.uniform(key, (n_s,), minval=0., maxval=t_max)
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
-        # get_t = partial(t_sample_fn, n_samples=n_samples)
-        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(random.split(k, n_samples))
-    ii = len(x) // batch_size
-    
-    idx = jnp.arange(len(x))
-    idx_ = idx[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-    idx_ = es('(ib)...->ib...', idx_, b=batch_size)
-    idx_last = idx[matching_limit:]
+        get_t = lambda k, n_s: jax.vmap(lambda key: t_sample_fn(key))(random.split(k, n_s))
+
+    # Fix 1 & 3: a single jitted evaluation core whose trace is stable as long
+    # as the closed-over arrays (x_pad, attn_pad, target_pad) keep the same
+    # shape.  ``n_s`` is declared static so JAX never conflates a 3-sample
+    # smoke-test trace with the 20-sample full-eval trace.
+    @partial(jax.jit, static_argnames=('n_s',))
+    def _eval_core(rng_key, params, n_s):
+        def pred(rng_key, data_idx):
+            x_batch = x_pad.at[data_idx].get()
+            att_m_batch = attn_pad.at[data_idx].get()
+            # y_batch = target_pad.at[data_idx].get()
+
+            rng_key, key_ = random.split(rng_key)
+            t_tree = get_t(key_, n_s)  # shape (n_s,)
+
+            def single_pred(key, t):
+                key, subkey = random.split(key)
+                out, _ = model(params['params'], {}, t, (x_batch, att_m_batch), train=False, key=subkey)
+                return key, out  # out shape (batch_size, output_dim)
+
+            rng_key, out = jax.lax.scan(single_pred, rng_key, t_tree)
+            return rng_key, out  # out shape (n_s, batch_size, output_dim)
+
+        # out: (n_batches, n_s, batch_size, output_dim)
+        rng_key, out = jax.lax.scan(pred, rng_key, idx_)
+        # -> (n_s, n_padded, output_dim)  — trim padding
+        out = out.transpose(1, 0, 2, 3).reshape(n_s, -1, out.shape[-1])[:, :n_valid, :]
+        return rng_key, out  # (n_s, n_valid, output_dim)
 
     # Use shared post_pred_performance from src.utils (returns prefixed keys when key_prefix provided)
 
     def acc_fn(rng_key, params):
-        # @scan_tqdm(ii, desc='Evaluating', leave=False)
-        def pred(rng_key, data_idx):
-            x_batch = x.at[data_idx].get()
-            att_m_batch = attention_mask.at[data_idx].get()
-            y_batch = target.at[data_idx].get()
+        rng_key, out = _eval_core(rng_key, params, n_samples)
+        # out: (n_samples, n_valid, output_dim)
 
-            rng_key, key_ = random.split(rng_key)
-            t_tree = get_t(key_)  # shape (n_samples,)
-            # keys = random.split(key_, n_samples)
-            
-            def single_pred(key, t):
-                # t is either scalar or tree of shape ()
-                key, subkey = random.split(key)
-                loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=subkey)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
-                return key, (loss*batch_size, out)
-            
-            rng_key, (loss, out) = jax.lax.scan(single_pred, rng_key, t_tree)
-            return rng_key, (loss, out)  # loss shape (n_samples), out shape (n_samples, batch_size, output_dim)
-
-        rng_key, (loss, out) = jax.lax.scan(pred, rng_key, idx_) # loss shape (n_batches, n_samples), out shape (n_batches, n_samples, batch_size, output_dim)
-
-        # shape (n_data, output_dim)
-        # compute loss of last irregular batch
-        if len(idx_last) > 0:
-            rng_key, (loss_last, out_last) = pred(rng_key, idx_last)
-            loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-            # jax.debug.print(f"out_last shape: {out_last.shape}")
-            out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
-        else:
-            out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
-
-        loss = loss.transpose(1,0)
         bma_metrics = post_pred_performance(out, target, key_prefix=key_prefix + "bma_", num_bins=num_bins_ece)
 
-        # # compute the expected calibration error (ECE)
-        ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
-        # acc = jax.vmap(lambda logits, labels: jnp.mean(jnp.argmax(logits, axis=-1) == labels), in_axes=(0, None))(out, target)  # shape (n_samples,)
-        acc = jnp.argmax(out, axis=-1) == target # shape (n_samples, n_data)
+        ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # (n_samples,)
+        acc = jnp.argmax(out, axis=-1) == target  # (n_samples, n_valid)
+
+        # Recompute NLL from returned logits — avoids accumulating a separate
+        # loss tensor through the padded scan, eliminating shape mismatches.
+        log_probs = jax.nn.log_softmax(out, axis=-1)  # (n_samples, n_valid, n_classes)
+        loss = -jnp.sum(log_probs * jax.nn.one_hot(target, out.shape[-1]), axis=-1)  # (n_samples, n_valid)
 
         if average:
             ece = jnp.mean(ece)
-            loss = loss.sum() / (n_samples * x.shape[0])
-            acc = acc.sum() / (n_samples * x.shape[0])
+            loss = loss.mean()
+            acc = acc.sum() / (n_samples * n_valid)
         else:
-            loss = jnp.sum(loss, axis=1) / x.shape[0]
-            acc = jnp.sum(acc, axis=1) / x.shape[0]
+            loss = jnp.mean(loss, axis=1)   # (n_samples,) — mean NLL per t-sample
+            acc = jnp.sum(acc, axis=1) / n_valid
 
-        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece, **bma_metrics}, out  # mean over epochs
+        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece, **bma_metrics}, out
     return acc_fn
 
 
@@ -1355,16 +1392,17 @@ def _setup_t_sample_fn(s_model, curve_sampling_mode):
         num_curve_leaves = len(jax.tree.leaves(only_curves))
         struct = jax.tree.structure(only_curves)
 
-        def t_sample_fn(key):
+        def t_sample_fn_v1(key):
             t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=t_max)
             t_tree = jax.tree.unflatten(struct, t_flatt)
             t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree,
                                    is_leaf=lambda x: x is None)
             return t_tree
+        return t_sample_fn_v1
     else:
-        t_sample_fn = lambda key: random.uniform(key, (1,), minval=0., maxval=t_max)
-    return t_sample_fn
-
+        def t_sample_fn_v2(key):
+            return random.uniform(key, (1,), minval=0., maxval=t_max)
+        return t_sample_fn_v2
 
 def _setup_validation(s_model, data: 'DataSplits', batch_size_eval, k):
     """Set up validation metrics function and best-parameter tracking.
@@ -1895,8 +1933,8 @@ if __name__ == '__main__':
             'train_hyper': {
                 'batch_size': args.batch_size,
                 'num_epochs': -1,             # -1 means use num_steps instead
-                'num_steps': 10 if args.smoke_test else 5_000,
-                'eval_every_n_batch': 20,
+                'num_steps': 10 if args.smoke_test else 10_000,
+                'eval_every_n_batch': 50,
                 'temperature': [1.0],
                 'dataset_sampling': {'minibatch': {}},
                 # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
@@ -1932,12 +1970,12 @@ if __name__ == '__main__':
                     'r': 8,
                     'lora_dtype': 'float32',
                     'lora_alpha': 16.0,
-                    'lora_mode': 'A(t)B(t)',
+                    'lora_mode': 'A(t)eB(t)',
                     # 'lora_mode': 'Arotsd(t)eB',
                     # 'lora_mode': 'Arot(t)sdeBrot(t)',
-                    'rho_scheduler_frequency': 100.,
-                    'lora_rho': .25,
-                    'lora_rho_s': .5,
+                    'rho_scheduler_frequency': 50.,
+                    'lora_rho': .5,
+                    'lora_rho_s': .0,
                     'filter_masks': [
                         {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
                         {'keys': ["self_attn", "v_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -1953,15 +1991,15 @@ if __name__ == '__main__':
                     'learning_rate': {
                         'name': "linear_onecycle_schedule",
                         'kwargs': {
-                            'transition_steps': 5_000,
-                            'peak_value': 4e-4,
+                            'transition_steps': 10_000,
+                            'peak_value': 2e-4,
                             'pct_start': 0.12,
                             'pct_final': 1.,
                             'div_factor': 300.0,
                             'final_div_factor': 300.0,
                         },
                     },
-                    'weight_decay': 0.0,
+                    'weight_decay': 0.001,
                 },
                 'freeze_other_params': True,
                 # SGD alternative:

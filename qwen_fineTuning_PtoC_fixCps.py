@@ -77,9 +77,9 @@ class DataSplits:
 def _empty_val_metric():
     """Sentinel validation metrics used when no validation data is available."""
     return ({
-        'val_loss': jnp.array(jnp.inf, dtype=jnp.float32),
-        'val_acc': jnp.array(-jnp.inf, dtype=jnp.float32),
-        'val_ece': jnp.array(jnp.inf, dtype=jnp.float32),
+        'val_mean_loss': jnp.array(jnp.inf, dtype=jnp.float32),
+        'val_mean_acc': jnp.array(-jnp.inf, dtype=jnp.float32),
+        'val_mean_ece': jnp.array(jnp.inf, dtype=jnp.float32),
         'val_bma_ll': jnp.array(-jnp.inf, dtype=jnp.float32),
         'val_bma_acc': jnp.array(-jnp.inf, dtype=jnp.float32),
         'val_bma_ece': jnp.array(jnp.inf, dtype=jnp.float32),
@@ -660,7 +660,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             loss = jnp.mean(loss, axis=1)   # (n_samples,) — mean NLL per t-sample
             acc = jnp.sum(acc, axis=1) / n_valid
 
-        return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece, **bma_metrics}, out
+        return {key_prefix + 'mean_loss': loss, key_prefix + 'mean_acc': acc, key_prefix + 'mean_ece': ece, **bma_metrics}, out
     return acc_fn
 
 
@@ -850,7 +850,9 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     t_sample_fn = env.t_sample_fn
     k = config.model_params.k
     batch_size_eval = config.train_hyper.batch_size_eval
-    temperature = config.train_hyper.temperature
+    # temperature = config.train_hyper.temperature
+    print(f"currently temperature is not used in evaluation ")
+    temperature = jnp.array([1.0])
     smoke_test = config.train_hyper.smoke_test
     curve_sampling_mode = config.model_params.curve_sampling_mode
     t_max = getattr(s_model, 't_max', 1.0)
@@ -871,48 +873,91 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
         test_ids, test_mask, test_labels = data.get('test')
         print("Evaluating test set (k=0)")
         _, logits = _logits(test_ids, test_mask, test_labels,
-                            n_samples=n_samples, key_prefix='final_')
+                            n_samples=1, key_prefix='test_')
         pp = post_pred_performance(logits, test_labels)
         logger.summary.update({
-            f'{logger_prefix}final_{mk}': v for mk, v in pp.items()})
-        return {}
+            f'{logger_prefix}test_{mk}': v for mk, v in pp.items()})
+        return {'test_logits': logits}
+
+    art_logits = None
+    if config.train_hyper.save_params:
+        art_logits = wandb.Artifact(name="logits", type="npz")
 
     # ---- k > 0: curve evaluation ----
     t_space = jnp.linspace(0, t_max, n_samples)
     best_weight = False          # stays False → uniform BMA
     weights_all = None
+    log_like = jnp.zeros(n_samples)  # placeholder for uniform case (log_like not used when best_weight is False)
 
-    if curve_sampling_mode == 'combined':
+    if curve_sampling_mode.startswith('combined') and "noBMA" not in curve_sampling_mode:
+        ds_for_posterior = curve_sampling_mode.split('_')[-1]
         # -- Compute BMA weights on train set --
-        if data.has_train:
+        if data.has_train and ((ds_for_posterior == 'train') or (ds_for_posterior == 'all')):
             print("Computing posterior weights on train set")
             train_ids, train_mask, train_labels = data.get('train')
             train_metrics, train_logits = _logits(
                 train_ids, train_mask, train_labels,
-                n_samples=n_samples, key_prefix='f_train_')
+                n_samples=n_samples, key_prefix='train_ppd_')
 
             train_pp = post_pred_performance(train_logits, train_labels)
             logger.summary.update({
-                f'{logger_prefix}f_train_{mk}': v
+                f'{logger_prefix}train_ppd_uniform_{mk}': v
                 for mk, v in train_pp.items()})
 
             # Plot train curve
             fig = _plot_curve_along_t(
-                t_space, train_metrics['f_train_loss'],
-                train_metrics['f_train_acc'], train_metrics['f_train_ece'],
-                title='Final trainset')
+                t_space, train_metrics['train_ppd_mean_loss'],
+                train_metrics['train_ppd_mean_acc'], train_metrics['train_ppd_mean_ece'],
+                title='Curve @ Train')
             logger.log({'Curve Predictive Train': wandb.Image(fig)})
             plt.close(fig)
 
-            # Posterior weights
-            log_like = -train_metrics['f_train_loss']
+            if art_logits is not None:
+                # Save train logits artifact
+                jnp.savez(f'tmp_files/{logger.id}_train_logits.npz',
+                            logits=train_logits, labels=train_labels)
+                art_logits.add_file(f'tmp_files/{logger.id}_train_logits.npz')
+                print("Saved train logits artifact")
+            
+            # unnormalised posterior weights (important use sum instead of mean for normalisation (logsumexp) to get correct weights for different n_samples (with mean, we would imply temperature scaling of the likelihood which is not intended would be log(p(D|\theta)^{1/N}))) 
+            log_like += -train_metrics['train_ppd_mean_loss'] * train_logits.shape[1]  # un-average NLL (#samples,)
+
+        if data.has_val and ((ds_for_posterior != 'val') or (ds_for_posterior == 'all')):
+            print("Computing posterior weights on validation set")
+            val_ids, val_mask, val_labels = data.get('val')
+            val_metrics, val_logits = _logits(
+                val_ids, val_mask, val_labels,
+                n_samples=n_samples, key_prefix='val_ppd_')
+
+            val_pp = post_pred_performance(val_logits, val_labels)
+            logger.summary.update({
+                f'{logger_prefix}val_ppd_uniform_{mk}': v
+                for mk, v in val_pp.items()})
+            # Plot val curve
+            fig = _plot_curve_along_t(
+                t_space, val_metrics['val_ppd_mean_loss'],
+                val_metrics['val_ppd_mean_acc'], val_metrics['val_ppd_mean_ece'],
+                title='Curve @ Validation')
+            logger.log({'Curve Predictive Val': wandb.Image(fig)})
+            plt.close(fig)
+            
+            if art_logits is not None:
+                # Save val logits artifact
+                jnp.savez(f'tmp_files/{logger.id}_val_logits.npz',
+                            logits=val_logits, labels=val_labels)
+                art_logits.add_file(f'tmp_files/{logger.id}_val_logits.npz')
+                print("Saved val logits artifact")
+
+            log_like += -val_metrics['val_ppd_mean_loss'] * val_logits.shape[1]  # un-average NLL
+
+        if not jnp.allclose(log_like, 0.0):
             weights_all = _compute_posterior_weights(log_like, temperature)
 
             # Save weights artifact
             art_w = wandb.Artifact(name="bma_weights", type="npz")
             jnp.savez(f'tmp_files/{logger.id}_weights.npz',
-                      weights=weights_all, t_space=t_space,
-                      log_like=log_like, temperature=temperature)
+                        weights=weights_all, t_space=t_space,
+                        log_like=log_like, temperature=temperature)
             art_w.add_file(f'tmp_files/{logger.id}_weights.npz')
             logger.log_artifact(art_w)
             print("Saved posterior weights artifact")
@@ -929,32 +974,35 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
                     break
             else:
                 raise RuntimeError("No weights file found in artifact")
+        else:
+            raise RuntimeError(f"No log-likelihood computed for posterior weights — check that train/val or all is set in combinateion with combined sampling mode. Current mode: {curve_sampling_mode} with selected {ds_for_posterior} for posterior weights")
 
-        # -- Optimise temperature on val set --
-        if weights_all is not None and data.has_val:
-            val_ids, val_mask, val_labels = data.get('val')
-            print("Optimising temperature on validation set")
-            _, val_logits = _logits(
-                val_ids, val_mask, val_labels,
-                n_samples=n_samples, key_prefix='final_valid_')
 
-            best_ll, best_temp = -jnp.inf, None
-            for weight, temp in zip(weights_all, temperature):
-                pp = post_pred_performance(val_logits, val_labels, weight)
-                logger.summary.update({
-                    f'{logger_prefix}final_valid_ppd_t{temp}_{mk}': v
-                    for mk, v in pp.items()})
-                if pp['ll'] > best_ll:
-                    best_ll, best_temp, best_weight = pp['ll'], temp, weight
-            logger.summary.update({
-                f'{logger_prefix}best_val_log_like_temp': best_temp,
-                f'{logger_prefix}best_val_log_like': best_ll,
-            })
-            print(f"Best temperature: {best_temp}")
+        # # -- Optimise temperature on val set --
+        # if weights_all is not None and data.has_val:
+        #     val_ids, val_mask, val_labels = data.get('val')
+        #     print("Optimising temperature on validation set")
+        #     _, val_logits = _logits(
+        #         val_ids, val_mask, val_labels,
+        #         n_samples=n_samples, key_prefix='final_valid_')
+
+        #     best_ll, best_temp = -jnp.inf, None
+        #     for weight, temp in zip(weights_all, temperature):
+        #         pp = post_pred_performance(val_logits, val_labels, weight)
+        #         logger.summary.update({
+        #             f'{logger_prefix}final_valid_ppd_t{temp}_{mk}': v
+        #             for mk, v in pp.items()})
+        #         if pp['ll'] > best_ll:
+        #             best_ll, best_temp, best_weight = pp['ll'], temp, weight
+        #     logger.summary.update({
+        #         f'{logger_prefix}best_val_log_like_temp': best_temp,
+        #         f'{logger_prefix}best_val_log_like': best_ll,
+        #     })
+        #     print(f"Best temperature: {best_temp}")
 
     # -- Compute test logits (once) --
     use_linspace = (curve_sampling_mode != 'per_leave')
-    key_prefix = 'final_' if use_linspace else 'approx_'
+    key_prefix = 'test_ppd_'
     print(f"Evaluating test set ({'linspace' if use_linspace else 't_sample'}, "
           f"{n_samples} samples)")
     test_ids, test_mask, test_labels = data.get('test')
@@ -963,12 +1011,22 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
         n_samples=n_samples, use_linspace=use_linspace,
         key_prefix=key_prefix)
 
+    if art_logits is not None:
+        # Save test logits artifact
+        jnp.savez(f'tmp_files/{logger.id}_test_logits.npz',
+                    logits=test_logits, labels=test_labels)
+        art_logits.add_file(f'tmp_files/{logger.id}_test_logits.npz')
+        logger.log_artifact(art_logits)
+        print("Saved test logits artifact")
+        logger.log_artifact(art_w)
+        print("Saved logits to wandb artifact")
+
     # -- Plot test performance along curve (not per_leave) --
     if use_linspace:
         fig = _plot_curve_along_t(
-            t_space, test_metrics[key_prefix + 'loss'],
-            test_metrics[key_prefix + 'acc'],
-            test_metrics[key_prefix + 'ece'],
+            t_space, test_metrics[key_prefix + 'mean_loss'],
+            test_metrics[key_prefix + 'mean_acc'],
+            test_metrics[key_prefix + 'mean_ece'],
             title='Final testset')
         logger.log({'Curve Predictive': wandb.Image(fig)})
         plt.close(fig)
@@ -977,51 +1035,53 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     # Always log uniform-BMA test metrics
     pp = post_pred_performance(test_logits, test_labels)
     logger.summary.update({
-        f'{logger_prefix}{key_prefix}{mk}': v for mk, v in pp.items()})
-
-    # Weighted metrics (combined mode with posterior weights)
-    if curve_sampling_mode == 'combined' and weights_all is not None:
-        if isinstance(best_weight, jnp.ndarray):
-            # Best temperature was found on val — use it
-            pp_w = post_pred_performance(test_logits, test_labels, best_weight)
-            logger.summary.update({
-                f'{logger_prefix}post_pred_test_ppd_{mk}': v
-                for mk, v in pp_w.items()})
-            mi = mutual_information(
-                test_logits.astype(jnp.float32), weights=best_weight)
-            me = mean_entropy(
-                test_logits.astype(jnp.float32), weights=best_weight)
-            logger.summary.update({
-                f'{logger_prefix}test_mutual_information_ppd': mi,
-                f'{logger_prefix}test_mean_entropy_ppd': me,
-            })
-        else:
-            # No val set — report per temperature
-            for weight, temp in zip(weights_all, temperature):
-                pp_w = post_pred_performance(
-                    test_logits, test_labels, weight)
-                logger.summary.update({
-                    f'{logger_prefix}post_pred_test_ppd_t{temp}_{mk}': v
-                    for mk, v in pp_w.items()})
-                mi = mutual_information(
-                    test_logits.astype(jnp.float32), weights=weight)
-                me = mean_entropy(
-                    test_logits.astype(jnp.float32), weights=weight)
-                logger.summary.update({
-                    f'{logger_prefix}test_mutual_information_ppd_t{temp}': mi,
-                    f'{logger_prefix}test_mean_entropy_ppd_t{temp}': me,
-                })
-
+        f'{logger_prefix}{key_prefix}uniform_{mk}': v for mk, v in pp.items()})
+    
     # Uncertainty metrics (always for k > 0)
     mi = mutual_information(test_logits.astype(jnp.float32))
     me = mean_entropy(test_logits.astype(jnp.float32))
     entrop = entropy(test_logits.astype(jnp.float32))
     logger.summary.update({
-        f'{logger_prefix}test_mutual_information': mi,
-        f'{logger_prefix}test_mean_entropy': me,
-        f'{logger_prefix}std_entropy_along_curve': entrop.mean(-1).std(),
-        f'{logger_prefix}mean_entropy_along_curve': entrop.mean(),
+        f'{logger_prefix}{key_prefix}uniform_mutual_information': mi,
+        f'{logger_prefix}{key_prefix}uniform_mean_entropy': me,
+        f'{logger_prefix}{key_prefix}uniform_std_entropy_along_curve': entrop.mean(-1).std(),
+        f'{logger_prefix}{key_prefix}uniform_mean_entropy_along_curve': entrop.mean(),
     })
+
+    # Weighted metrics (combined mode with posterior weights)
+    if curve_sampling_mode.startswith('combined') and weights_all is not None:
+        best_weight = weights_all[0]  # if temperature is used, this will be the best temp weight; if not, it's the uniform weight (same as False) so no harm done
+
+        # if isinstance(best_weight, jnp.ndarray):
+        # Best temperature was found on val — use it
+        pp_w = post_pred_performance(test_logits, test_labels, best_weight)
+        logger.summary.update({
+            f'{logger_prefix}{key_prefix}{mk}': v
+            for mk, v in pp_w.items()})
+        mi = mutual_information(
+            test_logits.astype(jnp.float32), weights=best_weight)
+        me = mean_entropy(
+            test_logits.astype(jnp.float32), weights=best_weight)
+        logger.summary.update({
+            f'{logger_prefix}{key_prefix}weighted_mutual_information': mi,
+            f'{logger_prefix}{key_prefix}weighted_mean_entropy': me,
+        })
+        # else:
+        #     # No val set — report per temperature
+        #     for weight, temp in zip(weights_all, temperature):
+        #         pp_w = post_pred_performance(
+        #             test_logits, test_labels, weight)
+        #         logger.summary.update({
+        #             f'{logger_prefix}post_pred_test_ppd_t{temp}_{mk}': v
+        #             for mk, v in pp_w.items()})
+        #         mi = mutual_information(
+        #             test_logits.astype(jnp.float32), weights=weight)
+        #         me = mean_entropy(
+        #             test_logits.astype(jnp.float32), weights=weight)
+        #         logger.summary.update({
+        #             f'{logger_prefix}test_mutual_information_ppd_t{temp}': mi,
+        #             f'{logger_prefix}test_mean_entropy_ppd_t{temp}': me,
+        #         })
 
     return {}
 
@@ -1178,6 +1238,9 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
             metrics['val_bma_ll'] > best_val_ll, lambda x: get_best_params(params), lambda x: best_params, None)
         best_val_ll = jnp.maximum(best_val_ll, metrics['val_bma_ll'])
 
+        # drop mean metrics
+        metrics = {k: v for k, v in metrics.items() if not k.startswith('val_mean')}
+
         if k > 0:
             cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
             upper_length = _bezier_upper_bound(cp)
@@ -1228,8 +1291,8 @@ def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
 
         # train on batches
         carry, metrics = jax.lax.scan(train_batch_fn, carry, shuffel_idx)
-        val_loss_ = _inf_mean(metrics['val_loss'])
-        val_acc_ = _inf_mean(metrics['val_acc'])
+        val_loss_ = _inf_mean(metrics['val_mean_loss'])
+        val_acc_ = _inf_mean(metrics['val_mean_acc'])
         jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}",
                         epoch + 1, num_epochs, metrics['loss'][-1], val_loss_, val_acc_)
         return carry, metrics
@@ -1723,6 +1786,7 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
     cp_fix = config.model_params.cp_fix  # save original before context
 
     train_params = []
+    de_logits = []
     print("Pretraining fixed control points")
 
     with config.as_pretrain() as pt_config:
@@ -1735,13 +1799,14 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
                     rng_key, env, params, data, pt_config, logger,
                     f'cp_fixed_{i}_')
 
-                run_evaluation(
+                test_logits = run_evaluation(
                     rng_key=rng_key, env=env, params=params,
                     data=data, config=pt_config,
                     logger=logger, logger_prefix=f'cp_fixed_{i}_')
 
                 train_params.append(
                     env.s_model.only_trainable_params(params['params']))
+                de_logits.append(test_logits['test_logits'])
 
                 # Free params before re-allocating for the next CP so both
                 # copies never exist in memory simultaneously.
@@ -1750,6 +1815,11 @@ def _pretrain_fixed_cps(rng_key, config: 'Config', data, logger, artifact):
                 params = _init_subspace_params(pt_config, env.s_model, init_key)
             else:
                 train_params.append(False)
+    # print DE performance of pretrained CPs
+    df_logits = jnp.concat(de_logits, axis=0)
+    metrics = post_pred_performance(df_logits, data.test_labels, key_prefix='DE_')
+    logger.summary.update(metrics)
+
 
     if config.train_hyper.save_params:
         print("Save pretrained trainable params ...")
@@ -1960,7 +2030,7 @@ if __name__ == '__main__':
             # All parameters that determine *what* the subspace model is.
             'model_params': {
                 'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
-                'curve_sampling_mode': 'combined',  # 'per_leave' | 'combined' | 'combined_noBMA'
+                'curve_sampling_mode': 'combined_all',  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 'subspace_model': 'lora_category',
                 'jitter_multiplier': 0.,      # weight-init noise scale
                 'natural_parameterization': False,
@@ -2110,6 +2180,6 @@ if __name__ == '__main__':
     #         'freeze_other_params': True,
     #     },
     # }
-        logger = wandb.init(project="qwen_PtoC", name="test_more degree", entity="ddold", config=config)
+        logger = wandb.init(project="qwen_PtoC_seg", name="test_more degree", entity="ddold", config=config)
         train(logger, config)
 

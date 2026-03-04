@@ -17,7 +17,7 @@ from transformers.models.qwen2.modeling_qwen2 import rotate_half as torch_rotate
 # Import our JAX implementation
 from src.qwen_jax import (
     RMSNorm, RotaryEmbedding, apply_rotary_emb, rotate_half, repeat_kv,
-    QwenMLP, QwenAttention, QwenDecoderLayer, QwenModel, QwenForCausalLM,
+    QwenMLP, QwenAttention, QwenDecoderLayer, QwenForCausalLM,
     create_qwen_config_from_pytorch
 )
 
@@ -305,6 +305,61 @@ def test_apply_rotary_pos_emb():
     
     return q_diff < 1e-5 and k_diff < 1e-5
 
+
+def test_compute_posterior_weights():
+    """Test _compute_posterior_weights behaviour."""
+    print("\n=== Testing _compute_posterior_weights ===")
+
+    # Local import to avoid top-level dependency ordering
+    from qwen_fineTuning_PtoC_fixCps import _compute_posterior_weights
+
+    # Simple log-likelihoods and temperatures
+    log_like = jnp.array([0.0, 1.0, 2.0])
+    temperatures = [1.0, 0.5, 10.0]
+
+    weights = _compute_posterior_weights(log_like, temperatures)
+    weights_np = np.array(weights)
+
+    # Shape: (len(temperatures), n_samples)
+    expected_shape = (len(temperatures), log_like.shape[0])
+    print(f"Weights shape: {weights_np.shape}, expected: {expected_shape}")
+    if weights_np.shape != expected_shape:
+        print("Shape mismatch")
+        return False
+
+    # Each row should sum to ~1 (softmax over samples)
+    row_sums = weights_np.sum(axis=-1)
+    print(f"Row sums: {row_sums}")
+    if not np.allclose(row_sums, 1.0, atol=1e-6):
+        print("Rows do not sum to 1")
+        return False
+
+    # All weights must be non-negative
+    if (weights_np < 0).any():
+        print("Negative weights found")
+        return False
+
+    # Low temperature => more concentrated on max log-likelihood
+    max_idx = int(jnp.argmax(log_like))
+    low_temp_idx = 1  # temperature 0.5
+    concentrated_on_max = int(np.argmax(weights_np[low_temp_idx])) == max_idx
+
+    # High temperature => closer to uniform distribution
+    high_temp_idx = 2  # temperature 10.0
+    uniform_approx = np.allclose(weights_np[high_temp_idx],
+                                 np.ones_like(weights_np[high_temp_idx]) / weights_np.shape[1],
+                                 atol=5e-2)
+
+    print(f"Concentrated on max at low temp: {concentrated_on_max}")
+    print(f"High-temp approx uniform: {uniform_approx}")
+
+    # Pytest-style assertions
+    assert weights_np.shape == expected_shape
+    assert np.allclose(row_sums, 1.0, atol=1e-6)
+    assert np.all(weights_np >= 0)
+    assert concentrated_on_max
+    assert uniform_approx
+
 def test_mlp(pytorch_model):
     """Test MLP equivalence"""
     print("\n=== Testing MLP ===")
@@ -526,6 +581,7 @@ def run_all_tests():
     results['rotate_half'] = test_rotate_half()
     results['repeat_kv'] = test_repeat_kv()
     results['apply_rotary_pos_emb'] = test_apply_rotary_pos_emb()
+    results['posterior_weights'] = test_compute_posterior_weights()
     results['simple_forward'] = test_simple_forward()
     
     # Load PyTorch model for component tests

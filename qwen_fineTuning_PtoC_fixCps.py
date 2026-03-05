@@ -36,6 +36,8 @@ from functools import partial
 
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
+# Central project prefix for artifacts/datasets
+WANDB_PATH = "ddold/qwen_PtoC_seg"
 # import sys
 # sys.setrecursionlimit(200)
 
@@ -389,7 +391,7 @@ class Config:
     rng_seed: int = 1
     load_params_path: str | bool = False
     data: dict = field(default_factory=lambda: {
-        'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+        'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
         'val_percentage': 0.1,
     })
     net_kwargs: dict = field(default_factory=lambda: {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"})
@@ -1291,8 +1293,8 @@ def _make_train_epoch_fn(env: 'TrainingEnv', config: 'Config', *,
 
         # train on batches
         carry, metrics = jax.lax.scan(train_batch_fn, carry, shuffel_idx)
-        val_loss_ = _inf_mean(metrics['val_mean_loss'])
-        val_acc_ = _inf_mean(metrics['val_mean_acc'])
+        val_loss_ = _inf_mean(metrics['val_bma_ll'])
+        val_acc_ = _inf_mean(metrics['val_bma_acc'])
         jax.debug.print("Epoch {}/{}: Loss: {}, Val Loss: {}, Val Acc: {}",
                         epoch + 1, num_epochs, metrics['loss'][-1], val_loss_, val_acc_)
         return carry, metrics
@@ -1995,22 +1997,22 @@ if __name__ == '__main__':
         config = {
             # --- Run / experiment --------------------------------------------------
             'rng_seed': 1,
-            # 'load_params_path': "ddold/qwen_PtoC/47xexal3",
+            # 'load_params_path': WANDB_PATH + "/47xexal3",
             'load_params_path': False,
 
             # --- Data --------------------------------------------------------------
             'data': {
-                'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
-                # 'dataset_path': "ddold/qwen_PtoC/ARC-Easy_dataset:v0",
-                # 'dataset_path': "ddold/qwen_PtoC/MMLU_chem_dataset:v0",
-                # 'dataset_path': "ddold/qwen_PtoC/obqa_dataset:v0",
+                'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
+                # 'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
+                # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
+                # 'dataset_path': WANDB_PATH + "/obqa_dataset:v0",
                 'val_percentage': 0.1,
             },
 
             # --- Base model (QwenTextClassificationWrapper) ------------------------
             # 'target_token_ids' is injected automatically after dataset load
             'net_kwargs': {'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"},
-            # 'net_kwargs': {'model_path': "ddold/qwen_PtoC/qwen2.5_7B_bfloat16:v0"},
+            # 'net_kwargs': {'model_path': WANDB_PATH + "/qwen2.5_7B_bfloat16:v0"},
 
             # --- Training hyperparameters → TrainHyperparams ----------------------
             # These control *how* training runs, not *what* is built.
@@ -2100,7 +2102,7 @@ if __name__ == '__main__':
 
     #     # --- Data --------------------------------------------------------------
     #     'data': {
-    #         'dataset_path': "ddold/qwen_PtoC/winogrande_m_dataset:v0",
+    #         'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
     #         'val_percentage': 0.1,
     #     },
 
@@ -2180,6 +2182,6 @@ if __name__ == '__main__':
     #         'freeze_other_params': True,
     #     },
     # }
-        logger = wandb.init(project="qwen_PtoC_seg", name="test_more degree", entity="ddold", config=config)
+        logger = wandb.init(project=WANDB_PATH.split('/')[-1], name="test_more degree", entity=WANDB_PATH.split('/')[0], config=config)
         train(logger, config)
 

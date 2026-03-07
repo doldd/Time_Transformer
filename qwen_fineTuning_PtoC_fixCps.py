@@ -1020,8 +1020,6 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
         art_logits.add_file(f'tmp_files/{logger.id}_test_logits.npz')
         logger.log_artifact(art_logits)
         print("Saved test logits artifact")
-        logger.log_artifact(art_w)
-        print("Saved logits to wandb artifact")
 
     # -- Plot test performance along curve (not per_leave) --
     if use_linspace:

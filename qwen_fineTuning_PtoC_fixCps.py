@@ -1858,9 +1858,10 @@ def _train_full_curve(rng_key, config: 'Config', data, train_params, logger, art
     print("Training curve model")
     if np.sum(cp_fix) == 0:
         print("No fixed control points, training full curve with all control points free.")
-        if config.model_params.curve_segment:
-            assert config.model_params.indepent_connected is True, (
-                "Set indepentend connected to True in curve segment mode with no fixed control points")
+        if config.model_params.curve_segment and config.model_params.indepent_connected is False:
+            logging.warning("Curve segment mode enabled with no fixed control points and independent_connected is False. => shared control points gets double amount of gradient steps. Consider setting independent_connected to True to allow segments to move independently.")
+            # assert config.model_params.indepent_connected is True, (
+            #     "Set indepentend connected to True in curve segment mode with no fixed control points")
 
     # Setup training environment — k is derived from config.model_params.k.
     # Passes train_params so params are initialised and the optimizer is built
@@ -2036,7 +2037,7 @@ if __name__ == '__main__':
                 'natural_parameterization': False,
                 'weight_decay': 0.,
                 'curve_parameterization': 'bezier',
-                'curve_segment': 3,           # int → segmented degree; False → full curve
+                'curve_segment': False,           # int → segmented degree; False → full curve
                 'indepent_connected': False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,
@@ -2076,7 +2077,7 @@ if __name__ == '__main__':
                         'name': "linear_onecycle_schedule",
                         'kwargs': {
                             'transition_steps': 10_000,
-                            'peak_value': 2e-4,
+                            'peak_value': 1e-4,
                             'pct_start': 0.12,
                             'pct_final': 1.,
                             'div_factor': 300.0,
@@ -2180,6 +2181,6 @@ if __name__ == '__main__':
     #         'freeze_other_params': True,
     #     },
     # }
-        logger = wandb.init(project=WANDB_PATH.split('/')[-1], name="test_more degree", entity=WANDB_PATH.split('/')[0], config=config)
+        logger = wandb.init(project=WANDB_PATH.split('/')[-1], name="test noPretrain curve old", entity=WANDB_PATH.split('/')[0], config=config)
         train(logger, config)
 

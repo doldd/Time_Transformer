@@ -1,6 +1,6 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Lora Bezier pretrain + Segment
-description: "Test with fixed control points and bezier segments (non smooth traversion from one to next segment (Approach 2 (easy)). E.g. [1,0,0,1,0,0,1] with two independent segments. "
+name: Lora Bezier pretrain + Segment (1) Linear Modeconnect
+description: "Test Linear Mode connection with fixed control points and bezier segments (non smooth traversion from one to next segment (Approach 2 (easy)). E.g. [1,0,1,0,1] with two independent segments."
 method: grid
 metric:
   goal: maximize
@@ -48,8 +48,9 @@ parameters:
     parameters:
       cp_fix:
         values:
-          - [1, 0, 0, 1, 0, 0, 1,]
-          - [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
+          - [1, 1, 1,]
+          # - [1, 0, 0, 1, 0, 0, 1,]
+          # - [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
       curve_sampling_mode:
         values: ["combined_all"]
       subspace_model:
@@ -66,7 +67,7 @@ parameters:
       curve_parameterization:
         value: "bezier"
       curve_segment:
-        value: 3
+        value: 1
       indepent_connected:
         value: False
       gravity:

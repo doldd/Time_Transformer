@@ -1,6 +1,6 @@
 program: qwen_fineTuning_PtoC_fixCps.py
-name: Wino_n test Open Curve + Segment (3)
-description: "Test (only winograde_m) Curve connection with all open cp's and bezier segments (non smooth traversion from one to next segment (Approach 2 (easy)). E.g. [1,0,1,0,1] with two independent segments."
+name: Wino_n test Open Curve + No Segment (0)
+description: "Test (only winograde_m) orig curve connection with all open cp's (smooth traversion)"
 method: grid
 metric:
   goal: maximize
@@ -48,8 +48,13 @@ parameters:
     parameters:
       cp_fix:
         values:
-          - [0, 0, 0, 0, 0, 0, 0]
-          - [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+          # - [0, 0, 0,]
+          # - [0, 0, 0, 0, 0,]
+          # - [0, 0, 0, 0, 0, 0, 0, 0,]
+          - [0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, ]
+          - [0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0 ]
+          - 
+          # - [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
           # - [1, 0, 0, 1, 0, 0, 1,]
           # - [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
       curve_sampling_mode:
@@ -66,9 +71,9 @@ parameters:
       weight_decay:
         value: 0.0
       curve_parameterization:
-        value: "bezier"
+        values: ["bezier",]
       curve_segment:
-        value: 3
+        value: False
       indepent_connected:
         value: False
       gravity:
@@ -95,7 +100,8 @@ parameters:
           lora_alpha:
             value: 16.0
           lora_mode:
-            values: ["A(t)eB(t)", "Asd(t)eB",]
+            # values: ["A(t)eB(t)", "Asd(t)eB", "A(t)eB"]
+            values: ["A(t)eB(t)",]
           lora_rho:
             values: [0.25,]
           lora_rho_s:

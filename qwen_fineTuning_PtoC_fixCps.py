@@ -18,7 +18,13 @@ import matplotlib.pyplot as plt
 from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
-from src.utils import calibration_error as ece_fn, post_pred_performance
+from src.utils import (
+    calibration_error as ece_fn, post_pred_performance,
+    bezier_length, lower_bound,
+    upper_bound, bezier_mass_center,
+    bezier_gyration, bezier_mean_curvature,
+    bezier_rel_center
+)
 
 # Project imports
 from src.qwen_jax import QwenTextClassificationWrapper
@@ -712,70 +718,8 @@ def entropy(logits):
 
 
 # ---------------------------------------------------------------------------
-# Curve geometry helpers (pure functions used by the training loop)
+# Plotting helpers
 # ---------------------------------------------------------------------------
-
-def _bezier_length(cp):
-    """Compute arc length of a Bézier curve defined by control points *cp*."""
-    k = cp.shape[0] - 1
-    t = jnp.linspace(0, 1, 1000)
-    bezier_coeff_inv = bezier_coeff_fn(k)
-    coeff = jax.vmap(bezier_coeff_inv)(t)
-    cp_diff = cp[1:] - cp[:-1]
-
-    def _d_length_t(cp_diff, c):
-        d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * k)
-        return cp_diff, d_t
-
-    _, d_t = jax.lax.scan(_d_length_t, cp_diff, coeff)
-    return jax.scipy.integrate.trapezoid(d_t, t)
-
-
-def _bezier_lower_bound(cp):
-    """Chord length between first and last control point."""
-    return jnp.linalg.norm(cp[-1] - cp[0])
-
-
-def _bezier_upper_bound(cp):
-    """Sum of segment lengths of the control polygon."""
-    return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
-
-
-def _bezier_mass_center(cp):
-    """Norm of the mass centre of control points."""
-    return jnp.linalg.norm(cp.mean(axis=0))
-
-
-def _bezier_gyration(cp):
-    """Mean distance of control points from their centre of mass."""
-    mc = cp.mean(0)
-    return jnp.linalg.norm(cp - mc, axis=1).mean()
-
-
-def _bezier_mean_curvature(cp):
-    """Integrated mean curvature of the Bézier curve defined by *cp*."""
-    tt = jnp.linspace(0, 1, 10)
-    _, d_bezier = bezier_curve(cp.shape[0], cp)
-
-    def _single(t):
-        grad_ = d_bezier(t)
-        second_dev = jax.jacrev(d_bezier)(t).squeeze()
-        norm_r_prime_sq = jnp.dot(grad_, grad_)
-        norm_r_double_prime_sq = jnp.dot(second_dev, second_dev)
-        dot_r_prime_double_prime = jnp.dot(grad_, second_dev)
-        numerator = jnp.sqrt(
-            norm_r_prime_sq * norm_r_double_prime_sq - dot_r_prime_double_prime**2)
-        denominator = norm_r_prime_sq ** (3 / 2)
-        return numerator / denominator
-
-    curvature = jax.vmap(_single)(tt)
-    return jax.scipy.integrate.trapezoid(curvature, tt)
-
-
-def _bezier_rel_center(cp, initial_center):
-    """Distance of the current mass centre from *initial_center*."""
-    return jnp.linalg.norm(cp.mean(axis=0) - initial_center)
-
 
 def _plot_curve_along_t(t_space, loss, acc, ece, title='Curve Predictive',
                         loss_label='test_ll', acc_label='test acc',
@@ -1243,11 +1187,11 @@ def _make_train_batch_fn(env: 'TrainingEnv', config: 'Config', *,
 
         if k > 0:
             cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, k)
-            upper_length = _bezier_upper_bound(cp)
-            lower_length = _bezier_lower_bound(cp)
-            mean_center = _bezier_mass_center(cp)
-            gyration_radius = _bezier_gyration(cp)
-            rel_center = _bezier_rel_center(cp, initial_cp_center)
+            upper_length = upper_bound(cp)
+            lower_length = lower_bound(cp)
+            mean_center = bezier_mass_center(cp)
+            gyration_radius = bezier_gyration(cp)
+            rel_center = bezier_rel_center(cp, initial_cp_center)
 
             return (rng_key, params, opt_state, best_val_ll, best_params, update_idx + 1, initial_cp_center), \
                 {'loss': loss, 'current_lr': current_lr, 'upper_length': upper_length,
@@ -1684,7 +1628,7 @@ def run_training(rng_key, env, params, data, config: 'Config', logger, logger_pr
 
     if s_model.k > 0:
         cp = masked_pytree_to_matrix(params['params'], s_model.curve_mask, s_model.k)
-        length = _bezier_length(cp)
+        length = bezier_length(cp)
         logger.summary.update({'Curve length': length})
 
     return rng_key, params, last_trainable_params

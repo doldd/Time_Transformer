@@ -13,6 +13,7 @@ from flax.core import unfreeze
 # import arviz as az
 
 __all__ = ['bezier_length', 'lower_bound', 'upper_bound',
+           'bezier_mass_center', 'bezier_gyration', 'bezier_mean_curvature', 'bezier_rel_center',
            'plot_subspace', 'get_cp_w', 'get_data',
            'init_model', 'load_checkpoint_new', 'load_fn']
 
@@ -77,47 +78,68 @@ def set_size(width=textwidth, fraction=1, subplots=(1, 1)):
     return (fig_width_in, fig_height_in)
 
 
-def bezier_length(control_points):
-    # Number of dimensions
-    dims = control_points.shape[1]
-    n = len(control_points) - 1  # Degree of the Bezier curve
-    # Calculate factorial terms for the Bernstein basis (n choose i)
-    # def factorial(n):
-    #     if n == 0:
-    #         return 1
-    #     else:
-    #         return n * factorial(n - 1)
+def bezier_length(cp):
+    """Compute arc length of a Bézier curve defined by control points *cp*."""
+    from src.subspace_curve import bezier_coeff_fn
+    k = cp.shape[0] - 1
+    t = jnp.linspace(0, 1, 1000)
+    bezier_coeff_inv = bezier_coeff_fn(k)
+    coeff = jax.vmap(bezier_coeff_inv)(t)
+    cp_diff = cp[1:] - cp[:-1]
 
-    # def binom(n, k):
-    #     return factorial(n) / (factorial(k) * factorial(n - k))
+    def _d_length_t(cp_diff, c):
+        d_t = jnp.linalg.norm(jnp.einsum('j,j...->...', c, cp_diff) * k)
+        return cp_diff, d_t
 
-    # Calculate the Bernstein basis polynomials
-    def bernstein_basis(i, n, t):
-        return binom(n, i) * (t**i) * ((1 - t)**(n - i))
-    # Calculate the derivative of the Bezier curve at a given t
-
-    def bezier_derivative(t):
-        derivative = np.zeros(dims)
-        for i in range(n):
-            for k in range(dims):
-                derivative[k] += (n * (control_points[i+1][k] - control_points[i][k]) *
-                                  bernstein_basis(i, n - 1, t))
-        return np.linalg.norm(derivative)
-
-    # Compute the length of the Bezier curve as an integral
-    length, error = quad(bezier_derivative, 0, 1)
-    return length, error
+    _, d_t = jax.lax.scan(_d_length_t, cp_diff, coeff)
+    return jax.scipy.integrate.trapezoid(d_t, t)
 
 
-def lower_bound(control_points):
-    return np.linalg.norm(control_points[..., 0, :] - control_points[..., -1, :], axis=-1)
+def lower_bound(cp):
+    """Chord length between first and last control point."""
+    return jnp.linalg.norm(cp[-1] - cp[0])
 
 
-def upper_bound(control_points):
-    n_points = control_points.shape[-2]
-    pair_wise_length = [np.linalg.norm(
-        control_points[..., i, :] - control_points[..., i+1, :], axis=-1) for i in range(n_points-1)]
-    return np.sum(pair_wise_length, axis=0)
+def upper_bound(cp):
+    """Sum of segment lengths of the control polygon."""
+    return jnp.linalg.norm(jnp.diff(cp, axis=0), axis=1).sum()
+
+
+def bezier_mass_center(cp):
+    """Norm of the mass centre of control points."""
+    return jnp.linalg.norm(cp.mean(axis=0))
+
+
+def bezier_gyration(cp):
+    """Mean distance of control points from their centre of mass."""
+    mc = cp.mean(0)
+    return jnp.linalg.norm(cp - mc, axis=1).mean()
+
+
+def bezier_mean_curvature(cp):
+    """Integrated mean curvature of the Bézier curve defined by *cp*."""
+    from src.subspace_curve import bezier_curve
+    tt = jnp.linspace(0, 1, 10)
+    _, d_bezier = bezier_curve(cp.shape[0], cp)
+
+    def _single(t):
+        grad_ = d_bezier(t)
+        second_dev = jax.jacrev(d_bezier)(t).squeeze()
+        norm_r_prime_sq = jnp.dot(grad_, grad_)
+        norm_r_double_prime_sq = jnp.dot(second_dev, second_dev)
+        dot_r_prime_double_prime = jnp.dot(grad_, second_dev)
+        numerator = jnp.sqrt(
+            norm_r_prime_sq * norm_r_double_prime_sq - dot_r_prime_double_prime**2)
+        denominator = norm_r_prime_sq ** (3 / 2)
+        return numerator / denominator
+
+    curvature = jax.vmap(_single)(tt)
+    return jax.scipy.integrate.trapezoid(curvature, tt)
+
+
+def bezier_rel_center(cp, initial_center):
+    """Distance of the current mass centre from *initial_center*."""
+    return jnp.linalg.norm(cp.mean(axis=0) - initial_center)
 
 
 def plot_subspace(X, Y, Z, t0=None, t_bend=None, t2=None, aspect_equal=True, linear_color=False,

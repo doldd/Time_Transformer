@@ -9,13 +9,19 @@ This file captures actionable build/lint/test commands and repository convention
 Commands
 --------
 - Install (recommended): `poetry install` (uses `pyproject.toml`). If you don't use Poetry, create a venv and `pip install -r requirements.txt` if available.
-- Run training (example from `.github/copilot-instructions.md`):
+-- Run training (example):
 
   ```bash
+  # Activate the project's conda env first
   conda activate jaxTorchTrans
-  JAX_COMPILATION_CACHE_DIR="jax_cache" CUDA_VISIBLE_DEVICES="2" \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
-    python qwen_fineTuning_PtoC_fixCps.py --batch-size=4 --cp-fix 0 0 0
+
+  # Example training invocation (canonical for this project):
+  JAX_COMPILATION_CACHE_DIR="jax_cache" \
+    CUDA_VISIBLE_DEVICES="2" \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
+    python qwen_fineTuning_PtoC_fixCps.py \
+      --batch-size=4 --cp-fix 1 0 1 0 1 --smoke-test
   ```
 
 - Run all tests: `poetry run pytest` or `pytest` in an activated env.
@@ -39,6 +45,22 @@ Quick developer tips
 - Use `poetry run <cmd>` to ensure commands run inside the project's environment.
 - When running code that compiles with JAX, set XLA/JAX env vars used by training scripts (see `.github/copilot-instructions.md`).
 - Tests sometimes require GPU/JAX-capable environment for heavy code; many unit tests avoid device-heavy operations.
+
+Canonical run & hardware notes
+-----------------------------
+- Hardware: experiments target an NVIDIA A100 cluster (4 GPUs available). Training runs use a single GPU — the team typically sets `CUDA_VISIBLE_DEVICES="2"` to select the device.
+- Canonical experiment command (use this when reproducing runs):
+
+  ```bash
+  conda activate jaxTorchTrans
+  JAX_COMPILATION_CACHE_DIR="jax_cache" \
+    CUDA_VISIBLE_DEVICES="2" \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
+    python qwen_fineTuning_PtoC_fixCps.py --batch-size=4 --cp-fix 1 0 1 0 1 --smoke-test
+  ```
+
+  - Data: training datasets and saved artifacts are managed via Weights & Biases (wandb); use the project's save/load helpers to fetch datasets/params from wandb.
 
 Code Style Guidelines (for agents)
 ---------------------------------

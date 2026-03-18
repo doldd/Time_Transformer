@@ -18,7 +18,7 @@ from flax.core import freeze, unfreeze
 
 from jax_tqdm import scan_tqdm
 from tqdm import tqdm
-from src.utils import calibration_error as ece_fn
+from src.utils import calibration_error as ece_fn, post_pred_performance
 from copy import deepcopy
 from numpyro import distributions as dist
 
@@ -138,98 +138,19 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
 
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
-
-# def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
-#     if t_sample_fn is None:
-#         if use_linspace:
-#             get_t = lambda key: jnp.linspace(0, 1., n_samples)
-#         else:
-#             get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=1.)
-#     else:
-#         if use_linspace:
-#             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
-#         def tree_per_sample_fn(key):
-#             keys = jax.random.split(key, n_samples)
-#             return [t_sample_fn(k) for k in keys]
-#         get_t = tree_per_sample_fn
-#     ii = len(x) // batch_size
-    
-#     x_ = x[:(matching_limit:=(x.shape[0] // batch_size) * batch_size)]  # drop non matching batch size
-#     x_last = x[matching_limit:]
-#     x_ = es('(ib)...->ib...', x_, b=batch_size)
-
-#     att_m_ = attention_mask[:matching_limit]  # drop non matching batch size
-#     att_last = attention_mask[matching_limit:]
-#     att_m_ = es('(ib)...->ib...', att_m_, b=batch_size)
-
-#     y_all = target[:matching_limit]  # drop non matching batch size
-#     y_last = target[matching_limit:]
-#     y_ = es('(ib)...->ib...', y_all, b=batch_size)
-
-#     def acc_fn(rng_key, params):
-#         # @scan_tqdm(ii, desc='Evaluating', leave=False)
-#         def pred(key, data):
-#             x_batch, atten_batch, y_batch = data
-#             # # turn off leading padding tokens in batch for faster evaluation
-#             # x_batch = x_batch[:, (max_seqlen:=jnp.argmax(atten_batch, axis=1).min()):]
-#             # atten_batch = atten_batch[:, max_seqlen:]
-
-#             # @jax.jit
-#             def eval(t):
-#                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, atten_batch), y_batch, train=False)  # params, batch_stats, t, x ; out shape (batch_size, output_dim)
-#                 acc = jnp.sum(jnp.argmax(out, axis=-1) == y_batch)
-#                 return loss*batch_size, acc, out  # sum over batch
-#                 # return loss*batch_size, acc  # sum over batch
-            
-#             key, subkey = random.split(key)
-
-#             # draw samples to approximate curve performance
-#             t = get_t(subkey)
-#             loss, acc, out = jax.lax.map(eval, t) # out shape (draws, batch_size, output_dim)
-#             # loss, acc = jax.vmap(eval)(t) # out shape (draws, batch_size, output_dim)
-
-#             if average:
-#                 # mean over samples
-#                 return key, (jnp.sum(loss), jnp.sum(acc), out)
-#             else:
-#                 return key, (loss, acc, out)  # no mean over samples
-
-#         # shape (n_data, draws, output_dim)
-#         rng_key, (loss, acc, out) = jax.lax.scan(pred, rng_key, (x_, att_m_, y_)) # out shape (len(loader), draws, batch_size, output_dim)
-#         # compute loss of last irregular batch
-#         if len(x_last) > 0:
-#             rng_key, (loss_last, acc_last, out_last) = pred(rng_key, (x_last, att_last, y_last))
-#             loss = jnp.concatenate([loss, loss_last[jnp.newaxis, ...]], axis=0)
-#             acc = jnp.concatenate([acc, acc_last[jnp.newaxis, ...]], axis=0)
-#             out = jnp.concatenate([out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1]), out_last], axis=1)  # (n_samples, n_data, output_dim)
-#         else:
-#             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
-
-#         # # compute the expected calibration error (ECE)
-#         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
-
-#         if average:
-#             ece = jnp.mean(ece)
-#             loss = loss.sum() / (n_samples * x.shape[0])
-#             acc = acc.sum() / (n_samples * x.shape[0])
-#         else:
-#             loss = jnp.sum(loss, axis=0) / x.shape[0]
-#             acc = jnp.sum(acc, axis=0) / x.shape[0]
-
-#         return {key_prefix + 'loss': loss, key_prefix + 'acc': acc, key_prefix + 'ece': ece}, out  # mean over epochs
-#     return acc_fn
-
-def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None):
+def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_linspace=False, average=True, key_prefix='', num_bins_ece=15, t_sample_fn=None, t_max=None):
+    if t_max is None:
+        t_max = getattr(model, 't_max', 1.0)
     if t_sample_fn is None:
         if use_linspace:
-            get_t = lambda key: jnp.linspace(0, 1., n_samples)
+            get_t = lambda key: jnp.linspace(0, t_max, n_samples)
         else:
-            get_t = lambda key: jax.random.uniform(key, (n_samples,), minval=0., maxval=1.)
+            get_t = lambda key: random.uniform(key, (n_samples,), minval=0., maxval=t_max)
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
         # get_t = partial(t_sample_fn, n_samples=n_samples)
-        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(jax.random.split(k, n_samples))
+        get_t = lambda k: jax.vmap(lambda key: t_sample_fn(key))(random.split(k, n_samples))
     ii = len(x) // batch_size
     
     idx = jnp.arange(len(x))
@@ -249,14 +170,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
     # y_last = target[matching_limit:]
     # y_ = es('(ib)...->ib...', y_all, b=batch_size)
 
-    def post_pred_performance(logits, labels):
-        # logits shape (n_samples, n_data, n_classes)
-        post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
-        post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
-        post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
-        return {f'{key_prefix}bma_ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
-                f'{key_prefix}bma_acc': post_acc,
-                f'{key_prefix}bma_ece': post_ece}
+    # Use shared post_pred_performance from src.utils (returns prefixed keys when key_prefix provided)
 
     def acc_fn(rng_key, params):
         # @scan_tqdm(ii, desc='Evaluating', leave=False)
@@ -265,13 +179,13 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             att_m_batch = attention_mask.at[data_idx].get()
             y_batch = target.at[data_idx].get()
 
-            rng_key, key_ = jax.random.split(rng_key)
+            rng_key, key_ = random.split(rng_key)
             t_tree = get_t(key_)  # shape (n_samples,)
-            # keys = jax.random.split(key_, n_samples)
+            # keys = random.split(key_, n_samples)
             
             def single_pred(key, t):
                 # t is either scalar or tree of shape ()
-                key, subkey = jax.random.split(key)
+                key, subkey = random.split(key)
                 loss, _, out = model.nll(params['params'], {}, t, (x_batch, att_m_batch), y_batch, train=False, key=subkey)  # params, batch_stats, t, x ; out shape (batch_size, output_dim) # no Flat-Lora sampling
                 return key, (loss*batch_size, out)
             
@@ -291,7 +205,7 @@ def setup_metrics(model, batch_size, x, attention_mask, target, n_samples, use_l
             out = out.transpose(1, 0, 2, 3).reshape(n_samples, -1, out.shape[-1])  # (n_samples, n_data, output_dim)
 
         loss = loss.transpose(1,0)
-        bma_metrics = post_pred_performance(out, target)
+        bma_metrics = post_pred_performance(out, target, key_prefix=key_prefix + "bma_", num_bins=num_bins_ece)
 
         # # compute the expected calibration error (ECE)
         ece = jax.vmap(ece_fn, in_axes=(0, None, None))(out, target, num_bins_ece)  # mean over samples
@@ -343,14 +257,14 @@ def mutual_information(logits, weights:np.ndarray|bool=False):
     Returns:
         mi: float mutual information averaged over each data point
     """
-    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
-    if use_weigts:
+    if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
     else:
         avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
     entropy_pred = -jnp.sum(avg_probs * jnp.log(avg_probs + 1e-12), axis=-1)  # (n_data,)
-    if use_weigts:
+    if use_weights:
         expected_nentropy = jnp.sum(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1) * weights[:, None], axis=0)  # (n_data,)
     else:
         expected_nentropy = jnp.mean(-jnp.sum(probs * jnp.log(probs + 1e-12), axis=-1), axis=0)  # (n_data,)
@@ -365,9 +279,9 @@ def mean_entropy(logits, weights:np.ndarray|bool=False):
     Returns:
         entropy: float predictive entropy averaged over each data point
     """
-    use_weigts = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
+    use_weights = True if isinstance(weights, jnp.ndarray) or isinstance(weights, np.ndarray) else False
     probs = jax.nn.softmax(logits, axis=-1)  # (n_samples, n_data, n_classes)
-    if use_weigts:
+    if use_weights:
         avg_probs = jnp.sum(probs * weights[:, None, None], axis=0)  # (n_data, n_classes)
     else:
         avg_probs = jnp.mean(probs, axis=0)  # (n_data, n_classes)
@@ -453,8 +367,13 @@ def train(logger, config):
                          dataset_sampling: dict = None,
                          val_percentage: float = 0.0,
                          curve_parameterization = 'bezier',
+                         curve_segment: int | bool = False,
+                         indepent_connected: bool = False,
                          curve_sampling_mode: str = 'combined', # 'combined', 'per_leave'
                          logger_prefix: str = '',
+                         _cached_s_model=None,
+                         _cached_optimizer=None,
+                         _cached_scan_jit=None,
                          ):
         # Note: jitter parameter is unused but kept for interface compatibility
         rng_key, init_key = random.split(rng_key)
@@ -471,7 +390,7 @@ def train(logger, config):
             print(f"Setting num_steps to {num_steps} to match {num_epochs} epochs")
 
             # Split data (simple train/val split) # we dont use validate data
-            n_train = int(np.ceil((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
+            n_train = int(np.floor((1.-val_percentage)*len(input_ids) / batch_size) * batch_size)
             train_input_ids = input_ids[perm_idx][:n_train]
             train_attention_mask = attention_mask[perm_idx][:n_train]
             train_labels = labels[perm_idx][:n_train]
@@ -551,6 +470,8 @@ def train(logger, config):
                                                                    natural_parameterization=natural_parameterization,
                                                                    mutuable_param_name=False,
                                                                    curve_parameterization=curve_parameterization,
+                                                                   curve_segment=curve_segment,
+                                                                   indepent_connected=indepent_connected,
                                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer,
                                                                    entropy_weight=entropy_maxim,)
                 else:
@@ -561,6 +482,8 @@ def train(logger, config):
                                                             natural_parameterization=natural_parameterization,
                                                             mutuable_param_name=False,
                                                             curve_parameterization=curve_parameterization,
+                                                            curve_segment=curve_segment,
+                                                            indepent_connected=indepent_connected,
                                                             gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 if entropy_maxim > 0.0:
@@ -571,6 +494,8 @@ def train(logger, config):
                                                       natural_parameterization=natural_parameterization,
                                                       mutuable_param_name=False,
                                                       curve_parameterization=curve_parameterization,
+                                                      curve_segment=curve_segment,
+                                                      indepent_connected=indepent_connected,
                                                       entropy_weight=entropy_maxim,
                                                       )
                 else:
@@ -581,6 +506,8 @@ def train(logger, config):
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
+                                                   curve_segment=curve_segment,
+                                                   indepent_connected=indepent_connected,
                                                    )
         else:
             if regularizer:
@@ -589,17 +516,24 @@ def train(logger, config):
                                                    natural_parameterization=natural_parameterization,
                                                    mutuable_param_name=False,
                                                    curve_parameterization=curve_parameterization,
+                                                   curve_segment=curve_segment,
+                                                   indepent_connected=indepent_connected,
                                                    gravity=gravity, energy_weakening=energy_weakening, regularizer=regularizer)
             else:
                 s_model = CategorySubspace(model=model, k=k, weight_decay=weight_decay, 
                                            perm_spec=perm_spec,
                                            natural_parameterization=natural_parameterization,
                                            curve_parameterization=curve_parameterization,
+                                           curve_segment=curve_segment,
+                                           indepent_connected=indepent_connected,
                                            mutuable_param_name=False)
 
+        # Reuse cached s_model to avoid JAX retrace on each CP pretraining iteration
+        if _cached_s_model is not None:
+            s_model = _cached_s_model
 
         # initialize curve parameter with pretrained point parameter
-        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*jax.random.normal(key, p.shape, dtype=p.dtype))
+        params = s_model.init_params_from_point(init_key, params, curve_mask, noise_fn=lambda p, key: p+jitter_multiplier*random.normal(key, p.shape, dtype=p.dtype))
 
         # set train mask according to config
         # Only update mask for LoRA-capable subspaces
@@ -621,6 +555,7 @@ def train(logger, config):
                         return p
                     params['params'] = jax.tree.map(map_fn, s_model.curve_mask, params['params'], p)
 
+        t_max = getattr(s_model, 't_max', 1.0)
         if curve_sampling_mode == 'per_leave':
             print("Using per-leave curve sampling")
             # num_leaves_parameter = len(jax.tree.leaves(s_model.curve_mask))
@@ -635,13 +570,13 @@ def train(logger, config):
             struct = jax.tree.structure(only_curves)
 
             def t_sample_fn(key):
-                t_flatt = jax.random.uniform(key, (num_curve_leaves,), minval=0., maxval=1.)
+                t_flatt = random.uniform(key, (num_curve_leaves,), minval=0., maxval=t_max)
                 t_tree = jax.tree.unflatten(struct, t_flatt)
                 t_tree = jax.tree.map(lambda k: False if k is None else k, t_tree, is_leaf=lambda x: x is None) # clean None leaves to False for propper tree.map
                 return t_tree
         else:
             def t_sample_fn(key):
-                return random.uniform(key, (1,), minval=0., maxval=1.)
+                return random.uniform(key, (1,), minval=0., maxval=t_max)
 
 
         artifact_weights_use = False
@@ -834,6 +769,9 @@ def train(logger, config):
         # if "freeze_non_curve_params" in optimizer_conf and optimizer_conf["freeze_non_curve_params"]:
         #     opt_chain_list.append(optax.masked(optax.set_to_zero(), jax.tree.map(lambda x:not x, mask)))
         optimizer = optax.chain(*opt_chain_list)
+        # Reuse cached optimizer to avoid JAX retrace (static_argnums=(0,7) on train_step)
+        if _cached_optimizer is not None:
+            optimizer = _cached_optimizer
 
         only_train_params = s_model.only_trainable_params(params['params'])
         n_params = sum(p.size for p in jax.tree.flatten(only_train_params)[0])
@@ -1007,7 +945,7 @@ def train(logger, config):
         def train_epoch(carry, epoch):
             rng_key = carry[0]
             rng_key, subkey = random.split(rng_key)
-            shuffel_idx = jax.random.permutation(subkey, train_labels.shape[0])
+            shuffel_idx = random.permutation(subkey, train_labels.shape[0])
             shuffel_idx = es('(ib)->ib', shuffel_idx, b=batch_size)
             # x_ = es('(ib)...->ib...', train_input_ids[shuffel], b=batch_size)
             # x_atten_mask = es('(ib)...->ib...', train_attention_mask[shuffel], b=batch_size)
@@ -1049,7 +987,7 @@ def train(logger, config):
                 # get batch from data
                 pos = jnp.round(t*x_all.shape[0]).squeeze().astype(int)
                 rng_key, subkey = random.split(rng_key)
-                idx = jax.random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
+                idx = random.choice(subkey, window_size, shape=(batch_size,), replace=False) + pos - window_size//2
                 idx %= x_all.shape[0] # wrap around
                 x_batch = jnp.take(x_all, idx, axis=0, mode='clip')
                 atten_batch = jnp.take(atten_all, idx, axis=0, mode='clip')
@@ -1098,7 +1036,7 @@ def train(logger, config):
             if ds_sampling == 'expert':
                 print(f"Start sorted expert training for {num_steps}")
                 if sort_mode == 'Random':
-                    order = jax.random.permutation(rng_key, train_input_ids.shape[0])
+                    order = random.permutation(rng_key, train_input_ids.shape[0])
                 elif sort_mode:
                     distance = 1 - cosine_sim
                     if sort_mode == 'Hierarchical':
@@ -1137,13 +1075,19 @@ def train(logger, config):
                 train_expert_step = init_train_expert(window_size)
                 # start expert training loop
                 carry = (rng_key, params, opt_state, best_val_ll, best_params, (train_input_ids, train_attention_mask, train_labels))
-                carry, metrics = jax.lax.scan(
-                    train_expert_step, carry, jnp.arange(num_steps))
+                if _cached_scan_jit is None:
+                    @jit
+                    def _cached_scan_jit(carry, xs):
+                        return jax.lax.scan(train_expert_step, carry, xs)
+                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_steps))
             elif ds_sampling == 'minibatch':
                 print(f"Start minibatch training for {num_epochs} epochs")
                 carry = (rng_key, params, opt_state, best_val_ll, best_params, 0) # 0 is used for update counts
-                carry, metrics = jax.lax.scan(
-                    train_epoch, carry, jnp.arange(num_epochs))
+                if _cached_scan_jit is None:
+                    @jit
+                    def _cached_scan_jit(carry, xs):
+                        return jax.lax.scan(train_epoch, carry, xs)
+                carry, metrics = _cached_scan_jit(carry, jnp.arange(num_epochs))
                 window_size = 0  # not used in minibatch training
             else:
                 raise ValueError(f"Unknown dataset_sampling method {ds_sampling} given. Choose either 'expert' or 'minibatch'.")
@@ -1188,26 +1132,11 @@ def train(logger, config):
                 length = bezier_length(cp)
                 logger.summary.update({'Curve length': length})
 
-        #*** compute test metrics with BMA ***#
-        def post_pred_performance(logits, labels, weights:bool|jnp.ndarray=False):
-            # logits shape (n_samples, n_data, n_classes)
-            print(f"weights type {type(weights)} for BMA prediction {type(weights) == bool}")
-            if type(weights) == bool:
-                post_predict_logits = jax.nn.logsumexp(logits, axis=0) - jnp.log(logits.shape[0])  # shape (n_data, n_classes)
-                # post_predict_logits = (logits * weights[:, None, None]).sum(axis=0)  # shape (n_data, n_classes) #false because of log multiply
-            else:
-                print("Using provided weights for BMA prediction")
-                post_predict_logits = jax.nn.logsumexp(logits, b=weights[:, None, None], axis=0)
-            post_acc = jnp.mean(jnp.argmax(post_predict_logits, axis=-1) == labels)
-            post_ece = ece_fn(post_predict_logits, labels, num_bins=15)
-            return {'ll': dist.Categorical(logits=post_predict_logits).log_prob(labels).mean(),
-                           'acc': post_acc,
-                           'ece': post_ece}
- 
+        #*** compute test metrics with BMA using shared implementation in src.utils.post_pred_performance ***#
         # plot likelihood and acc along curve
-        t_space = jnp.linspace(0, 1, 20)
+        t_space = jnp.linspace(0, s_model.t_max, 20)
         if smoke_test or k == 0:
-            t_space = jnp.linspace(0, 1, 3)
+            t_space = jnp.linspace(0, s_model.t_max, 3)
         test_metrics_fn_final = setup_metrics(s_model, max(BATCH_SIZE_EVAL, 1), test_input_ids, test_attention_mask, test_labels, n_samples=len(t_space), use_linspace=True, average=False, key_prefix='final_')
         # valid
         # set lora noise off for evaluation if specified
@@ -1375,32 +1304,48 @@ def train(logger, config):
         #             'post_pred_acc': post_acc,
         #             'post_pred_ece': post_ece,
         #             })
-        return rng_key, s_model, params, last_trainable_params
+        return rng_key, s_model, params, last_trainable_params, optimizer, _cached_scan_jit
 
 
 
     params = None
     cp_fix = config['curve_params'].pop('cp_fix')
+    print(f"Control point fixed list: {cp_fix}")
+    deg_segments = config['curve_params'].get('curve_segment', False)
+    indep_connected = config['curve_params'].get('indepent_connected', False)
 
     # pretrain fixed control points 
     if np.sum(cp_fix) > 0:
         curve_state = ProcessState.PRETRAINING
+        if deg_segments:
+            all_segments_fixed_endpoints = np.all([deg_segments == i for i in np.diff(np.argwhere(np.array(cp_fix) == 1).flatten())])
+            assert all_segments_fixed_endpoints, "In curve segment mode, fixed control points must be consecutive and include endpoints, e.g. [1,0,1,0,1] with deg 2."
         if config.get('lora_params', None) is not None and np.sum(cp_fix) < len(cp_fix):
             assert (config['lora_params']['lora_mode'] == 'A(t)B(t)') or config['lora_params']['lora_mode'] == 'A(t)eB(t)', "Only A(t)B(t) or A(t)eB(t) LoRA mode makes sense for subspace curves with fixed control points" 
         train_params = []
+        _cached_pretrain_model = None
+        _cached_pretrain_optimizer = None
+        _cached_pretrain_scan = None
         print("Pretraining fixed control points")
         for i, fixed in enumerate(cp_fix):
             if fixed:
                 print(f"Training cp member {i}")
                 config['curve_params']['k'] = 0 
+                config['curve_params']['curve_segment'] = False 
 
                 if params is not None:
                     del params  # free memory
-                rng_key, s_model, params, _ = train_curve_inner(
+                rng_key, s_model, params, _, _pretrain_opt, _pretrain_scan = train_curve_inner(
                     rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                     lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                     smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}),
+                    _cached_s_model=_cached_pretrain_model,
+                    _cached_optimizer=_cached_pretrain_optimizer,
+                    _cached_scan_jit=_cached_pretrain_scan,
                     logger_prefix=f'cp_fixed_{i}_')
+                _cached_pretrain_model = s_model      # reuse same instance to avoid JAX retrace
+                _cached_pretrain_optimizer = _pretrain_opt  # reuse same optimizer object
+                _cached_pretrain_scan = _pretrain_scan  # reuse compiled scan (no retrace/recompile)
                 train_params.append(s_model.only_trainable_params(params['params']))
                 rng_key, _ = random.split(rng_key)
             else:
@@ -1414,6 +1359,7 @@ def train(logger, config):
             print("Saved pretrained parameters to tmp_files")
             artifact.add_file(f'tmp_files/{logger.id}_pretrained_params.npy')
     else:
+        # assert config['curve_params'].get('curve_segment', False) is False, "Curve segment mode does not make sense if no control points are fixed. (control points of shared segments would get more gradient upgraded)" 
         train_params = False
     if params is not None:
         del params  # free memory
@@ -1423,11 +1369,16 @@ def train(logger, config):
     if len(cp_fix) > 1:
         print("Training curve model")
         config['curve_params']['k'] = len(cp_fix)-1
+        config['curve_params']['curve_segment'] = deg_segments 
+        if np.sum(cp_fix) == 0:
+            print("No fixed control points, training full curve with all control points free.")
+            if deg_segments:
+                assert indep_connected == True, "In curve segment mode with no fixed control points, curve optimzation only makes sense if all segments are independently connected (e.g. each segment doesn't optimize its last cp) to avoid optimization issues with shared control points between segments."
         if len(cp_fix) == np.sum(cp_fix): # all control points are fixed e.g. [1,1] but we check linear mode connection
             curve_state = ProcessState.CURVE_EVAL
         else:
             curve_state = ProcessState.CURVE_FITTING
-        rng_key, s_model, params, last_trainable_params = train_curve_inner(
+        rng_key, s_model, params, last_trainable_params, _, _ = train_curve_inner(
                 rng_key, curve_state, **config['curve_params'], net_kwargs=config['net_kwargs'], 
                 lora_params=config.get('lora_params', None), dataset_path=config['dataset_path'],
                 smoke_test=config.get('smoke_test', False), dataset_sampling=config.get('dataset_sampling', {}), 
@@ -1465,8 +1416,6 @@ if __name__ == '__main__':
     parser.add_argument("--smoke-test", action="store_true", help="Run a quick smoke test with reduced epochs (2) and batch iterations (3).")
 
     args = parser.parse_args()
-    print(f"Fixed control points: {args.cp_fix}")
-
     
     print("Curve training")
     if args.use_sweep:
@@ -1501,7 +1450,7 @@ if __name__ == '__main__':
                             'lora_dtype': 'float32',
                             'lora_alpha': 16.0,
                             # 'lora_mode': 'A(t)B(t)',
-                            'lora_mode': 'Asd(t)eB',
+                            'lora_mode': 'A(t)B(t)',
                             # 'lora_mode': 'Arotsd(t)eB',
                             # 'lora_mode': 'Arot(t)sdeBrot(t)',
                             'lora_rho': .25,
@@ -1535,6 +1484,7 @@ if __name__ == '__main__':
                             'val_percentage' : 0.1,
                             'curve_parameterization': 'bezier',
                             'curve_sampling_mode': 'combined_noBMA', # 'per_leave' or 'combined'
+                            'curve_segment': 2, # if int only train on curve segment of degeree curve_segment between fixed control points, if False train on whole curve
                             # 'curve_sampling_mode': 'per_leave', # 'per_leave' or 'combined'
                             # 'filter_masks':[{'keys': ("self_attn", "q_proj", "kernel"), 'op': 'all'},
                             #                 {'keys': ("self_attn", "v_proj", "kernel"), 'op': 'all'}],

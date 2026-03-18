@@ -34,6 +34,7 @@ jupyter-bokeh = "^4.0.5"
 numpyro = "^0.15.0"
 optax = "^0.2.0"
 jaxopt = "^0.8.5"
+pytest = "^9.0.2"
 
 
 [[tool.poetry.source]]

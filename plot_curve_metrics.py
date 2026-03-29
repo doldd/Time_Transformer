@@ -11,6 +11,35 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def get_figsize(columnwidth=234.8, wf=1.0, hf=(np.sqrt(5) - 1.0) / 2.0):
+    """
+    Returns [fig_width, fig_height] in inches for matplotlib.
+    Default columnwidth is 234.8pt (standard for many IEEE/ACM/ACL journals).
+    """
+    fig_width_pt = columnwidth * wf
+    inches_per_pt = 1.0 / 72.27
+    fig_width = fig_width_pt * inches_per_pt
+    fig_height = fig_width * hf
+    return [fig_width, fig_height]
+
+
+# Configure LaTeX fonts and figure size
+figsize = get_figsize(wf=1.0)
+tex_fonts = {
+    # Use LaTeX to write all text
+    "text.usetex": True,
+    "font.family": "Nimbus Sans",
+    "axes.labelsize": 10,
+    "font.size": 10,
+    "legend.fontsize": 9,
+    "legend.title_fontsize": 10,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "figure.figsize": figsize,
+}
+plt.rcParams.update(tex_fonts)
+
+
 def load_and_compute_metrics(
     project_path="ddold/qwen_PtoC_seg", target_dataset="winogrande_s"
 ):
@@ -79,11 +108,22 @@ def load_and_compute_metrics(
         if cp_fix_str == "None" and n_seg == "None":
             continue
 
+        # --- REFINED GROUPING LOGIC ---
         group_label = f"Fix={cp_fix_str}, Segs={n_seg}, Deg={seg_deg}"
-        if group_label not in data_dict:
-            data_dict[group_label] = {"train": [], "val": [], "test": []}
+        
+        category_label = "Other"
+        if cp_fix is not None:
+            if all(val == 1 for val in cp_fix):
+                category_label = "Linear"
+            elif all(val == 0 for val in cp_fix):
+                category_label = "Open"
+            else:
+                category_label = "Pretrained"
 
-        logger.info("Processing run: %s (%s)", run.name, group_label)
+        if group_label not in data_dict:
+            data_dict[group_label] = {"train": [], "val": [], "test": [], "category": category_label}
+
+        logger.info("Processing run: %s (%s, cat: %s)", run.name, group_label, category_label)
 
         # Find the logits artifact
         artifacts = list(run.logged_artifacts())
@@ -125,7 +165,7 @@ def load_and_compute_metrics(
             acc_list = np.mean(preds == labels[np.newaxis, :], axis=1)
 
             data_dict[group_label][split].append(
-                {"t": t_space, "acc": acc_list, "ll": ll_list}
+                {"t": t_space, "acc": acc_list, "ll": ll_list, "category": category_label}
             )
 
     return data_dict
@@ -259,6 +299,232 @@ def plot_curve_metrics(data_dict, save_path="curve_metrics.png"):
     plt.show()
 
 
+def plot_mean_std_shaded(data_dict, save_path="curve_metrics_mean_std.png"):
+    """
+    Plots Train (left) and Test (right) metrics across t.
+    Re-aggregates groups into Linear, Open, and Pretrained for this plot.
+    Plots mean lines thick and shaded std areas.
+    """
+    # 1. Re-aggregate data by category
+    category_dict = {}
+    for group_label, splits in data_dict.items():
+        cat = splits.get("category", "Other")
+        if cat not in category_dict:
+            category_dict[cat] = {"train": [], "test": []}
+        
+        category_dict[cat]["train"].extend(splits["train"])
+        category_dict[cat]["test"].extend(splits["test"])
+
+    n_cats = len(category_dict)
+    if n_cats == 0:
+        logger.warning("No data to plot.")
+        return
+
+    # Create a subplot grid with 1 row and 2 columns
+    fig, (ax_train, ax_test) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Twin axes for Log-Likelihood
+    ax_train_ll = ax_train.twinx()
+    ax_test_ll = ax_test.twinx()
+
+    # Use a categorical color palette for the categories
+    colors = plt.cm.tab10(np.linspace(0, 1, n_cats))
+
+    for i, (cat_label, splits) in enumerate(category_dict.items()):
+        color = colors[i]
+
+        def plot_split_aggregated(split_name, ax, ax_ll, label_prefix):
+            if not splits[split_name]:
+                return
+            
+            # 1. Collect all unique t values from all runs in this category
+            all_t = np.unique(np.concatenate([run_data["t"] for run_data in splits[split_name]]))
+            
+            # 2. Interpolate each run onto this global t_space and track where it exists
+            acc_interp = []
+            ll_interp = []
+            mask = [] # To track which runs contribute to which t-point
+            
+            for run_data in splits[split_name]:
+                t_run = run_data["t"]
+                acc_run = run_data["acc"]
+                ll_run = run_data["ll"]
+                
+                # Interpolate run data to all_t
+                # Only keep values within the original range of this run
+                acc_val = np.interp(all_t, t_run, acc_run, left=np.nan, right=np.nan)
+                ll_val = np.interp(all_t, t_run, ll_run, left=np.nan, right=np.nan)
+                
+                acc_interp.append(acc_val)
+                ll_interp.append(ll_val)
+                mask.append(np.isfinite(acc_val))
+            
+            # 3. Calculate mean and std ignoring NaNs (where runs don't reach)
+            acc_matrix = np.array(acc_interp)
+            ll_matrix = np.array(ll_interp)
+            
+            avg_acc = np.nanmean(acc_matrix, axis=0)
+            std_acc = np.nanstd(acc_matrix, axis=0)
+            avg_ll = np.nanmean(ll_matrix, axis=0)
+            std_ll = np.nanstd(ll_matrix, axis=0)
+
+            # Accuracy (Solid line)
+            ax.plot(
+                all_t,
+                avg_acc,
+                color=color,
+                linestyle="-",
+                linewidth=2.5,
+                label=f"{label_prefix} (Acc)",
+            )
+            ax.fill_between(
+                all_t,
+                avg_acc - std_acc,
+                avg_acc + std_acc,
+                color=color,
+                alpha=0.15,
+            )
+
+            # Log-Likelihood (Dashed line)
+            ax_ll.plot(
+                all_t,
+                avg_ll,
+                color=color,
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.8,
+                label=f"{label_prefix} (LL)",
+            )
+            ax_ll.fill_between(
+                all_t,
+                avg_ll - std_ll,
+                avg_ll + std_ll,
+                color=color,
+                alpha=0.1,
+            )
+
+        # Plot Train and Test only
+        plot_split_aggregated("train", ax_train, ax_train_ll, cat_label)
+        plot_split_aggregated("test", ax_test, ax_test_ll, cat_label)
+
+    # --- FORMATTING ---
+    for ax, ax_ll, title in zip(
+        [ax_train, ax_test],
+        [ax_train_ll, ax_test_ll],
+        ["Train Metrics", "Test Metrics"],
+    ):
+        ax.set_title(title)
+        ax.set_xlabel("t (Curve Position)")
+        ax.set_ylabel("Accuracy (Solid)")
+        ax_ll.set_ylabel("Log-Likelihood (Dashed)")
+        ax.grid(True, linestyle=":", alpha=0.5)
+
+    # Unitary Legend for both subplots
+    lines, labels = ax_train.get_legend_handles_labels()
+    lines_ll, labels_ll = ax_train_ll.get_legend_handles_labels()
+    fig.legend(
+        lines + lines_ll,
+        labels + labels_ll,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.05),
+        ncol=3,
+        fontsize="x-small",
+    )
+
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    # Save as JPEG for compression as in the original function
+    plt.savefig(
+        save_path + ".jpeg",
+        format="jpeg",
+        dpi=100,
+        bbox_inches="tight",
+        pil_kwargs={"quality": 60},
+    )
+    plt.savefig(save_path + ".pdf", dpi=300)
+    logger.info("Mean/Std plot saved to %s", save_path)
+    plt.show()
+
+
+def plot_only_means(data_dict, save_path="curve_metrics_means_only.png"):
+    """
+    Plots a single row with Train (left) and Test (right) containing only the 
+    mean Log-Likelihood lines.
+    Hue: Category (Linear, Open, Pretrained)
+    Style: Group (Specific Fix Pattern)
+    """
+    n_groups = len(data_dict)
+    if n_groups == 0:
+        return
+
+    # Using the LaTeX-compatible figsize from earlier
+    # Each subplot width: columnwidth*wf*0.5 (roughly)
+    # Total width is figsize[0]*2 as we want a single row of two subplots
+    fig, (ax_train, ax_test) = plt.subplots(1, 2, figsize=(figsize[0] * 2, figsize[1]))
+
+    # Define categories and their colors
+    unique_cats = sorted(list(set(splits.get("category", "Other") for splits in data_dict.values())))
+    cat_colors = dict(zip(unique_cats, plt.cm.Set1(np.linspace(0, 1, len(unique_cats)))))
+    
+    # Define group styles (line styles)
+    line_styles = ["-", "--", "-.", ":"]
+    group_labels = sorted(data_dict.keys())
+    group_to_style = {label: line_styles[i % len(line_styles)] for i, label in enumerate(group_labels)}
+
+    for i, (group_label, splits) in enumerate(data_dict.items()):
+        cat_label = splits.get("category", "Other")
+        color = cat_colors[cat_label]
+        ls = group_to_style[group_label]
+
+        def plot_mean_line(split_name, ax):
+            if not splits[split_name]:
+                return
+            
+            all_t = np.unique(np.concatenate([run_data["t"] for run_data in splits[split_name]]))
+            ll_interp = []
+            
+            for run_data in splits[split_name]:
+                t_run = run_data["t"]
+                ll_val = np.interp(all_t, t_run, run_data["ll"], left=np.nan, right=np.nan)
+                ll_interp.append(ll_val)
+            
+            avg_ll = np.nanmean(np.array(ll_interp), axis=0)
+
+            ax.plot(
+                all_t, 
+                avg_ll, 
+                color=color, 
+                linestyle=ls, 
+                linewidth=2, 
+                label=f"[{cat_label}] {group_label}"
+            )
+
+        plot_mean_line("train", ax_train)
+        plot_mean_line("test", ax_test)
+
+    for ax, title in zip([ax_train, ax_test], ["Train Log-Likelihood", "Test Log-Likelihood"]):
+        ax.set_title(title)
+        ax.set_xlabel("t")
+        ax.set_ylabel("Log-Likelihood")
+        ax.grid(True, linestyle=":", alpha=0.5)
+        
+    # Single Legend for both subplots
+    handles, labels = ax_train.get_legend_handles_labels()
+    fig.legend(
+        handles, 
+        labels, 
+        loc="upper center", 
+        bbox_to_anchor=(0.5, 0.05), 
+        ncol=2, 
+        fontsize="xx-small"
+    )
+
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    plt.savefig(save_path + ".jpeg", format="jpeg", dpi=100, bbox_inches="tight", pil_kwargs={"quality": 70})
+    plt.savefig(save_path + ".pdf", dpi=300)
+    logger.info("Means-only (LL) plot saved to %s", save_path)
+    plt.show()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -280,5 +546,7 @@ if __name__ == "__main__":
     # 2. Plot
     if data:
         plot_curve_metrics(data, save_path=f"result/{args.dataset}_along_curve")
+        plot_mean_std_shaded(data, save_path=f"result/{args.dataset}_mean_std")
+        plot_only_means(data, save_path=f"result/{args.dataset}_means_only")
     else:
         logger.warning("No valid curve data found to plot.")

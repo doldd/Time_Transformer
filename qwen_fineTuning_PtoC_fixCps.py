@@ -43,7 +43,7 @@ from functools import partial
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # Central project prefix for artifacts/datasets
-WANDB_PATH = "ddold/qwen_PtoC_seg"
+WANDB_PATH = "ddold/qwen_PtoC"
 # import sys
 # sys.setrecursionlimit(200)
 
@@ -110,6 +110,7 @@ class TrainHyperparams:
     smoke_test: bool = False
     dataset_sampling: dict = field(default_factory=lambda: {'minibatch': {}})
     temperature: list = field(default_factory=lambda: [1.0,])
+    n_samples_eval: int = 20
 
     # --- computed properties (not stored; derived from above fields) ------
 
@@ -159,6 +160,7 @@ class TrainHyperparams:
             smoke_test=th.get('smoke_test', False),
             dataset_sampling=dataset_sampling,
             temperature=th.get('temperature', [1.0]),
+            n_samples_eval=th.get('n_samples_eval', 20),
         )
 
 
@@ -802,7 +804,7 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     smoke_test = config.train_hyper.smoke_test
     curve_sampling_mode = config.model_params.curve_sampling_mode
     t_max = getattr(s_model, 't_max', 1.0)
-    n_samples = 3 if (smoke_test or k == 0) else 20
+    n_samples = 3 if (smoke_test or k == 0) else config.train_hyper.n_samples_eval
 
     def _logits(input_ids, attention_mask, labels,
                 n_samples, use_linspace=True, key_prefix=''):
@@ -1946,6 +1948,7 @@ if __name__ == '__main__':
             # --- Data --------------------------------------------------------------
             'data': {
                 'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
+                # 'dataset_path': WANDB_PATH + "/boolq_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/obqa_dataset:v0",
@@ -1981,7 +1984,7 @@ if __name__ == '__main__':
                 'natural_parameterization': False,
                 'weight_decay': 0.,
                 'curve_parameterization': 'bezier',
-                'curve_segment': False,           # int → segmented degree; False → full curve
+                'curve_segment': 2,           # int → segmented degree; False → full curve
                 'indepent_connected': False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,

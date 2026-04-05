@@ -110,7 +110,6 @@ class TrainHyperparams:
     smoke_test: bool = False
     dataset_sampling: dict = field(default_factory=lambda: {'minibatch': {}})
     temperature: list = field(default_factory=lambda: [1.0,])
-    n_samples_eval: int = 20
 
     # --- computed properties (not stored; derived from above fields) ------
 
@@ -160,7 +159,6 @@ class TrainHyperparams:
             smoke_test=th.get('smoke_test', False),
             dataset_sampling=dataset_sampling,
             temperature=th.get('temperature', [1.0]),
-            n_samples_eval=th.get('n_samples_eval', 20),
         )
 
 
@@ -260,11 +258,20 @@ class ModelParams:
     regularizer: str = 'force'
     entropy_weight: float = 0.0
 
+    n_samples_eval: int | str = 20
+
     @classmethod
     def from_config_dict(cls, mp: dict) -> 'ModelParams':
         """Construct from ``config['model_params']`` dict."""
         cp_fix = mp['cp_fix']
         print(f"Control point fixed list: {cp_fix}")
+        n_samples_eval = mp.get('n_samples_eval', 20)
+        if n_samples_eval == 'auto':
+            k = len(cp_fix) - 1
+            n_samples_eval = k * 2 + 1
+        elif isinstance(n_samples_eval, str):
+            n_samples_eval = int(n_samples_eval)
+        
         return cls(
             cp_fix=cp_fix,
             curve_sampling_mode=mp.get('curve_sampling_mode', 'combined'),
@@ -276,6 +283,7 @@ class ModelParams:
             curve_parameterization=mp.get('curve_parameterization', 'bezier'),
             curve_segment=mp.get('curve_segment', False),
             indepent_connected=mp.get('indepent_connected', False),
+            n_samples_eval=n_samples_eval,
             lora_params=LoraParams.from_config_dict(mp['lora_params']) if mp.get('lora_params') else None,
             perm_spec=mp.get('perm_spec', False),
             mutuable_param_name=mp.get('mutuable_param_name', False),
@@ -804,7 +812,7 @@ def run_evaluation(*, rng_key, env: 'TrainingEnv', params,
     smoke_test = config.train_hyper.smoke_test
     curve_sampling_mode = config.model_params.curve_sampling_mode
     t_max = getattr(s_model, 't_max', 1.0)
-    n_samples = 3 if (smoke_test or k == 0) else config.train_hyper.n_samples_eval
+    n_samples = 3 if (smoke_test or k == 0) else config.model_params.n_samples_eval
 
     def _logits(input_ids, attention_mask, labels,
                 n_samples, use_linspace=True, key_prefix=''):
@@ -1941,17 +1949,17 @@ if __name__ == '__main__':
 
         config = {
             # --- Run / experiment --------------------------------------------------
-            'rng_seed': 1,
+            'rng_seed': 2,
             # 'load_params_path': WANDB_PATH + "/47xexal3",
             'load_params_path': False,
 
             # --- Data --------------------------------------------------------------
             'data': {
-                'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
+                # 'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/boolq_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
-                # 'dataset_path': WANDB_PATH + "/obqa_dataset:v0",
+                'dataset_path': WANDB_PATH + "/obqa_dataset:v0",
                 'val_percentage': 0.1,
             },
 
@@ -1966,19 +1974,20 @@ if __name__ == '__main__':
                 'batch_size': args.batch_size,
                 'num_epochs': -1,             # -1 means use num_steps instead
                 'num_steps': 10 if args.smoke_test else 10_000,
-                'eval_every_n_batch': 50,
+                'eval_every_n_batch': 200,
                 'temperature': [1.0],
                 'dataset_sampling': {'minibatch': {}},
                 # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
                 'save_params': True,
                 'smoke_test': args.smoke_test,
+                'n_samples_eval': 10,
             },
 
             # --- Subspace model + LoRA architecture → ModelParams -----------------
             # All parameters that determine *what* the subspace model is.
             'model_params': {
                 'cp_fix': args.cp_fix,        # e.g. [1,0,1]: 1=fixed, 0=trainable CP
-                'curve_sampling_mode': 'combined_all',  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
+                'curve_sampling_mode': 'combined_test',  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 'subspace_model': 'lora_category',
                 'jitter_multiplier': 0.,      # weight-init noise scale
                 'natural_parameterization': False,
@@ -2006,7 +2015,7 @@ if __name__ == '__main__':
                     # 'lora_mode': 'Arotsd(t)eB',
                     # 'lora_mode': 'Arot(t)sdeBrot(t)',
                     'rho_scheduler_frequency': 50.,
-                    'lora_rho': .5,
+                    'lora_rho': .25,
                     'lora_rho_s': .0,
                     'filter_masks': [
                         {'keys': ["self_attn", "q_proj", "kernel"], 'op': 'all', 'dims': [1, 0]},
@@ -2128,6 +2137,6 @@ if __name__ == '__main__':
     #         'freeze_other_params': True,
     #     },
     # }
-        logger = wandb.init(project=WANDB_PATH.split('/')[-1], name="test noPretrain curve old", entity=WANDB_PATH.split('/')[0], config=config)
+        logger = wandb.init(project=WANDB_PATH.split('/')[-1], name="test obqa+cos", entity=WANDB_PATH.split('/')[0], config=config)
         train(logger, config)
 

@@ -315,7 +315,7 @@ class ModelParams:
         elif isinstance(n_samples_eval, str):
             n_samples_eval = int(n_samples_eval)
 
-        return cls(
+        res = cls(
             num_curve_segment=num_curve_segment,
             SegDeg=SegDeg,
             Pretraining=Pretraining,
@@ -338,6 +338,8 @@ class ModelParams:
             regularizer=mp.get("regularizer", "force"),
             entropy_weight=mp.get("entropy_weight", 0.0),
         )
+        print(f"Computed cp_fix: {res.cp_fix}")
+        return res
 
     @property
     def k(self) -> int:
@@ -670,6 +672,9 @@ def load_text_classification_data(dataset_path: str, run=None, test=False):
         target_id = jnp.array(data["target_id"])
         all_target_ids = jnp.array(data["target_ids"])
 
+    print(
+        f"Loaded {'test' if test else 'train'} dataset: input_ids={input_ids.shape}, labels={labels.shape}"
+    )
     return input_ids, attention_mask, labels, target_id, all_target_ids
 
 
@@ -2251,7 +2256,7 @@ def _train_full_curve(rng_key, config: "Config", data, train_params, logger, art
             "No fixed control points, training full curve with all control points free."
         )
         if (
-            config.model_params.curve_segment
+            config.model_params.SegDeg < config.model_params.k
             and config.model_params.indepent_connected is False
         ):
             logging.warning(

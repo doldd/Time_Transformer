@@ -63,7 +63,7 @@ def get_all_datasets():
 
 
 def save_dataset_as_numpy(dataset_name, max_seq_len, model_name="Qwen/Qwen2.5-0.5B", 
-                          batch_size=100, output_dir="datasets", save_wandb_artifact=False, 
+                          batch_size=1, output_dir="datasets", save_wandb_artifact=False, 
                           wandb_project=None):
     """
     Save a single dataset as numpy arrays.
@@ -178,7 +178,7 @@ def save_dataset_as_numpy(dataset_name, max_seq_len, model_name="Qwen/Qwen2.5-0.
                         train_tokens['target_id'], 
                         target_id_batch.detach().cpu().numpy()
                     ), axis=0)
-            
+            print(f"✅ Finished processing training data with shape: {train_tokens['input_ids'].shape}")
             np.savez_compressed(train_file_path, target_ids=dataset.target_ids, **train_tokens)
         
         # Process test data
@@ -213,6 +213,7 @@ def save_dataset_as_numpy(dataset_name, max_seq_len, model_name="Qwen/Qwen2.5-0.
                     ), axis=0)
             
             # Save files
+            print(f"✅ Finished processing test data with shape: {test_tokens['input_ids'].shape}")
             print(f"Saving to {output_path}...")
             np.savez_compressed(test_file_path, target_ids=dataset.target_ids, **test_tokens)
         
@@ -568,7 +569,7 @@ def main():
                 dataset_name=config['name'],
                 model_name="Qwen/Qwen2.5-0.5B",
                 max_seq_len=config['max_seq_len'],
-                batch_size=4,
+                batch_size=1,
                 output_dir=args.dataset_output_dir,
                 save_wandb_artifact=args.upload_to_wandb,
                 wandb_project=args.wandb_project

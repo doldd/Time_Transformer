@@ -1025,6 +1025,9 @@ def run_evaluation(
         )
         pp = post_pred_performance(logits, test_labels)
         logger.summary.update({f"{logger_prefix}test_{mk}": v for mk, v in pp.items()})
+        logger.summary.update(
+            {f"{logger_prefix}test_entropy": entropy(logits.astype(jnp.float32)).mean()}
+        )
         return {"test_logits": logits}
 
     art_logits = None
@@ -2213,8 +2216,21 @@ def _pretrain_fixed_cps(rng_key, config: "Config", data, logger, artifact):
                 train_params.append(False)
     # print DE performance of pretrained CPs
     df_logits = jnp.concat(de_logits, axis=0)
-    metrics = post_pred_performance(df_logits, data.test_labels, key_prefix="DE_")
+    metrics = post_pred_performance(df_logits, data.test_labels, key_prefix="test_DE_")
     logger.summary.update(metrics)
+
+    # Uncertainty metrics for DE
+    mi = mutual_information(df_logits.astype(jnp.float32))
+    me = mean_entropy(df_logits.astype(jnp.float32))
+    entrop = entropy(df_logits.astype(jnp.float32))
+    logger.summary.update(
+        {
+            "test_DE_uniform_mutual_information": mi,
+            "test_DE_uniform_mean_entropy": me,
+            "test_DE_uniform_std_entropy_along_curve": entrop.mean(-1).std(),
+            "test_DE_uniform_mean_entropy_along_curve": entrop.mean(),
+        }
+    )
 
     if config.train_hyper.save_params:
         print("Save pretrained trainable params ...")

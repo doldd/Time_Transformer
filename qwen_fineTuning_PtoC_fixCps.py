@@ -2462,19 +2462,20 @@ if __name__ == "__main__":
                 # 'dataset_sampling': {'expert': {'window_size': 4, 'sort_mode': False}},
                 "save_params": True,
                 "smoke_test": args.smoke_test,
-                "n_samples_eval": 10,
             },
             # --- Subspace model + LoRA architecture → ModelParams -----------------
             # All parameters that determine *what* the subspace model is.
             "model_params": {
-                "cp_fix": args.cp_fix,  # e.g. [1,0,1]: 1=fixed, 0=trainable CP
+                "n_samples_eval": 10,
+                "num_curve_segment": 2,  # int → segmented degree; False → full curve
+                "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
+                "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 "subspace_model": "lora_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
                 "curve_parameterization": "bezier",
-                "curve_segment": 2,  # int → segmented degree; False → full curve
                 "indepent_connected": False,  # True → independently connected segments
                 # 'gravity': 5.0,
                 # 'energy_weakening': 4.,

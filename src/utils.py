@@ -474,10 +474,16 @@ def post_pred_performance(
     # alternative ll computation using Categorical distribution (should be the same)
     # ll = dist.Categorical(logits=post_predict_logits).log_prob(labels).mean()
 
+    # Brier score
+    post_predict_probs = jnp.exp(post_predict_logits)
+    true_probs = jax.nn.one_hot(labels, post_predict_logits.shape[-1])
+    brier = jnp.mean(jnp.sum((post_predict_probs - true_probs) ** 2, axis=-1))
+
     return {
         f"{key_prefix}ll": ll,
         f"{key_prefix}acc": post_acc,
         f"{key_prefix}ece": post_ece,
+        f"{key_prefix}brier": brier,
     }
 
 

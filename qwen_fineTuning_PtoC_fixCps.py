@@ -110,9 +110,11 @@ def _empty_val_metric():
             "val_mean_loss": jnp.array(jnp.inf, dtype=jnp.float32),
             "val_mean_acc": jnp.array(-jnp.inf, dtype=jnp.float32),
             "val_mean_ece": jnp.array(jnp.inf, dtype=jnp.float32),
+            "val_mean_brier": jnp.array(jnp.inf, dtype=jnp.float32),
             "val_bma_ll": jnp.array(-jnp.inf, dtype=jnp.float32),
             "val_bma_acc": jnp.array(-jnp.inf, dtype=jnp.float32),
             "val_bma_ece": jnp.array(jnp.inf, dtype=jnp.float32),
+            "val_bma_brier": jnp.array(jnp.inf, dtype=jnp.float32),
         },
         None,
     )
@@ -811,6 +813,11 @@ def setup_metrics(
         )  # (n_samples,)
         acc = jnp.argmax(out, axis=-1) == target  # (n_samples, n_valid)
 
+        # Brier score (n_samples, n_valid)
+        probs = jax.nn.softmax(out, axis=-1)
+        true_probs = jax.nn.one_hot(target, out.shape[-1])
+        brier = jnp.sum((probs - true_probs) ** 2, axis=-1)
+
         # Recompute NLL from returned logits — avoids accumulating a separate
         # loss tensor through the padded scan, eliminating shape mismatches.
         log_probs = jax.nn.log_softmax(out, axis=-1)  # (n_samples, n_valid, n_classes)
@@ -822,14 +829,17 @@ def setup_metrics(
             ece = jnp.mean(ece)
             loss = loss.mean()
             acc = acc.sum() / (n_samples * n_valid)
+            brier = brier.mean()
         else:
             loss = jnp.mean(loss, axis=1)  # (n_samples,) — mean NLL per t-sample
             acc = jnp.sum(acc, axis=1) / n_valid
+            brier = jnp.mean(brier, axis=1)
 
         return {
             key_prefix + "mean_loss": loss,
             key_prefix + "mean_acc": acc,
             key_prefix + "mean_ece": ece,
+            key_prefix + "mean_brier": brier,
             **bma_metrics,
         }, out
 

@@ -2526,7 +2526,7 @@ if __name__ == "__main__":
             },
             # --- Base model (QwenTextClassificationWrapper) ------------------------
             # 'target_token_ids' is injected automatically after dataset load
-            "net_kwargs": {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"},
+            "net_kwargs": {"model_path": "artifacts/qwen2.5_7B_bfloat16:v0"},
             # 'net_kwargs': {'model_path': WANDB_PATH + "/qwen2.5_7B_bfloat16:v0"},
             # --- Training hyperparameters → TrainHyperparams ----------------------
             # These control *how* training runs, not *what* is built.
@@ -2544,13 +2544,14 @@ if __name__ == "__main__":
             # --- Subspace model + LoRA architecture → ModelParams -----------------
             # All parameters that determine *what* the subspace model is.
             "model_params": {
+                "use_scan": True,  # whether to use flax scan model def
                 "n_samples_eval": 10,
                 "num_curve_segment": 2,  # int → segmented degree; False → full curve
                 "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
-                "subspace_model": "jsd_v2_category",
-                # "subspace_model": "jsd_noise_category",
+                # "subspace_model": "jsd_v2_category",
+                "subspace_model": "jsd_noise_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,

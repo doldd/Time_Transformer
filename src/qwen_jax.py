@@ -332,7 +332,7 @@ class QwenForCausalLM(nn.Module):
                     return out, None
 
             ScannedRematLayer = nn.scan(
-                nn.remat(ScanQwenDecoderLayer, static_argnums=(4,)),
+                ScanQwenDecoderLayer,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
                 length=self.num_hidden_layers,

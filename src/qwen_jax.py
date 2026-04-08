@@ -3,13 +3,11 @@
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from typing import Optional, Any, Tuple
-import math
+import flax.linen as nn
 from flax.core import unfreeze, freeze
-
 import json
 import os
+import functools
 
 
 def rotate_half(x):
@@ -251,6 +249,7 @@ class QwenDecoderLayer(nn.Module):
     attention_dropout: float = 0.0
     rope_theta: float = 10000.0
 
+    @functools.partial(nn.remat, static_argnums=(4,))
     @nn.compact
     def __call__(
         self, hidden_states, attention_mask=None, position_ids=None, train=True

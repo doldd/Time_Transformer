@@ -249,7 +249,7 @@ class QwenDecoderLayer(nn.Module):
     attention_dropout: float = 0.0
     rope_theta: float = 10000.0
 
-    @functools.partial(nn.remat, static_argnums=(4,))
+    # @functools.partial(nn.remat, static_argnums=(4,))
     @nn.compact
     def __call__(
         self, hidden_states, attention_mask=None, position_ids=None, train=True

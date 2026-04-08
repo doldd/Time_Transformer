@@ -1365,6 +1365,127 @@ class JensenShannonMixin:
         )
 
 
+class JensenShannonMixin_v2:
+    def __init__(self, entropy_weight=0.0, target_jsd=0.0, **kwargs):
+        logger.info(
+            "Using Jensen-Shannon Mixin v2 with weight: %s, target_jsd: %s",
+            entropy_weight,
+            target_jsd,
+        )
+        super().__init__(**kwargs)
+        self.entropy_weight = entropy_weight
+        self.target_jsd = target_jsd
+
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+        joind_param = jax.tree.map(
+            lambda x, y, m: x if m else y,
+            params,
+            unfreeze(freezed_params),
+            self.train_mask,
+        )
+
+        # Symmetric NLL on clean data
+        nll1, state, out1 = self.nll(joind_param, state, t, x, y, train=True, key=key)
+        probs_1 = jax.nn.softmax(out1, axis=-1)
+
+        # Fixed offset t2 = (t + t_max/2) % t_max
+        t2 = (t + self.t_max / 2) % self.t_max
+        nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
+        probs_2 = jax.nn.softmax(out2, axis=-1)
+
+        # JSD divergence between probs_1 and probs_2
+        m = 0.5 * (probs_1 + probs_2)
+        kl_1 = jnp.sum(probs_1 * (jnp.log(probs_1 + 1e-8) - jnp.log(m + 1e-8)), axis=-1)
+        kl_2 = jnp.sum(probs_2 * (jnp.log(probs_2 + 1e-8) - jnp.log(m + 1e-8)), axis=-1)
+        jsd = (0.5 * (kl_1 + kl_2)).mean()
+
+        # Margin-based JSD (target_jsd)
+        jsd_loss = jnp.maximum(self.target_jsd - jsd, 0.0)
+
+        loss = 0.5 * (nll1.mean() + nll2.mean()) + self.entropy_weight * jsd_loss
+
+        if self.weight_decay != 0.0:
+            loss = loss + sum(
+                self.l2_loss(w, alpha=self.weight_decay)
+                for w in jax.tree.leaves(params)
+            )
+        return loss.squeeze(), (
+            state,
+            {"nll1": nll1.mean(), "nll2": nll2.mean(), "jsd": jsd},
+        )
+
+
+class JensenShannonNoiseMixin:
+    def __init__(self, entropy_weight=0.0, noise_rate=0.1, vocab_size=151936, **kwargs):
+        logger.info(
+            "Using Jensen-Shannon Noise Mixin with weight: %s, noise_rate: %s, vocab_size: %s",
+            entropy_weight,
+            noise_rate,
+            vocab_size,
+        )
+        super().__init__(**kwargs)
+        self.entropy_weight = entropy_weight
+        self.noise_rate = noise_rate
+        self.vocab_size = vocab_size
+
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+        # x is (input_ids, attention_mask)
+        input_ids, attention_mask = x
+        joind_param = jax.tree.map(
+            lambda x, y, m: x if m else y,
+            params,
+            unfreeze(freezed_params),
+            self.train_mask,
+        )
+
+        # Symmetric NLL on clean data
+        nll1, state, out1 = self.nll(joind_param, state, t, x, y, train=True, key=key)
+
+        t2 = (t + self.t_max / 2) % self.t_max
+        nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
+
+        # Create OOD data (random token replacement with noise_rate)
+        key, noise_key = jax.random.split(key)
+        noise_mask = (
+            jax.random.uniform(noise_key, input_ids.shape) < self.noise_rate
+        ) & (attention_mask > 0)
+        random_tokens = jax.random.randint(
+            noise_key, input_ids.shape, 0, self.vocab_size
+        )
+        x_ood = (
+            jnp.where(noise_mask, random_tokens, input_ids),
+            attention_mask,
+        )
+
+        # JSD on OOD data
+        out_ood1, state = self(joind_param, state, t, x_ood, train=True, key=key)
+        probs_ood1 = jax.nn.softmax(out_ood1, axis=-1)
+
+        out_ood2, state = self(joind_param, state, t2, x_ood, train=True, key=key)
+        probs_ood2 = jax.nn.softmax(out_ood2, axis=-1)
+
+        m_ood = 0.5 * (probs_ood1 + probs_ood2)
+        kl_1 = jnp.sum(
+            probs_ood1 * (jnp.log(probs_ood1 + 1e-8) - jnp.log(m_ood + 1e-8)), axis=-1
+        )
+        kl_2 = jnp.sum(
+            probs_ood2 * (jnp.log(probs_ood2 + 1e-8) - jnp.log(m_ood + 1e-8)), axis=-1
+        )
+        jsd_ood = (0.5 * (kl_1 + kl_2)).mean()
+
+        loss = 0.5 * (nll1.mean() + nll2.mean()) - self.entropy_weight * jsd_ood
+
+        if self.weight_decay != 0.0:
+            loss = loss + sum(
+                self.l2_loss(w, alpha=self.weight_decay)
+                for w in jax.tree.leaves(params)
+            )
+        return loss.squeeze(), (
+            state,
+            {"nll1": nll1.mean(), "nll2": nll2.mean(), "jsd_ood": jsd_ood},
+        )
+
+
 # Define classes:
 @register_subspace_model("repulsive_regression")
 class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):
@@ -2186,6 +2307,18 @@ class LoRAEntropyCategorySubspace(LoRAMixin, EntropyMixin2, CategorySubspace):
 
 @register_subspace_model("lora_jsd_category")
 class LoRAJSDCategorySubspace(LoRAMixin, JensenShannonMixin, CategorySubspace):
+    pass
+
+
+@register_subspace_model("jsd_v2_category")
+class LoRAJSDV2CategorySubspace(LoRAMixin, JensenShannonMixin_v2, CategorySubspace):
+    pass
+
+
+@register_subspace_model("jsd_noise_category")
+class LoRAJSDNoiseCategorySubspace(
+    LoRAMixin, JensenShannonNoiseMixin, CategorySubspace
+):
     pass
 
 

@@ -8,6 +8,7 @@ This file gives concise, actionable build/lint/test commands and repository conv
 1) Safety mandates (READ FIRST)
 --------------------------------
 - **W&B READ-ONLY (MANDATORY):** never delete runs, update attributes, create reports, or write to the remote Weights & Biases account. Treat all wandb access as strictly read-only.
+- **Environment Stability:** NEVER change, install, or update python packages (no `pip install`, `poetry install`, etc.). Use the existing `jaxTorchTrans` conda environment.
 - **Non-destructive git:** do not use destructive git (no `--force` push, no `git reset --hard`) without explicit human approval.
 - **Secrets:** never commit `.env`, credentials, or keys.
 
@@ -28,7 +29,7 @@ JAX_COMPILATION_CACHE_DIR="jax_cache" \
   CUDA_VISIBLE_DEVICES="2" \
   XLA_PYTHON_CLIENT_PREALLOCATE=false \
   XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
-  python qwen_fineTuning_PtoC_fixCps.py --batch-size=4 --cp-fix 1 0 1 0 1 --smoke-test
+  python qwen_fineTuning_PtoC_fixCps.py --batch-size=4 --smoke-test
 ```
 
 4) Tests (quick commands)
@@ -110,6 +111,23 @@ Essential pattern: `SubspaceBaseModel` (in `src/subspace_curve.py`) is central â
 1. Run formatting and linting: `poetry run black . && poetry run ruff check .`.
 2. Run a focused unit test while iterating: `pytest -q src/test_subspace_curve.py::test_name`.
 3. When changing LoRA/mask formats, add converter helpers and unit tests; follow `src/subspace_curve.py` and `src/qwen_jax.py`.
+
+16) Recent Progress (Context for following agents)
+--------------------------------------------------
+### Goal
+Finalize ICML 2026/NeurIPS 2026 paper text for PtoC method (Overleaf project: `default`).
+
+### Accomplished
+- **NeurIPS Migration:** Migrated `main.tex` to NeurIPS 2026 style.
+- **BMA Narrative:** Framed PtoC as a "path-integral BMA" bridging point-estimates and MCMC.
+- **MFVI Insight:** Updated user story: the LoRA loss landscape is **not** overly complex, as MFVI works surprisingly well.
+- **Figures:** Integrated Figure 1 (TikZ) comparing MAP, MFVI, DE, Curve, and PSMILE.
+- **Experimental Results:** Updated `main.tex` with empirical insights (PtoC > DE(5) on ARC-Challenge LL).
+
+### Work In Progress
+- **PSMILE Analysis:** Finalize Figure 2/Analysis for particle-based MCMC vs Curve BMA.
+- **MFVI Theory:** Refine text explaining the efficacy of MFVI in the LoRA subspace.
+- **Consistency:** Ensure $\nseg$ ($N_{\text{seg}}$) and $\segdeg$ notation remains uniform.
 
 Notes
 -----

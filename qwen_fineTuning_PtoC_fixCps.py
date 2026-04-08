@@ -43,6 +43,8 @@ from src.subspace_curve import (
     EntropyMixin,
     EntropyMixin2,
     JensenShannonMixin,
+    JensenShannonMixin_v2,
+    JensenShannonNoiseMixin,
     LoRAMixin,
 )
 from scipy.cluster import hierarchy
@@ -299,6 +301,9 @@ class ModelParams:
     energy_weakening: float = 0.1
     regularizer: str = "force"
     entropy_weight: float = 0.0
+    target_jsd: float = 0.1
+    noise_rate: float = 0.1
+    vocab_size: int = 151936
 
     n_samples_eval: int | str = 20
 
@@ -339,6 +344,9 @@ class ModelParams:
             energy_weakening=mp.get("energy_weakening", 0.1),
             regularizer=mp.get("regularizer", "force"),
             entropy_weight=mp.get("entropy_weight", 0.0),
+            target_jsd=mp.get("target_jsd", 0.1),
+            noise_rate=mp.get("noise_rate", 0.1),
+            vocab_size=mp.get("vocab_size", 151936),
         )
         print(f"Computed cp_fix: {res.cp_fix}")
         return res
@@ -395,8 +403,22 @@ class ModelParams:
                 energy_weakening=self.energy_weakening,
                 regularizer=self.regularizer,
             )
-        if issubclass(s_model_cls, (EntropyMixin, EntropyMixin2, JensenShannonMixin)):
+        if issubclass(
+            s_model_cls,
+            (
+                EntropyMixin,
+                EntropyMixin2,
+                JensenShannonMixin,
+                JensenShannonMixin_v2,
+                JensenShannonNoiseMixin,
+            ),
+        ):
             d["entropy_weight"] = self.entropy_weight
+        if issubclass(s_model_cls, JensenShannonMixin_v2):
+            d["target_jsd"] = self.target_jsd
+        if issubclass(s_model_cls, JensenShannonNoiseMixin):
+            d["noise_rate"] = self.noise_rate
+            d["vocab_size"] = self.vocab_size
         if self.lora_params and self.lora_params.use_lora:
             d.update(self.lora_params.model_kwargs())
         return d
@@ -2467,14 +2489,14 @@ if __name__ == "__main__":
             "data": {
                 # 'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/boolq_dataset:v0",
-                # 'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
+                'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
-                "dataset_path": WANDB_PATH + "/obqa_dataset:v0",
+                # "dataset_path": WANDB_PATH + "/obqa_dataset:v0",
                 "val_percentage": 0.1,
             },
             # --- Base model (QwenTextClassificationWrapper) ------------------------
             # 'target_token_ids' is injected automatically after dataset load
-            "net_kwargs": {"model_path": "artifacts/qwen2.5_7B_bfloat16:v0"},
+            "net_kwargs": {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"},
             # 'net_kwargs': {'model_path': WANDB_PATH + "/qwen2.5_7B_bfloat16:v0"},
             # --- Training hyperparameters → TrainHyperparams ----------------------
             # These control *how* training runs, not *what* is built.
@@ -2497,14 +2519,15 @@ if __name__ == "__main__":
                 "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
-                "subspace_model": "lora_category",
+                "subspace_model": "jsd_v2_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
                 "curve_parameterization": "bezier",
                 "indepent_connected": False,  # True → independently connected segments
-                # 'gravity': 5.0,
-                # 'energy_weakening': 4.,
+                "entropy_weight": 0.5,
+                "target_jsd": 0.1,
+                "noise_rate": 0.1,
                 # curve topology: which parameters become the Bézier curve
                 "filter_masks": [
                     {"keys": ["self_attn", "q_proj", "kernel"], "op": "all"},

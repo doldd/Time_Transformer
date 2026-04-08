@@ -15,7 +15,7 @@ import os
 def rotate_half(x):
     """Rotates half the hidden dims of the input (JAX version)"""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate((-x2, x1), axis=-1)
 
 
@@ -64,6 +64,7 @@ def repeat_kv(hidden_states, n_rep):
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (JAX version)"""
+
     eps: float = 1e-6
 
     @nn.compact
@@ -73,13 +74,13 @@ class RMSNorm(nn.Module):
         variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
         hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
 
-        weight = self.param('weight', nn.initializers.ones,
-                            (hidden_states.shape[-1],))
+        weight = self.param("weight", nn.initializers.ones, (hidden_states.shape[-1],))
         return weight * hidden_states.astype(input_dtype)
 
 
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (JAX version)"""
+
     head_dim: int
     rope_theta: float = 10000.0
 
@@ -87,15 +88,18 @@ class RotaryEmbedding(nn.Module):
     def __call__(self, x, position_ids):
         """Forward pass matching PyTorch implementation"""
         # Compute inverse frequencies as a parameter
-        inv_freq = 1.0 / (self.rope_theta ** (jnp.arange(0,
-                          self.head_dim, 2, dtype=jnp.float32) / self.head_dim))
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (jnp.arange(0, self.head_dim, 2, dtype=jnp.float32) / self.head_dim)
+        )
         # inv_freq = self.param('inv_freq', lambda key, shape: inv_freq, inv_freq.shape)
 
         # x is used for device and dtype info
         batch_size = position_ids.shape[0]
         inv_freq_expanded = inv_freq[None, :, None].astype(jnp.float32)
         inv_freq_expanded = jnp.broadcast_to(
-            inv_freq_expanded, (batch_size, inv_freq.shape[0], 1))
+            inv_freq_expanded, (batch_size, inv_freq.shape[0], 1)
+        )
         position_ids_expanded = position_ids[:, None, :].astype(jnp.float32)
 
         # Compute frequencies
@@ -109,6 +113,7 @@ class RotaryEmbedding(nn.Module):
 
 class QwenMLP(nn.Module):
     """Qwen MLP with SwiGLU activation (JAX version)"""
+
     hidden_size: int
     intermediate_size: int
     hidden_act: str = "silu"
@@ -116,10 +121,8 @@ class QwenMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         # Gate and Up projections (no bias)
-        gate = nn.Dense(self.intermediate_size,
-                        use_bias=False, name='gate_proj')(x)
-        up = nn.Dense(self.intermediate_size,
-                      use_bias=False, name='up_proj')(x)
+        gate = nn.Dense(self.intermediate_size, use_bias=False, name="gate_proj")(x)
+        up = nn.Dense(self.intermediate_size, use_bias=False, name="up_proj")(x)
 
         # Apply activation function (SiLU/Swish)
         if self.hidden_act == "silu":
@@ -131,14 +134,16 @@ class QwenMLP(nn.Module):
         intermediate = gate_activated * up
 
         # Down projection (no bias)
-        output = nn.Dense(self.hidden_size, use_bias=False,
-                          name='down_proj')(intermediate)
+        output = nn.Dense(self.hidden_size, use_bias=False, name="down_proj")(
+            intermediate
+        )
 
         return output
 
 
 class QwenAttention(nn.Module):
     """Multi-head attention with grouped query attention (JAX version)"""
+
     hidden_size: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -148,35 +153,43 @@ class QwenAttention(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None, position_ids=None, train=True):
+    def __call__(
+        self, hidden_states, attention_mask=None, position_ids=None, train=True
+    ):
         num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        scaling = self.head_dim ** -0.5
+        scaling = self.head_dim**-0.5
         rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             rope_theta=self.rope_theta,
-            name='rotary_emb',
+            name="rotary_emb",
         )
 
         batch_size, seq_len, _ = hidden_states.shape
 
         # Linear projections (Qwen2 uses bias=True for q,k,v and bias=False for o)
-        q = nn.Dense(self.num_attention_heads * self.head_dim,
-                     use_bias=True, name='q_proj')(hidden_states)
-        k = nn.Dense(self.num_key_value_heads * self.head_dim,
-                     use_bias=True, name='k_proj')(hidden_states)
-        v = nn.Dense(self.num_key_value_heads * self.head_dim,
-                     use_bias=True, name='v_proj')(hidden_states)
+        q = nn.Dense(
+            self.num_attention_heads * self.head_dim, use_bias=True, name="q_proj"
+        )(hidden_states)
+        k = nn.Dense(
+            self.num_key_value_heads * self.head_dim, use_bias=True, name="k_proj"
+        )(hidden_states)
+        v = nn.Dense(
+            self.num_key_value_heads * self.head_dim, use_bias=True, name="v_proj"
+        )(hidden_states)
 
         # Reshape for multi-head attention
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = q.reshape(hidden_shape).transpose(
-            0, 2, 1, 3)  # [batch, heads, seq_len, head_dim]
+            0, 2, 1, 3
+        )  # [batch, heads, seq_len, head_dim]
         key_states = k.reshape(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
         value_states = v.reshape(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
 
         # Apply rotary embeddings
         if position_ids is None:
@@ -191,13 +204,14 @@ class QwenAttention(nn.Module):
         value_states = repeat_kv(value_states, num_key_value_groups)
 
         # Compute attention scores
-        attn_weights = jnp.matmul(query_states, jnp.transpose(
-            key_states, (0, 1, 3, 2))) * scaling
+        attn_weights = (
+            jnp.matmul(query_states, jnp.transpose(key_states, (0, 1, 3, 2))) * scaling
+        )
 
         # Always apply causal mask
         causal_mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=bool), k=1)
         causal_mask = jnp.logical_not(causal_mask[None, None, :, :])
-        
+
         # Broadcast causal_mask to match attn_weights shape: [1, 1, seq_len, seq_len]
         if attention_mask is not None:
             attention_mask = attention_mask[:, None, None, :].astype(bool)
@@ -209,7 +223,8 @@ class QwenAttention(nn.Module):
         # Apply dropout
         if train and self.attention_dropout > 0.0:
             attn_weights = nn.Dropout(rate=self.attention_dropout)(
-                attn_weights, deterministic=not train)
+                attn_weights, deterministic=not train
+            )
 
         # Apply attention to values
         attn_output = jnp.matmul(attn_weights, value_states)
@@ -219,14 +234,14 @@ class QwenAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1)
 
         # Output projection (no bias)
-        output = nn.Dense(self.hidden_size, use_bias=False,
-                          name='o_proj')(attn_output)
+        output = nn.Dense(self.hidden_size, use_bias=False, name="o_proj")(attn_output)
 
         return output
 
 
 class QwenDecoderLayer(nn.Module):
     """Single transformer decoder layer (JAX version)"""
+
     hidden_size: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -237,13 +252,16 @@ class QwenDecoderLayer(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None, position_ids=None, train=True):
+    def __call__(
+        self, hidden_states, attention_mask=None, position_ids=None, train=True
+    ):
         head_dim = self.hidden_size // self.num_attention_heads
 
         # Self-attention with residual connection
         residual = hidden_states
-        hidden_states = RMSNorm(eps=self.rms_norm_eps,
-                                name='input_layernorm')(hidden_states)
+        hidden_states = RMSNorm(eps=self.rms_norm_eps, name="input_layernorm")(
+            hidden_states
+        )
         hidden_states = QwenAttention(
             hidden_size=self.hidden_size,
             num_attention_heads=self.num_attention_heads,
@@ -251,27 +269,28 @@ class QwenDecoderLayer(nn.Module):
             head_dim=head_dim,
             attention_dropout=self.attention_dropout,
             rope_theta=self.rope_theta,
-            name='self_attn'
+            name="self_attn",
         )(hidden_states, attention_mask, position_ids, train)
         hidden_states = residual + hidden_states
 
         # MLP with residual connection
         residual = hidden_states
-        hidden_states = RMSNorm(eps=self.rms_norm_eps,
-                                name='post_attention_layernorm')(hidden_states)
+        hidden_states = RMSNorm(eps=self.rms_norm_eps, name="post_attention_layernorm")(
+            hidden_states
+        )
         hidden_states = QwenMLP(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             hidden_act=self.hidden_act,
-            name='mlp'
+            name="mlp",
         )(hidden_states)
         hidden_states = residual + hidden_states
-
         return hidden_states
 
 
 class QwenForCausalLM(nn.Module):
     """Qwen model for causal language modeling (JAX version)"""
+
     vocab_size: int
     hidden_size: int
     num_hidden_layers: int
@@ -286,11 +305,13 @@ class QwenForCausalLM(nn.Module):
     rope_theta: float = 10000.0
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, position_ids=None, train=True) -> jnp.ndarray:
+    def __call__(
+        self, input_ids, attention_mask=None, position_ids=None, train=True
+    ) -> jnp.ndarray:
         embed_layer = nn.Embed(
             num_embeddings=self.vocab_size,
             features=self.hidden_size,
-            name='embed_tokens',
+            name="embed_tokens",
         )
         hidden_states = embed_layer(input_ids)
 
@@ -304,15 +325,17 @@ class QwenForCausalLM(nn.Module):
                 rms_norm_eps=self.rms_norm_eps,
                 attention_dropout=self.attention_dropout,
                 rope_theta=self.rope_theta,
-                name=f'layers_{i}',
+                name=f"layers_{i}",
             )(hidden_states, attention_mask, position_ids, train)
 
-        hidden_states = RMSNorm(eps=self.rms_norm_eps, name='norm')(hidden_states)
+        hidden_states = RMSNorm(eps=self.rms_norm_eps, name="norm")(hidden_states)
 
         if self.tie_word_embeddings:
             logits = jnp.dot(hidden_states, embed_layer.embedding.T)
         else:
-            logits = nn.Dense(self.vocab_size, use_bias=False, name='lm_head')(hidden_states)
+            logits = nn.Dense(self.vocab_size, use_bias=False, name="lm_head")(
+                hidden_states
+            )
 
         return logits
 
@@ -321,10 +344,11 @@ class QwenTextClassificationWrapper:
     """
     Wrapper class for Qwen2.5 model to interface with SubspaceBaseModel
     """
+
     def __init__(self, model_path: str, target_token_ids: jnp.ndarray):
         """
         Initialize Qwen wrapper
-        
+
         Args:
             model_path: Path to the converted JAX model
             target_token_ids: Token IDs for classification targets (e.g., [36, 37] for True/False)
@@ -342,7 +366,16 @@ class QwenTextClassificationWrapper:
         params = load_model_params(self.model_path)
         return params
 
-    def apply(self, variables, *args, rngs=None, method=None, mutable=False, capture_intermediates=False, **kwargs):
+    def apply(
+        self,
+        variables,
+        *args,
+        rngs=None,
+        method=None,
+        mutable=False,
+        capture_intermediates=False,
+        **kwargs,
+    ):
         """Flexible apply wrapper matching project API.
 
         Signature: apply(self, variables, *args, rngs=None, method=None, mutable=False,
@@ -358,7 +391,7 @@ class QwenTextClassificationWrapper:
         to the underlying model.apply call.
         """
         # Call underlying model.apply and forward Flax-specific kwargs
-        if mutable: 
+        if mutable:
             out, state = self.model.apply(
                 variables,
                 *args,
@@ -368,8 +401,13 @@ class QwenTextClassificationWrapper:
                 capture_intermediates=capture_intermediates,
                 **kwargs,
             )
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits, state # Return probabilities for target classes only   
+            last_token_logits = out[:, -1, self.target_token_ids].astype(
+                jnp.float32
+            )  # (batch, num_classes)
+            return (
+                last_token_logits,
+                state,
+            )  # Return probabilities for target classes only
         else:
             out = self.model.apply(
                 variables,
@@ -381,8 +419,11 @@ class QwenTextClassificationWrapper:
                 **kwargs,
             )
             # last_token_logits = out[:, -1, self.target_token_ids]  # (batch, num_classes)
-            last_token_logits = out[:, -1, self.target_token_ids].astype(jnp.float32)  # (batch, num_classes)
-            return last_token_logits # Return probabilities for target classes only  
+            last_token_logits = out[:, -1, self.target_token_ids].astype(
+                jnp.float32
+            )  # (batch, num_classes)
+            return last_token_logits  # Return probabilities for target classes only
+
 
 # Utility functions for testing
 
@@ -390,35 +431,34 @@ class QwenTextClassificationWrapper:
 def create_qwen_config_from_pytorch(pytorch_config):
     """Convert PyTorch config to JAX model parameters"""
     return {
-        'vocab_size': pytorch_config.vocab_size,
-        'hidden_size': pytorch_config.hidden_size,
-        'num_hidden_layers': pytorch_config.num_hidden_layers,
-        'num_attention_heads': pytorch_config.num_attention_heads,
-        'num_key_value_heads': pytorch_config.num_key_value_heads,
-        'intermediate_size': pytorch_config.intermediate_size,
-        'hidden_act': pytorch_config.hidden_act,
-        'max_position_embeddings': pytorch_config.max_position_embeddings,
-        'rms_norm_eps': pytorch_config.rms_norm_eps,
-        'attention_dropout': getattr(pytorch_config, 'attention_dropout', 0.0),
-        'tie_word_embeddings': getattr(pytorch_config, 'tie_word_embeddings', True),
-        'rope_theta': getattr(pytorch_config, 'rope_theta', 10000.0),
+        "vocab_size": pytorch_config.vocab_size,
+        "hidden_size": pytorch_config.hidden_size,
+        "num_hidden_layers": pytorch_config.num_hidden_layers,
+        "num_attention_heads": pytorch_config.num_attention_heads,
+        "num_key_value_heads": pytorch_config.num_key_value_heads,
+        "intermediate_size": pytorch_config.intermediate_size,
+        "hidden_act": pytorch_config.hidden_act,
+        "max_position_embeddings": pytorch_config.max_position_embeddings,
+        "rms_norm_eps": pytorch_config.rms_norm_eps,
+        "attention_dropout": getattr(pytorch_config, "attention_dropout", 0.0),
+        "tie_word_embeddings": getattr(pytorch_config, "tie_word_embeddings", True),
+        "rope_theta": getattr(pytorch_config, "rope_theta", 10000.0),
     }
 
 
 def create_parameter_mapping(config):
     """
-    Create a mapping dictionary that defines how JAX pytree parameters 
+    Create a mapping dictionary that defines how JAX pytree parameters
     correspond to PyTorch parameters.
 
     Returns:
         tuple: With: (Mapping from JAX parameter paths to PyTorch parameter names, and transpose info)
     """
     mapping = {}
-    NUM_LAYERS = config['num_hidden_layers']
+    NUM_LAYERS = config["num_hidden_layers"]
 
     # Embedding layer
-    mapping["params/embed_tokens/embedding"] = (
-        "model.embed_tokens.weight", (0, 1))
+    mapping["params/embed_tokens/embedding"] = ("model.embed_tokens.weight", (0, 1))
 
     # Transformer layers
     for layer_idx in range(NUM_LAYERS):
@@ -427,48 +467,73 @@ def create_parameter_mapping(config):
 
         # Attention weights
         mapping[f"{prefix_jax}/self_attn/q_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.q_proj.weight", (1, 0))
+            f"{prefix_torch}.self_attn.q_proj.weight",
+            (1, 0),
+        )
         mapping[f"{prefix_jax}/self_attn/q_proj/bias"] = (
-            f"{prefix_torch}.self_attn.q_proj.bias", (0,))
+            f"{prefix_torch}.self_attn.q_proj.bias",
+            (0,),
+        )
         mapping[f"{prefix_jax}/self_attn/k_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.k_proj.weight", (1, 0))
+            f"{prefix_torch}.self_attn.k_proj.weight",
+            (1, 0),
+        )
         mapping[f"{prefix_jax}/self_attn/k_proj/bias"] = (
-            f"{prefix_torch}.self_attn.k_proj.bias", (0,))
+            f"{prefix_torch}.self_attn.k_proj.bias",
+            (0,),
+        )
         mapping[f"{prefix_jax}/self_attn/v_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.v_proj.weight", (1, 0))
+            f"{prefix_torch}.self_attn.v_proj.weight",
+            (1, 0),
+        )
         mapping[f"{prefix_jax}/self_attn/v_proj/bias"] = (
-            f"{prefix_torch}.self_attn.v_proj.bias", (0,))
+            f"{prefix_torch}.self_attn.v_proj.bias",
+            (0,),
+        )
         mapping[f"{prefix_jax}/self_attn/o_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.o_proj.weight", (1, 0))
+            f"{prefix_torch}.self_attn.o_proj.weight",
+            (1, 0),
+        )
 
         # Layer norms
         mapping[f"{prefix_jax}/input_layernorm/weight"] = (
-            f"{prefix_torch}.input_layernorm.weight", (0,))
+            f"{prefix_torch}.input_layernorm.weight",
+            (0,),
+        )
         mapping[f"{prefix_jax}/post_attention_layernorm/weight"] = (
-            f"{prefix_torch}.post_attention_layernorm.weight", (0,))
+            f"{prefix_torch}.post_attention_layernorm.weight",
+            (0,),
+        )
 
         # MLP weights
         mapping[f"{prefix_jax}/mlp/gate_proj/kernel"] = (
-            f"{prefix_torch}.mlp.gate_proj.weight", (1, 0))
+            f"{prefix_torch}.mlp.gate_proj.weight",
+            (1, 0),
+        )
         mapping[f"{prefix_jax}/mlp/up_proj/kernel"] = (
-            f"{prefix_torch}.mlp.up_proj.weight", (1, 0))
+            f"{prefix_torch}.mlp.up_proj.weight",
+            (1, 0),
+        )
         mapping[f"{prefix_jax}/mlp/down_proj/kernel"] = (
-            f"{prefix_torch}.mlp.down_proj.weight", (1, 0))
+            f"{prefix_torch}.mlp.down_proj.weight",
+            (1, 0),
+        )
 
     # Final layer norm
     mapping["params/norm/weight"] = ("model.norm.weight", (0,))
 
     # Language model head (if using tied embeddings, this might not exist)
     # if hasattr(model, 'lm_head') and model.lm_head is not None:
-    if config['tie_word_embeddings'] is False:
+    if config["tie_word_embeddings"] is False:
         mapping["params/lm_head/kernel"] = ("lm_head.weight", (1, 0))
 
     return mapping
 
 
 def get_dtype_from_tensor(torch_tensor):
-    ''' return jax dtype from PyTorch tensor'''
+    """return jax dtype from PyTorch tensor"""
     import torch
+
     if torch_tensor.dtype == torch.float32:
         return jnp.float32
     elif torch_tensor.dtype == torch.float16:
@@ -499,7 +564,7 @@ def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
     tree_flat, tree_struct = jax.tree.flatten_with_path(jax_params)
 
     new_jax_params = []
-    for (n, p) in tree_flat:
+    for n, p in tree_flat:
         jax_path = "/".join((nn.key for nn in n))
         pytorch_name, transpose_order = param_mapping.get(jax_path, (None, None))
 
@@ -517,15 +582,15 @@ def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
             pp = pp.detach().cpu().numpy().transpose(transpose_order)
         except Exception as e:
             print(f"WARNING: Error processing '{pytorch_name}': {e}")
-            print(
-                f"\tTranspose order: {transpose_order}, Original shape: {pp.shape}")
+            print(f"\tTranspose order: {transpose_order}, Original shape: {pp.shape}")
             continue
         if p.shape != pp.shape:
             print(
-                f"WARNING: Shape mismatch for {pytorch_name}: JAX {p.shape} vs PyTorch {pp.shape}")
+                f"WARNING: Shape mismatch for {pytorch_name}: JAX {p.shape} vs PyTorch {pp.shape}"
+            )
             continue
         if jax_dtype:
-            if jnp.issubdtype(dtype, jnp.floating): # convert only floating point types
+            if jnp.issubdtype(dtype, jnp.floating):  # convert only floating point types
                 dtype = jax_dtype
         new_jax_params.append(jnp.array(pp, dtype=dtype))
 
@@ -534,35 +599,37 @@ def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
 
 
 def save_params_and_config(params, config, path):
-    '''
+    """
     Save JAX model parameters and configuration to disk.
-    '''
+    """
     os.makedirs(path, exist_ok=True)
     jnp.save(f"{path}/jax_params.npy", unfreeze(params))
 
-    with open(f"{path}/jax_config.json", 'w', encoding='utf-8') as f:
+    with open(f"{path}/jax_config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 
 def load_model_config(path):
-    '''
+    """
     Load only the model configuration from disk.
-    '''
-    with open(f"{path}/jax_config.json", 'r', encoding='utf-8') as f:
+    """
+    with open(f"{path}/jax_config.json", "r", encoding="utf-8") as f:
         config = json.load(f)
     return config
 
+
 def load_model_params(path):
-    '''
+    """
     Load only the model parameters from disk.
-    '''
+    """
     params = jnp.load(f"{path}/jax_params.npy", allow_pickle=True).item()
     return params
 
+
 def load_params_and_config(path):
-    '''
+    """
     Load JAX model parameters and configuration from disk.
-    '''
+    """
     params = load_model_params(path)
     config = load_model_config(path)
     return params, config

@@ -317,19 +317,30 @@ class QwenForCausalLM(nn.Module):
 
         if self.use_scan:
 
-            @nn.remat
-            def scan_layer_fn(mdl, carry, attention_mask, position_ids):
-                return mdl(carry, attention_mask, position_ids, train), None
+            class ScanQwenDecoderLayer(QwenDecoderLayer):
+                @nn.compact
+                def __call__(
+                    self,
+                    hidden_states,
+                    attention_mask=None,
+                    position_ids=None,
+                    train=True,
+                ):
+                    out = super().__call__(
+                        hidden_states, attention_mask, position_ids, train
+                    )
+                    return out, None
 
-            ScanLayer = nn.scan(
-                scan_layer_fn,
+            ScannedRematLayer = nn.scan(
+                nn.remat(ScanQwenDecoderLayer, static_argnums=(4,)),
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                in_axes=(nn.broadcast, nn.broadcast),
-                out_axes=None,
                 length=self.num_hidden_layers,
+                in_axes=(nn.broadcast, nn.broadcast, nn.broadcast),
+                out_axes=None,
             )
-            layer = QwenDecoderLayer(
+
+            hidden_states, _ = ScannedRematLayer(
                 hidden_size=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
@@ -339,10 +350,7 @@ class QwenForCausalLM(nn.Module):
                 attention_dropout=self.attention_dropout,
                 rope_theta=self.rope_theta,
                 name="layers",
-            )
-            hidden_states, _ = ScanLayer(
-                layer, hidden_states, attention_mask, position_ids
-            )
+            )(hidden_states, attention_mask, position_ids, train)
         else:
             for i in range(self.num_hidden_layers):
                 hidden_states = QwenDecoderLayer(

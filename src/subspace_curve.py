@@ -1525,10 +1525,10 @@ class LoraAbstractParams:
         return cls(*children, *aux_data)
 
     def add_w_noise(self, p, k):
-        scaling = self.lora_rho_w / jnp.sqrt(p.shape[0])
+        scaling = self.lora_rho_w / jnp.sqrt(p.shape[-2])
         w_noise = (
             scaling
-            * jnp.linalg.norm(p, axis=0, keepdims=True)
+            * jnp.linalg.norm(p, axis=-2, keepdims=True)
             * jax.random.normal(k, p.shape, dtype=p.dtype)
         )
         return p + w_noise
@@ -1614,7 +1614,7 @@ class LoRAScaleParams(LoraAbstractParams):
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         # A_ = jnp.matmul(self.s, self.A)  # Scale A by s
         # w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
-        w = jnp.einsum("...j,ji,ik->...k", self.B, self.s, self.A)
+        w = jnp.einsum("...mj,ji,...ik->...mk", self.B, self.s, self.A)
         w = jnp.moveaxis(
             w, [-2, -1], self.dims
         )  # Move the last two axes to the positions specified by m
@@ -1630,7 +1630,7 @@ class LoRAScaleDiagParams(LoRAScaleParams):
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         # A_ = jnp.matmul(jnp.diag(self.s), self.A)  # Scale A by s
         # w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
-        w = jnp.einsum("...i,i,ij->...j", self.B, self.s, self.A)
+        w = jnp.einsum("...mi,i,...ij->...mj", self.B, self.s, self.A)
         w = jnp.moveaxis(
             w, [-2, -1], self.dims
         )  # Move the last two axes to the positions specified by m
@@ -1667,9 +1667,9 @@ class LoRAepsilonAParams(LoRAABParam):
     def _apply(self, key):
         # print(f"Applying LoRA to {p.w0.shape} with A: {p.A.shape}, B: {p.B.shape}")
         epsilon_s = (
-            random.normal(key, self.A.shape[0]) * self.lora_rho_s + 1.0
+            random.normal(key, (self.A.shape[-2],)) * self.lora_rho_s + 1.0
         )  # Add noise around 1
-        w = jnp.einsum("...i,i,ij->...j", self.B, epsilon_s, self.A)
+        w = jnp.einsum("...mi,i,...ij->...mj", self.B, epsilon_s, self.A)
         # jax.debug.print(f"LoRAepsilonABParams: Applied noise with shape {w.shape}")
         # A_ = jnp.matmul(jnp.diag(epsilon_s), self.A)  # Scale A by s
         # w = jnp.matmul(self.B, A_)  # Apply LoRA transformation
@@ -1717,7 +1717,7 @@ class LoRAepsilonScaleDiagParams(LoRAScaleDiagParams):
         epsilon_s = (
             random.normal(key, self.s.shape) * self.lora_rho_s + 1.0
         )  # Add noise around 1
-        w = jnp.einsum("...r,r,r,rj->...j", self.B, self.s, epsilon_s, self.A)
+        w = jnp.einsum("...mr,r,r,...rj->...mj", self.B, self.s, epsilon_s, self.A)
         w = jnp.moveaxis(
             w, [-2, -1], self.dims
         )  # Move the last two axes to the positions specified by m
@@ -1765,11 +1765,11 @@ class LoRARotaEpsilonDiagscaleRotbParams(LoRAepsilonScaleDiagParams):
         ).T  # Constrain A to the Stiefel manifold
         B = constrain_to_stiefel_mainfold(self.B)  # Constrain B to the Stiefel manifold
         epsilon_s = (
-            random.normal(key, self.s.shape[0]) * self.lora_rho_s + 1.0
+            random.normal(key, self.s.shape) * self.lora_rho_s + 1.0
         )  # Add noise around 1
         epsilon_s = jax.nn.softplus(epsilon_s) + 1e-8  # Ensure epsilon_s is positive
         s = jax.nn.softplus(self.s) + 1e-8  # Ensure s is positive
-        w = jnp.einsum("...r,r,r,ri->...i", B, s, epsilon_s, A)
+        w = jnp.einsum("...mr,r,r,...ri->...mi", B, s, epsilon_s, A)
         w = jnp.moveaxis(
             w, [-2, -1], self.dims
         )  # Move the last two axes to the positions specified by m

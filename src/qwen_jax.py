@@ -302,6 +302,7 @@ class QwenForCausalLM(nn.Module):
     attention_dropout: float = 0.0
     tie_word_embeddings: bool = True
     rope_theta: float = 10000.0
+    use_scan: bool = True
 
     @nn.compact
     def __call__(
@@ -314,8 +315,21 @@ class QwenForCausalLM(nn.Module):
         )
         hidden_states = embed_layer(input_ids)
 
-        for i in range(self.num_hidden_layers):
-            hidden_states = QwenDecoderLayer(
+        if self.use_scan:
+
+            @nn.remat
+            def scan_layer_fn(mdl, carry, attention_mask, position_ids):
+                return mdl(carry, attention_mask, position_ids, train), None
+
+            ScanLayer = nn.scan(
+                scan_layer_fn,
+                variable_axes={"params": 0},
+                split_rngs={"params": True, "dropout": True},
+                in_axes=(nn.broadcast, nn.broadcast),
+                out_axes=None,
+                length=self.num_hidden_layers,
+            )
+            layer = QwenDecoderLayer(
                 hidden_size=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
@@ -324,8 +338,24 @@ class QwenForCausalLM(nn.Module):
                 rms_norm_eps=self.rms_norm_eps,
                 attention_dropout=self.attention_dropout,
                 rope_theta=self.rope_theta,
-                name=f"layers_{i}",
-            )(hidden_states, attention_mask, position_ids, train)
+                name="layers",
+            )
+            hidden_states, _ = ScanLayer(
+                layer, hidden_states, attention_mask, position_ids
+            )
+        else:
+            for i in range(self.num_hidden_layers):
+                hidden_states = QwenDecoderLayer(
+                    hidden_size=self.hidden_size,
+                    num_attention_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    intermediate_size=self.intermediate_size,
+                    hidden_act=self.hidden_act,
+                    rms_norm_eps=self.rms_norm_eps,
+                    attention_dropout=self.attention_dropout,
+                    rope_theta=self.rope_theta,
+                    name=f"layers_{i}",
+                )(hidden_states, attention_mask, position_ids, train)
 
         hidden_states = RMSNorm(eps=self.rms_norm_eps, name="norm")(hidden_states)
 
@@ -344,17 +374,23 @@ class QwenTextClassificationWrapper:
     Wrapper class for Qwen2.5 model to interface with SubspaceBaseModel
     """
 
-    def __init__(self, model_path: str, target_token_ids: jnp.ndarray):
+    def __init__(
+        self, model_path: str, target_token_ids: jnp.ndarray, use_scan: bool = None
+    ):
         """
         Initialize Qwen wrapper
 
         Args:
             model_path: Path to the converted JAX model
             target_token_ids: Token IDs for classification targets (e.g., [36, 37] for True/False)
+            use_scan: Override scan toggle. If None, it's read from the model config.
         """
         self.model_path = model_path
         config = load_model_config(model_path)
-        # vocab_size removed; use self.config['vocab_size'] when required
+        if use_scan is not None:
+            config["use_scan"] = use_scan
+
+        self.use_scan_actual = config.get("use_scan", True)
         self.model = QwenForCausalLM(**config)
         self.target_token_ids = target_token_ids.flatten()
 
@@ -362,7 +398,8 @@ class QwenTextClassificationWrapper:
         """Initialize model parameters for compatibility with SubspaceBaseModel"""
         # Return existing converted parameters
         # Note: key and x are unused but required for interface compatibility
-        params = load_model_params(self.model_path)
+        config = load_model_config(self.model_path)
+        params = load_model_params(self.model_path, use_scan=self.use_scan_actual)
         return params
 
     def apply(
@@ -427,7 +464,7 @@ class QwenTextClassificationWrapper:
 # Utility functions for testing
 
 
-def create_qwen_config_from_pytorch(pytorch_config):
+def create_qwen_config_from_pytorch(pytorch_config, use_scan=True):
     """Convert PyTorch config to JAX model parameters"""
     return {
         "vocab_size": pytorch_config.vocab_size,
@@ -442,10 +479,11 @@ def create_qwen_config_from_pytorch(pytorch_config):
         "attention_dropout": getattr(pytorch_config, "attention_dropout", 0.0),
         "tie_word_embeddings": getattr(pytorch_config, "tie_word_embeddings", True),
         "rope_theta": getattr(pytorch_config, "rope_theta", 10000.0),
+        "use_scan": use_scan,
     }
 
 
-def create_parameter_mapping(config):
+def create_parameter_mapping(config, use_scan=True):
     """
     Create a mapping dictionary that defines how JAX pytree parameters
     correspond to PyTorch parameters.
@@ -460,63 +498,92 @@ def create_parameter_mapping(config):
     mapping["params/embed_tokens/embedding"] = ("model.embed_tokens.weight", (0, 1))
 
     # Transformer layers
-    for layer_idx in range(NUM_LAYERS):
-        prefix_torch = f"model.layers.{layer_idx}"
-        prefix_jax = f"params/layers_{layer_idx}"
+    if use_scan:
+        prefix_jax = "params/layers"
+
+        def map_layer(jax_suffix, torch_suffix, trans_order):
+            mapping[f"{prefix_jax}/{jax_suffix}"] = (
+                [f"model.layers.{i}.{torch_suffix}" for i in range(NUM_LAYERS)],
+                trans_order,
+            )
 
         # Attention weights
-        mapping[f"{prefix_jax}/self_attn/q_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.q_proj.weight",
-            (1, 0),
-        )
-        mapping[f"{prefix_jax}/self_attn/q_proj/bias"] = (
-            f"{prefix_torch}.self_attn.q_proj.bias",
-            (0,),
-        )
-        mapping[f"{prefix_jax}/self_attn/k_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.k_proj.weight",
-            (1, 0),
-        )
-        mapping[f"{prefix_jax}/self_attn/k_proj/bias"] = (
-            f"{prefix_torch}.self_attn.k_proj.bias",
-            (0,),
-        )
-        mapping[f"{prefix_jax}/self_attn/v_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.v_proj.weight",
-            (1, 0),
-        )
-        mapping[f"{prefix_jax}/self_attn/v_proj/bias"] = (
-            f"{prefix_torch}.self_attn.v_proj.bias",
-            (0,),
-        )
-        mapping[f"{prefix_jax}/self_attn/o_proj/kernel"] = (
-            f"{prefix_torch}.self_attn.o_proj.weight",
-            (1, 0),
-        )
+        map_layer("self_attn/q_proj/kernel", "self_attn.q_proj.weight", (1, 0))
+        map_layer("self_attn/q_proj/bias", "self_attn.q_proj.bias", (0,))
+        map_layer("self_attn/k_proj/kernel", "self_attn.k_proj.weight", (1, 0))
+        map_layer("self_attn/k_proj/bias", "self_attn.k_proj.bias", (0,))
+        map_layer("self_attn/v_proj/kernel", "self_attn.v_proj.weight", (1, 0))
+        map_layer("self_attn/v_proj/bias", "self_attn.v_proj.bias", (0,))
+        map_layer("self_attn/o_proj/kernel", "self_attn.o_proj.weight", (1, 0))
 
         # Layer norms
-        mapping[f"{prefix_jax}/input_layernorm/weight"] = (
-            f"{prefix_torch}.input_layernorm.weight",
-            (0,),
-        )
-        mapping[f"{prefix_jax}/post_attention_layernorm/weight"] = (
-            f"{prefix_torch}.post_attention_layernorm.weight",
-            (0,),
+        map_layer("input_layernorm/weight", "input_layernorm.weight", (0,))
+        map_layer(
+            "post_attention_layernorm/weight", "post_attention_layernorm.weight", (0,)
         )
 
         # MLP weights
-        mapping[f"{prefix_jax}/mlp/gate_proj/kernel"] = (
-            f"{prefix_torch}.mlp.gate_proj.weight",
-            (1, 0),
-        )
-        mapping[f"{prefix_jax}/mlp/up_proj/kernel"] = (
-            f"{prefix_torch}.mlp.up_proj.weight",
-            (1, 0),
-        )
-        mapping[f"{prefix_jax}/mlp/down_proj/kernel"] = (
-            f"{prefix_torch}.mlp.down_proj.weight",
-            (1, 0),
-        )
+        map_layer("mlp/gate_proj/kernel", "mlp.gate_proj.weight", (1, 0))
+        map_layer("mlp/up_proj/kernel", "mlp.up_proj.weight", (1, 0))
+        map_layer("mlp/down_proj/kernel", "mlp.down_proj.weight", (1, 0))
+    else:
+        for layer_idx in range(NUM_LAYERS):
+            prefix_torch = f"model.layers.{layer_idx}"
+            prefix_jax = f"params/layers_{layer_idx}"
+
+            # Attention weights
+            mapping[f"{prefix_jax}/self_attn/q_proj/kernel"] = (
+                f"{prefix_torch}.self_attn.q_proj.weight",
+                (1, 0),
+            )
+            mapping[f"{prefix_jax}/self_attn/q_proj/bias"] = (
+                f"{prefix_torch}.self_attn.q_proj.bias",
+                (0,),
+            )
+            mapping[f"{prefix_jax}/self_attn/k_proj/kernel"] = (
+                f"{prefix_torch}.self_attn.k_proj.weight",
+                (1, 0),
+            )
+            mapping[f"{prefix_jax}/self_attn/k_proj/bias"] = (
+                f"{prefix_torch}.self_attn.k_proj.bias",
+                (0,),
+            )
+            mapping[f"{prefix_jax}/self_attn/v_proj/kernel"] = (
+                f"{prefix_torch}.self_attn.v_proj.weight",
+                (1, 0),
+            )
+            mapping[f"{prefix_jax}/self_attn/v_proj/bias"] = (
+                f"{prefix_torch}.self_attn.v_proj.bias",
+                (0,),
+            )
+            mapping[f"{prefix_jax}/self_attn/o_proj/kernel"] = (
+                f"{prefix_torch}.self_attn.o_proj.weight",
+                (1, 0),
+            )
+
+            # Layer norms
+            mapping[f"{prefix_jax}/input_layernorm/weight"] = (
+                f"{prefix_torch}.input_layernorm.weight",
+                (0,),
+            )
+            mapping[f"{prefix_jax}/post_attention_layernorm/weight"] = (
+                f"{prefix_torch}.post_attention_layernorm.weight",
+                (0,),
+            )
+
+            # MLP weights
+            mapping[f"{prefix_jax}/mlp/gate_proj/kernel"] = (
+                f"{prefix_torch}.mlp.gate_proj.weight",
+                (1, 0),
+            )
+            mapping[f"{prefix_jax}/mlp/up_proj/kernel"] = (
+                f"{prefix_torch}.mlp.up_proj.weight",
+                (1, 0),
+            )
+            mapping[f"{prefix_jax}/mlp/down_proj/kernel"] = (
+                f"{prefix_torch}.mlp.down_proj.weight",
+                (1, 0),
+            )
 
     # Final layer norm
     mapping["params/norm/weight"] = ("model.norm.weight", (0,))
@@ -555,8 +622,10 @@ def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
     Returns:
         jax_params: FrozenDict with weights loaded from PyTorch.
     """
+    import numpy as np
 
-    param_mapping = create_parameter_mapping(config)
+    use_scan = config.get("use_scan", True)
+    param_mapping = create_parameter_mapping(config, use_scan=use_scan)
     pytorch_params = dict(model.named_parameters())
     jax_params = unfreeze(jax_params)
 
@@ -571,18 +640,44 @@ def convert_pytorch_weights_to_jax(jax_params, model, config, jax_dtype=None):
             print(f"WARNING: No mapping found for JAX path '{jax_path}'")
             continue
 
-        pp = pytorch_params.get(pytorch_name, None)
-        if pp is None:
-            print(f"WARNING: No PyTorch parameter found for '{pytorch_name}'")
-            continue
+        if isinstance(pytorch_name, list):
+            # Handle stacked parameters (e.g. layers in nn.scan)
+            stacked_arrays = []
+            for p_name in pytorch_name:
+                pp = pytorch_params.get(p_name, None)
+                if pp is None:
+                    print(f"WARNING: No PyTorch parameter found for '{p_name}'")
+                    break
 
-        dtype = get_dtype_from_tensor(pp)
-        try:
-            pp = pp.detach().cpu().numpy().transpose(transpose_order)
-        except Exception as e:
-            print(f"WARNING: Error processing '{pytorch_name}': {e}")
-            print(f"\tTranspose order: {transpose_order}, Original shape: {pp.shape}")
-            continue
+                dtype = get_dtype_from_tensor(pp)
+                try:
+                    pp_arr = pp.detach().cpu().numpy().transpose(transpose_order)
+                    stacked_arrays.append(pp_arr)
+                except Exception as e:
+                    print(f"WARNING: Error processing '{p_name}': {e}")
+                    break
+
+            if len(stacked_arrays) != len(pytorch_name):
+                continue
+
+            pp = np.stack(stacked_arrays, axis=0)
+        else:
+            # Normal single parameter handling
+            pp = pytorch_params.get(pytorch_name, None)
+            if pp is None:
+                print(f"WARNING: No PyTorch parameter found for '{pytorch_name}'")
+                continue
+
+            dtype = get_dtype_from_tensor(pp)
+            try:
+                pp = pp.detach().cpu().numpy().transpose(transpose_order)
+            except Exception as e:
+                print(f"WARNING: Error processing '{pytorch_name}': {e}")
+                print(
+                    f"\tTranspose order: {transpose_order}, Original shape: {pp.shape}"
+                )
+                continue
+
         if p.shape != pp.shape:
             print(
                 f"WARNING: Shape mismatch for {pytorch_name}: JAX {p.shape} vs PyTorch {pp.shape}"
@@ -617,18 +712,69 @@ def load_model_config(path):
     return config
 
 
-def load_model_params(path):
+def load_model_params(path, use_scan=None):
     """
     Load only the model parameters from disk.
+    If use_scan is True and the loaded parameters have the old layout (layers_0, layers_1, etc.),
+    it converts them to the new stacked layout (layers).
     """
     params = jnp.load(f"{path}/jax_params.npy", allow_pickle=True).item()
+
+    if use_scan is True:
+        # Check if we need to convert old layout to new layout
+        if (
+            "params" in params
+            and "layers_0" in params["params"]
+            and "layers" not in params["params"]
+        ):
+            print("Converting old layout parameters to new stacked (scan) layout...")
+            num_layers = sum(
+                1 for k in params["params"].keys() if k.startswith("layers_")
+            )
+            new_params = dict(params["params"])
+
+            layers_dict = {}
+            for i in range(num_layers):
+                layer_key = f"layers_{i}"
+                layer_params = new_params.pop(layer_key)
+
+                # Recursively add arrays to layers_dict lists
+                def collect_arrays(d, current_dict):
+                    for k, v in d.items():
+                        if isinstance(v, dict):
+                            if k not in current_dict:
+                                current_dict[k] = {}
+                            collect_arrays(v, current_dict[k])
+                        else:
+                            if k not in current_dict:
+                                current_dict[k] = []
+                            current_dict[k].append(v)
+
+                collect_arrays(layer_params, layers_dict)
+
+            # Stack lists of arrays
+            def stack_arrays(d):
+                import numpy as np
+
+                for k, v in d.items():
+                    if isinstance(v, dict):
+                        stack_arrays(v)
+                    else:
+                        d[k] = jnp.array(np.stack(v, axis=0))
+
+            stack_arrays(layers_dict)
+            new_params["layers"] = layers_dict
+            params = {"params": new_params}
+
     return params
 
 
-def load_params_and_config(path):
+def load_params_and_config(path, use_scan=None):
     """
     Load JAX model parameters and configuration from disk.
     """
-    params = load_model_params(path)
     config = load_model_config(path)
+    if use_scan is None:
+        use_scan = config.get("use_scan", True)
+    params = load_model_params(path, use_scan=use_scan)
     return params, config

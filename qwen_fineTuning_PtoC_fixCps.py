@@ -221,8 +221,27 @@ class LoraParams:
     )
 
     @classmethod
-    def from_config_dict(cls, lp: dict) -> "LoraParams":
+    def from_config_dict(cls, lp: dict, use_scan: bool = True) -> "LoraParams":
         """Construct from the ``lora_params`` sub-dict of ``config['model_params']``."""
+        filter_masks = lp.get("filter_masks", [])
+        # Dynamically adjust dims for scan mode
+        if use_scan:
+            for mask in filter_masks:
+                # If the target is inside a layer (e.g. self_attn) and we're using scan,
+                # shift dims from [1, 0] to [2, 1] because of the new scan dimension at axis 0.
+                if "dims" in mask and any(
+                    k
+                    in [
+                        "self_attn",
+                        "mlp",
+                        "input_layernorm",
+                        "post_attention_layernorm",
+                    ]
+                    for k in mask["keys"]
+                ):
+                    if mask["dims"] == [1, 0]:
+                        mask["dims"] = [2, 1]
+
         return cls(
             use_lora=lp.get("use_lora", False),
             r=lp.get("r", 8),
@@ -232,7 +251,7 @@ class LoraParams:
             rho_scheduler_frequency=lp.get("rho_scheduler_frequency", 0.0),
             lora_rho=lp.get("lora_rho", 0.0),
             lora_rho_s=lp.get("lora_rho_s", 0.0),
-            filter_masks=lp.get("filter_masks", []),
+            filter_masks=filter_masks,
         )
 
     def model_kwargs(self) -> dict:
@@ -281,6 +300,7 @@ class ModelParams:
     Pretraining: bool = False
     curve_sampling_mode: str = "combined_noBMA"
     subspace_model: str = "lora_category"
+    use_scan: bool = True
     filter_masks: list = field(
         default_factory=lambda: [
             {"keys": ["self_attn", "q_proj", "kernel"], "op": "all"},
@@ -328,6 +348,7 @@ class ModelParams:
             Pretraining=Pretraining,
             curve_sampling_mode=mp.get("curve_sampling_mode", "combined"),
             subspace_model=mp.get("subspace_model", ""),
+            use_scan=mp.get("use_scan", True),
             filter_masks=mp.get("filter_masks", []),
             jitter_multiplier=mp.get("jitter_multiplier", 0.0),
             natural_parameterization=mp.get("natural_parameterization", False),
@@ -335,7 +356,9 @@ class ModelParams:
             curve_parameterization=mp.get("curve_parameterization", "bezier"),
             indepent_connected=mp.get("indepent_connected", False),
             n_samples_eval=n_samples_eval,
-            lora_params=LoraParams.from_config_dict(mp["lora_params"])
+            lora_params=LoraParams.from_config_dict(
+                mp["lora_params"], use_scan=mp.get("use_scan", True)
+            )
             if mp.get("lora_params")
             else None,
             perm_spec=mp.get("perm_spec", False),
@@ -581,6 +604,13 @@ class Config:
         """
         d = dict(d)  # shallow copy so we don't mutate the caller's dict
         model_params = ModelParams.from_config_dict(d["model_params"])
+
+        # Inject use_scan into net_kwargs if it exists in model_params
+        net_kwargs = dict(d.get("net_kwargs", {}))
+        if "use_scan" not in net_kwargs:
+            net_kwargs["use_scan"] = model_params.use_scan
+        d["net_kwargs"] = net_kwargs
+
         optimizer_conf = OptimizerConf.from_config_dict(d["optimizer_conf"])
         # Migrate weight_decay: if the subspace model carries a non-zero weight
         # decay AND the optimizer is adamw, move it into the optimizer kwargs so
@@ -2489,7 +2519,7 @@ if __name__ == "__main__":
             "data": {
                 # 'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/boolq_dataset:v0",
-                'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
+                "dataset_path": WANDB_PATH + "/ARC-Easy_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
                 # "dataset_path": WANDB_PATH + "/obqa_dataset:v0",
                 "val_percentage": 0.1,
@@ -2503,7 +2533,7 @@ if __name__ == "__main__":
             "train_hyper": {
                 "batch_size": args.batch_size,
                 "num_epochs": -1,  # -1 means use num_steps instead
-                "num_steps": 10 if args.smoke_test else 10_000,
+                "num_steps": 2 if args.smoke_test else 10_000,
                 "eval_every_n_batch": 200,
                 "temperature": [1.0],
                 "dataset_sampling": {"minibatch": {}},
@@ -2520,6 +2550,7 @@ if __name__ == "__main__":
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 "subspace_model": "jsd_v2_category",
+                # "subspace_model": "jsd_noise_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
@@ -2527,7 +2558,7 @@ if __name__ == "__main__":
                 "indepent_connected": False,  # True → independently connected segments
                 "entropy_weight": 0.5,
                 "target_jsd": 0.1,
-                "noise_rate": 0.1,
+                "noise_rate": 0.3,
                 # curve topology: which parameters become the Bézier curve
                 "filter_masks": [
                     {"keys": ["self_attn", "q_proj", "kernel"], "op": "all"},

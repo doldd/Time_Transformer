@@ -45,6 +45,7 @@ from src.subspace_curve import (
     JensenShannonMixin,
     JensenShannonMixin_v2,
     JensenShannonNoiseMixin,
+    JensenShannonNoiseSamplingMixin,
     LoRAMixin,
 )
 from scipy.cluster import hierarchy
@@ -411,12 +412,15 @@ class ModelParams:
                 JensenShannonMixin,
                 JensenShannonMixin_v2,
                 JensenShannonNoiseMixin,
+                JensenShannonNoiseSamplingMixin,
             ),
         ):
             d["entropy_weight"] = self.entropy_weight
         if issubclass(s_model_cls, JensenShannonMixin_v2):
             d["target_jsd"] = self.target_jsd
-        if issubclass(s_model_cls, JensenShannonNoiseMixin):
+        if issubclass(
+            s_model_cls, (JensenShannonNoiseMixin, JensenShannonNoiseSamplingMixin)
+        ):
             d["noise_rate"] = self.noise_rate
             d["target_jsd"] = self.target_jsd
             d["vocab_size"] = self.vocab_size
@@ -2520,7 +2524,7 @@ if __name__ == "__main__":
                 "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
-                "subspace_model": "jsd_noise_category",
+                "subspace_model": "jsd_noise_sampling_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,

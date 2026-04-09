@@ -1416,16 +1416,25 @@ class JensenShannonMixin_v2:
 
 
 class JensenShannonNoiseMixin:
-    def __init__(self, entropy_weight=0.0, noise_rate=0.1, vocab_size=151936, **kwargs):
+    def __init__(
+        self,
+        entropy_weight=0.0,
+        noise_rate=0.1,
+        target_jsd=0.0,
+        vocab_size=151936,
+        **kwargs,
+    ):
         logger.info(
-            "Using Jensen-Shannon Noise Mixin with weight: %s, noise_rate: %s, vocab_size: %s",
+            "Using Jensen-Shannon Noise Mixin with weight: %s, noise_rate: %s, target_jsd: %s, vocab_size: %s",
             entropy_weight,
             noise_rate,
+            target_jsd,
             vocab_size,
         )
         super().__init__(**kwargs)
         self.entropy_weight = entropy_weight
         self.noise_rate = noise_rate
+        self.target_jsd = target_jsd
         self.vocab_size = vocab_size
 
     def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
@@ -1444,13 +1453,21 @@ class JensenShannonNoiseMixin:
         t2 = (t + self.t_max / 2) % self.t_max
         nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
 
-        # Create OOD data (random token replacement with noise_rate)
-        key, noise_key = jax.random.split(key)
+        # Create OOD data (dynamic per-sample noise rate)
+        key, rate_key, token_key = jax.random.split(key, 3)
+        batch_size = input_ids.shape[0]
+
+        # Sample a different noise rate for EACH sequence in the batch [0, noise_rate]
+        sample_noise_rates = jax.random.uniform(
+            rate_key, shape=(batch_size, 1), minval=0.0, maxval=self.noise_rate
+        )
+
         noise_mask = (
-            jax.random.uniform(noise_key, input_ids.shape) < self.noise_rate
+            jax.random.uniform(token_key, input_ids.shape) < sample_noise_rates
         ) & (attention_mask > 0)
+
         random_tokens = jax.random.randint(
-            noise_key, input_ids.shape, 0, self.vocab_size
+            token_key, input_ids.shape, 0, self.vocab_size
         )
         x_ood = (
             jnp.where(noise_mask, random_tokens, input_ids),
@@ -1473,7 +1490,10 @@ class JensenShannonNoiseMixin:
         )
         jsd_ood = (0.5 * (kl_1 + kl_2)).mean()
 
-        loss = 0.5 * (nll1.mean() + nll2.mean()) - self.entropy_weight * jsd_ood
+        # Margin-based JSD (target_jsd) - only penalize if below target
+        jsd_loss = jnp.maximum(self.target_jsd - jsd_ood, 0.0)
+
+        loss = 0.5 * (nll1.mean() + nll2.mean()) + self.entropy_weight * jsd_loss
 
         if self.weight_decay != 0.0:
             loss = loss + sum(

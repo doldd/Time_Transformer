@@ -418,6 +418,7 @@ class ModelParams:
             d["target_jsd"] = self.target_jsd
         if issubclass(s_model_cls, JensenShannonNoiseMixin):
             d["noise_rate"] = self.noise_rate
+            d["target_jsd"] = self.target_jsd
             d["vocab_size"] = self.vocab_size
         if self.lora_params and self.lora_params.use_lora:
             d.update(self.lora_params.model_kwargs())
@@ -2489,7 +2490,7 @@ if __name__ == "__main__":
             "data": {
                 # 'dataset_path': WANDB_PATH + "/winogrande_m_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/boolq_dataset:v0",
-                'dataset_path': WANDB_PATH + "/ARC-Easy_dataset:v0",
+                "dataset_path": WANDB_PATH + "/ARC-Easy_dataset:v0",
                 # 'dataset_path': WANDB_PATH + "/MMLU_chem_dataset:v0",
                 # "dataset_path": WANDB_PATH + "/obqa_dataset:v0",
                 "val_percentage": 0.1,
@@ -2519,15 +2520,15 @@ if __name__ == "__main__":
                 "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
-                "subspace_model": "jsd_v2_category",
+                "subspace_model": "jsd_noise_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
                 "curve_parameterization": "bezier",
                 "indepent_connected": False,  # True → independently connected segments
-                "entropy_weight": 0.5,
+                "entropy_weight": 5.0,
                 "target_jsd": 0.1,
-                "noise_rate": 0.1,
+                "noise_rate": 0.05,
                 # curve topology: which parameters become the Bézier curve
                 "filter_masks": [
                     {"keys": ["self_attn", "q_proj", "kernel"], "op": "all"},

@@ -536,7 +536,7 @@ class Config:
         }
     )
     net_kwargs: dict = field(
-        default_factory=lambda: {"model_path": "artifacts/qwen2.5_7B_bfloat16:v0"}
+        default_factory=lambda: {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"}
     )
     train_hyper: TrainHyperparams = field(default_factory=TrainHyperparams)
     model_params: ModelParams = field(default_factory=ModelParams)
@@ -821,7 +821,8 @@ def setup_metrics(
     # smoke-test trace with the 20-sample full-eval trace.
     @partial(jax.jit, static_argnames=("n_s",))
     def _eval_core(rng_key, params, n_s):
-        def pred(rng_key, data_idx):
+        def pred(carry, data_idx):
+            rng_key, _ = carry
             x_batch = x_pad.at[data_idx].get()
             att_m_batch = attn_pad.at[data_idx].get()
             # y_batch = target_pad.at[data_idx].get()
@@ -829,7 +830,8 @@ def setup_metrics(
             rng_key, key_ = random.split(rng_key)
             t_tree = get_t(key_, n_s)  # shape (n_s,)
 
-            def single_pred(key, t):
+            def single_pred(carry, t):
+                key, dummy = carry
                 key, subkey = random.split(key)
                 out, _ = model(
                     params["params"],
@@ -839,13 +841,18 @@ def setup_metrics(
                     train=False,
                     key=subkey,
                 )
-                return key, out  # out shape (batch_size, output_dim)
+                return (key, dummy), out  # out shape (batch_size, output_dim)
 
-            rng_key, out = jax.lax.scan(single_pred, rng_key, t_tree)
-            return rng_key, out  # out shape (n_s, batch_size, output_dim)
+            (rng_key, _), out = jax.lax.scan(
+                single_pred, (rng_key, jnp.empty((0,))), t_tree
+            )
+            return (
+                rng_key,
+                jnp.empty((0,)),
+            ), out  # out shape (n_s, batch_size, output_dim)
 
         # out: (n_batches, n_s, batch_size, output_dim)
-        rng_key, out = jax.lax.scan(pred, rng_key, idx_)
+        (rng_key, _), out = jax.lax.scan(pred, (rng_key, jnp.empty((0,))), idx_)
         # -> (n_s, n_padded, output_dim)  — trim padding
         out = out.transpose(1, 0, 2, 3).reshape(n_s, -1, out.shape[-1])[:, :n_valid, :]
         return rng_key, out  # (n_s, n_valid, output_dim)
@@ -2544,7 +2551,7 @@ if __name__ == "__main__":
             # --- Subspace model + LoRA architecture → ModelParams -----------------
             # All parameters that determine *what* the subspace model is.
             "model_params": {
-                "use_scan": True,  # whether to use flax scan model def
+                "use_scan": False,  # whether to use flax scan model def
                 "n_samples_eval": 10,
                 "num_curve_segment": 2,  # int → segmented degree; False → full curve
                 "SegDeg": 2,  # degree of each curve segment if num_curve_segment is set
@@ -2552,6 +2559,7 @@ if __name__ == "__main__":
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 # "subspace_model": "jsd_v2_category",
                 "subspace_model": "jsd_noise_category",
+                # "subspace_model": "lora_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
@@ -2631,7 +2639,7 @@ if __name__ == "__main__":
 
         #     # --- Base model (QwenTextClassificationWrapper) ------------------------
         #     'net_kwargs': {
-        #         'model_path': "artifacts/qwen2.5_7B_bfloat16:v0"
+        #         'model_path': "artifacts/qwen2.5_0.5B_bfloat16:v0"
         #     },
 
         #     # --- Training hyperparameters → TrainHyperparams ----------------------

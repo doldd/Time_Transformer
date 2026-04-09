@@ -315,33 +315,36 @@ class QwenForCausalLM(nn.Module):
         )
         hidden_states = embed_layer(input_ids)
 
+        batch_size, seq_len = input_ids.shape
+        if position_ids is None:
+            position_ids = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, seq_len), dtype=bool)
+
         if self.use_scan:
+            # attention_mask and position_ids are constant across layers
+            _attention_mask = attention_mask
+            _position_ids = position_ids
 
             class ScanQwenDecoderLayer(QwenDecoderLayer):
-                @nn.compact
-                def __call__(
-                    self,
-                    hidden_states,
-                    attention_mask=None,
-                    position_ids=None,
-                    train=True,
-                ):
-                    out = super().__call__(
-                        hidden_states, attention_mask, position_ids, train
-                    )
-                    # Return dummy array to bypass XLA tuple return bug with remat
-                    return out, jnp.empty((0,))
+                train: bool = True
 
-            ScannedRematLayer = nn.scan(
-                nn.remat(ScanQwenDecoderLayer, static_argnums=(4,)),
+                @nn.compact
+                def __call__(self, hidden_states):
+                    out = super().__call__(
+                        hidden_states, _attention_mask, _position_ids, self.train
+                    )
+                    return out
+
+            ScannedRematLayer = nn.remat_scan(
+                ScanQwenDecoderLayer,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                length=self.num_hidden_layers,
-                in_axes=(nn.broadcast, nn.broadcast, nn.broadcast),
-                out_axes=None,
+                lengths=(self.num_hidden_layers,),
             )
 
-            hidden_states, _ = ScannedRematLayer(
+            hidden_states = ScannedRematLayer(
                 hidden_size=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
@@ -350,8 +353,9 @@ class QwenForCausalLM(nn.Module):
                 rms_norm_eps=self.rms_norm_eps,
                 attention_dropout=self.attention_dropout,
                 rope_theta=self.rope_theta,
+                train=train,
                 name="layers",
-            )(hidden_states, attention_mask, position_ids, train)
+            )(hidden_states)
         else:
             for i in range(self.num_hidden_layers):
                 hidden_states = QwenDecoderLayer(

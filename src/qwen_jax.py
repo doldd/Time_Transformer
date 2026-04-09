@@ -329,10 +329,11 @@ class QwenForCausalLM(nn.Module):
                     out = super().__call__(
                         hidden_states, attention_mask, position_ids, train
                     )
-                    return out, None
+                    # Return dummy array to bypass XLA tuple return bug with remat
+                    return out, jnp.empty((0,))
 
             ScannedRematLayer = nn.scan(
-                ScanQwenDecoderLayer,
+                nn.remat(ScanQwenDecoderLayer, static_argnums=(4,)),
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
                 length=self.num_hidden_layers,

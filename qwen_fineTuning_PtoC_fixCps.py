@@ -46,6 +46,7 @@ from src.subspace_curve import (
     JensenShannonMixin_v2,
     JensenShannonNoiseMixin,
     JensenShannonNoiseSamplingMixin,
+    JensenShannonNoiseSamplingDropoutMixin,
     LoRAMixin,
 )
 from scipy.cluster import hierarchy
@@ -413,12 +414,16 @@ class ModelParams:
                 JensenShannonMixin_v2,
                 JensenShannonNoiseMixin,
                 JensenShannonNoiseSamplingMixin,
+                JensenShannonNoiseSamplingDropoutMixin,
             ),
         ):
             d["entropy_weight"] = self.entropy_weight
         if issubclass(s_model_cls, JensenShannonMixin_v2):
             d["target_jsd"] = self.target_jsd
-        if issubclass(s_model_cls, JensenShannonNoiseSamplingMixin):
+        if issubclass(
+            s_model_cls,
+            (JensenShannonNoiseSamplingMixin, JensenShannonNoiseSamplingDropoutMixin),
+        ):
             d["noise_rate"] = self.noise_rate
             d["target_jsd"] = self.target_jsd
             d["vocab_size"] = self.vocab_size

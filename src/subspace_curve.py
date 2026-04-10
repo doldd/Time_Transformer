@@ -1584,7 +1584,108 @@ class JensenShannonNoiseSamplingMixin:
         )
 
 
+class JensenShannonNoiseSamplingDropoutMixin:
+    def __init__(
+        self,
+        entropy_weight=0.0,
+        noise_rate=1.0,
+        target_jsd=0.0,
+        vocab_size=151936,
+        **kwargs,
+    ):
+        logger.info(
+            "Using Jensen-Shannon Noise Sampling Dropout Mixin with weight: %s, noise_rate (K): %s, target_jsd: %s, vocab_size: %s",
+            entropy_weight,
+            noise_rate,
+            target_jsd,
+            vocab_size,
+        )
+        super().__init__(**kwargs)
+        self.entropy_weight = entropy_weight
+        self.noise_rate = noise_rate
+        self.target_jsd = target_jsd
+        self.vocab_size = vocab_size
+
+    def compute_loss_t(self, key, t, params, state, freezed_params, x, y):
+        # x is (input_ids, attention_mask)
+        input_ids, attention_mask = x
+        joind_param = jax.tree.map(
+            lambda x, y, m: x if m else y,
+            params,
+            unfreeze(freezed_params),
+            self.train_mask,
+        )
+
+        # Symmetric NLL on clean data
+        nll1, state, out1 = self.nll(joind_param, state, t, x, y, train=True, key=key)
+
+        t2 = (t + self.t_max / 2) % self.t_max
+        nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
+
+        # Create OOD data (dynamic attention dropout based on K)
+        key, rate_key, drop_key = jax.random.split(key, 3)
+        batch_size = input_ids.shape[0]
+
+        # Determine valid sequence lengths per batch element
+        seq_lengths = jnp.sum(attention_mask > 0, axis=-1, keepdims=True)
+
+        # Sample K (number of tokens to drop) uniformly between [0, self.noise_rate] for each sequence
+        sample_k = jax.random.uniform(
+            rate_key, shape=(batch_size, 1), minval=0.0, maxval=self.noise_rate
+        )
+
+        # Calculate drop probabilities = K / sequence_length
+        drop_probs = sample_k / jnp.maximum(seq_lengths, 1.0)
+
+        # Create the dropout mask and apply it strictly to valid tokens
+        to_drop = jax.random.uniform(drop_key, attention_mask.shape) < drop_probs
+        new_attention_mask = jnp.where(
+            to_drop & (attention_mask > 0), 0, attention_mask
+        )
+
+        # Construct the OOD input (clean tokens, dropped attention)
+        x_ood = (input_ids, new_attention_mask)
+
+        # JSD on OOD data
+        out_ood1, state = self(joind_param, state, t, x_ood, train=True, key=key)
+        probs_ood1 = jax.nn.softmax(out_ood1, axis=-1)
+
+        out_ood2, state = self(joind_param, state, t2, x_ood, train=True, key=key)
+        probs_ood2 = jax.nn.softmax(out_ood2, axis=-1)
+
+        m_ood = 0.5 * (probs_ood1 + probs_ood2)
+        kl_1 = jnp.sum(
+            probs_ood1 * (jnp.log(probs_ood1 + 1e-8) - jnp.log(m_ood + 1e-8)), axis=-1
+        )
+        kl_2 = jnp.sum(
+            probs_ood2 * (jnp.log(probs_ood2 + 1e-8) - jnp.log(m_ood + 1e-8)), axis=-1
+        )
+        jsd_ood = (0.5 * (kl_1 + kl_2)).mean()
+
+        # Margin-based JSD (target_jsd) - only penalize if below target
+        jsd_loss = jnp.maximum(self.target_jsd - jsd_ood, 0.0)
+
+        loss = 0.5 * (nll1.mean() + nll2.mean()) + self.entropy_weight * jsd_loss
+
+        if self.weight_decay != 0.0:
+            loss = loss + sum(
+                self.l2_loss(w, alpha=self.weight_decay)
+                for w in jax.tree.leaves(params)
+            )
+        return loss.squeeze(), (
+            state,
+            {"nll1": nll1.mean(), "nll2": nll2.mean(), "jsd_ood": jsd_ood},
+        )
+
+
 # Define classes:
+@register_subspace_model("jsd_noise_sampling_dropout_category")
+class JSDNoiseSamplingDropoutCategorySubspace(
+    JensenShannonNoiseSamplingDropoutMixin, CategorySubspace
+):
+    pass
+
+
 @register_subspace_model("repulsive_regression")
 class RepulsiveRegressionSubspace(RepulsiveMixin, RegressionSubspace):
     pass

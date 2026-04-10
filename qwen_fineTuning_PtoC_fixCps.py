@@ -2531,7 +2531,7 @@ if __name__ == "__main__":
                 "Pretraining": False,  # whether this is the k=0 pretraining phase with fixed CPs
                 "curve_sampling_mode": "combined_test",  # 'per_leave' | 'combined_train' | 'combined_val' | 'combined_all' | 'combined_noBMA'
                 # "subspace_model": "jsd_noise_sampling_category",
-                "subspace_model": "jsd_noise_category",
+                "subspace_model": "jsd_noise_sampling_dropout_category",
                 "jitter_multiplier": 0.0,  # weight-init noise scale
                 "natural_parameterization": False,
                 "weight_decay": 0.0,

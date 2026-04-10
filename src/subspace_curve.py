@@ -1622,26 +1622,38 @@ class JensenShannonNoiseSamplingDropoutMixin:
         t2 = (t + self.t_max / 2) % self.t_max
         nll2, state, out2 = self.nll(joind_param, state, t2, x, y, train=True, key=key)
 
-        # Create OOD data (dynamic attention dropout based on K)
+        # Create OOD data (dynamic attention dropout based on percentage)
         key, rate_key, drop_key = jax.random.split(key, 3)
-        batch_size = input_ids.shape[0]
+        batch_size, seq_len = input_ids.shape
 
         # Determine valid sequence lengths per batch element
-        seq_lengths = jnp.sum(attention_mask > 0, axis=-1, keepdims=True)
+        seq_lengths = jnp.sum(attention_mask > 0, axis=-1)
 
-        # Sample K (number of tokens to drop) uniformly between [0, self.noise_rate] for each sequence
-        sample_k = jax.random.uniform(
-            rate_key, shape=(batch_size, 1), minval=0.0, maxval=self.noise_rate
+        # Sample a different noise rate (percentage) for EACH sequence in the batch
+        # Values are uniformly distributed between [0.0, self.noise_rate]
+        sample_noise_rates = jax.random.uniform(
+            rate_key, shape=(batch_size,), minval=0.0, maxval=self.noise_rate
         )
 
-        # Calculate drop probabilities = K / sequence_length
-        drop_probs = sample_k / jnp.maximum(seq_lengths, 1.0)
+        # Calculate K dynamically: round(length * percentage)
+        sample_k = jnp.round(seq_lengths * sample_noise_rates).astype(jnp.int32)
 
-        # Create the dropout mask and apply it strictly to valid tokens
-        to_drop = jax.random.uniform(drop_key, attention_mask.shape) < drop_probs
-        new_attention_mask = jnp.where(
-            to_drop & (attention_mask > 0), 0, attention_mask
-        )
+        # Create a random noise matrix for the top-k selection
+        noise = jax.random.uniform(drop_key, attention_mask.shape)
+        # Only consider valid tokens (mask > 0), set others to -1.0
+        noise = jnp.where(attention_mask > 0, noise, -1.0)
+
+        # Sort the noise. Invalid tokens (-1.0) are naturally pushed to the front.
+        sorted_noise = jnp.sort(noise, axis=-1)  # (batch_size, seq_len)
+
+        # The threshold value to drop the top 'k' tokens is at index (seq_len - k)
+        threshold_idx = jnp.clip(seq_len - sample_k, 0, seq_len - 1)
+        thresholds = jnp.take_along_axis(sorted_noise, threshold_idx[:, None], axis=-1)
+
+        # Tokens with noise >= threshold AND that are valid are dropped.
+        # We also ensure sample_k > 0 so we don't accidentally drop a token when K=0.
+        to_drop = (noise >= thresholds) & (attention_mask > 0) & (sample_k[:, None] > 0)
+        new_attention_mask = jnp.where(to_drop, 0, attention_mask)
 
         # Construct the OOD input (clean tokens, dropped attention)
         x_ood = (input_ids, new_attention_mask)
@@ -1676,14 +1688,6 @@ class JensenShannonNoiseSamplingDropoutMixin:
             state,
             {"nll1": nll1.mean(), "nll2": nll2.mean(), "jsd_ood": jsd_ood},
         )
-
-
-# Define classes:
-@register_subspace_model("jsd_noise_sampling_dropout_category")
-class JSDNoiseSamplingDropoutCategorySubspace(
-    JensenShannonNoiseSamplingDropoutMixin, CategorySubspace
-):
-    pass
 
 
 @register_subspace_model("repulsive_regression")
@@ -2524,6 +2528,13 @@ class LoRAJSDNoiseCategorySubspace(
 @register_subspace_model("jsd_noise_sampling_category")
 class LoRAJSDNoiseSamplingCategorySubspace(
     LoRAMixin, JensenShannonNoiseSamplingMixin, CategorySubspace
+):
+    pass
+
+
+@register_subspace_model("jsd_noise_sampling_dropout_category")
+class JSDNoiseSamplingDropoutCategorySubspace(
+    LoRAMixin, JensenShannonNoiseSamplingDropoutMixin, CategorySubspace
 ):
     pass
 

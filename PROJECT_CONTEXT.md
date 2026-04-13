@@ -5,7 +5,7 @@ This project implements and evaluates the **Point-to-Curve (PtoC)** framework fo
 ## Core Concepts
 
 - **LoRA Subspaces:** Instead of navigating the full parameter space, we optimize continuous paths strictly within the Low-Rank Adaptation (LoRA) modules.
-- **Segmented Bézier Curves:** The path is parameterized as a piecewise (segmented) Bézier curve. Each segment has a degree ($m$ or `SegDeg`) and the total path has a number of segments ($\nseg$ or `N_Seg`).
+- **Segmented Bézier Curves:** The path is parameterized as a piecewise (segmented) Bézier curve. Each segment has a degree ({seg_deg_name} or `SegDeg`) and the total path has a number of segments ($\nseg$ or `N_Seg`).
 - **Anchoring ($C_{\text{fix}}$):** A binary mask determines which control points are fixed (anchors from pre-trained point-estimate models) and which are trainable (intermediate points optimized to find the low-loss path).
 - **Bayesian Model Averaging (BMA):** At inference, we sample along the continuous curve to perform zero-overhead ensembling, improving uncertainty calibration and generalization.
 
@@ -21,7 +21,7 @@ This project implements and evaluates the **Point-to-Curve (PtoC)** framework fo
 - **Code-to-Paper Mapping:**
     - `cp_fix` $\rightarrow$ $C_{\text{fix}}$ (Binary mask for control points).
     - `N_Seg` $\rightarrow$ $\nseg$ (Number of segments).
-    - `SegDeg` $\rightarrow$ $m$ (Degree of each Bézier segment) ("curve_segment" hyper parameter if not False. If false degree is len(cp_fix)-1).
+    - `SegDeg` $\rightarrow$ {seg_deg_name} (Degree of each Bézier segment) ("curve_segment" hyper parameter if not False. If false degree is len(cp_fix)-1).
     - `lora_mode` $\rightarrow$ Specifies whether $A$, $B$, or a scaling matrix $S$ is time-varying.
 - **Flatness:** We incorporate noise-based regularization inspired by **Flat-LoRA (Liu et al., 2025)** to ensure the path remains in robust, flat regions of the loss landscape.
 

@@ -115,19 +115,17 @@ Essential pattern: `SubspaceBaseModel` (in `src/subspace_curve.py`) is central â
 16) Recent Progress (Context for following agents)
 --------------------------------------------------
 ### Goal
-Finalize ICML 2026/NeurIPS 2026 paper text for PtoC method (Overleaf project: `default`).
+Finalize ICML 2026/NeurIPS 2026 paper text for AtoC method (Overleaf project: `default`).
 
 ### Accomplished
 - **NeurIPS Migration:** Migrated `main.tex` to NeurIPS 2026 style.
-- **BMA Narrative:** Framed PtoC as a "path-integral BMA" bridging point-estimates and MCMC.
+- **BMA Narrative:** Framed AtoC as a "path-integral BMA" bridging point-estimates and MCMC.
 - **MFVI Insight:** Updated user story: the LoRA loss landscape is **not** overly complex, as MFVI works surprisingly well.
 - **Figures:** Integrated Figure 1 (TikZ) comparing MAP, MFVI, DE, Curve, and PSMILE.
-- **Experimental Results:** Updated `main.tex` with empirical insights (PtoC > DE(5) on ARC-Challenge LL).
+- **Experimental Results:** Updated `main.tex` with empirical insights (AtoC > DE(5) on ARC-Challenge LL).
 
 ### Work In Progress
-- **PSMILE Analysis:** Finalize Figure 2/Analysis for particle-based MCMC vs Curve BMA.
-- **MFVI Theory:** Refine text explaining the efficacy of MFVI in the LoRA subspace.
-- **Consistency:** Ensure $\nseg$ ($N_{\text{seg}}$) and $\segdeg$ notation remains uniform.
+- **Paper Writing:** Actively drafting and refining the main text of the paper.
 
 Notes
 -----

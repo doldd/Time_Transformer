@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# DEPRECATED: OOD computation has been merged into compute_curve_logits.py.
+# That script now handles both ID and OOD in a single pass and is the
+# canonical entry point.  This file is kept for reference only.
+import warnings
+
+warnings.warn(
+    "compute_ood_logits.py is deprecated. Use compute_curve_logits.py instead.",
+    DeprecationWarning,
+    stacklevel=1,
+)
+
 import argparse
 import copy
 import os
@@ -114,7 +125,10 @@ def main():
                     continue
 
             model_name = get_model_name(run)
-            filename = f"ood_custom_seed_{run.config.get('rng_seed', 1)}_{model_name}_{run.id}.npz"
+            # Extract dataset name for new naming convention
+            ds_name = run.config.get("data", {}).get("dataset_path", "").split("/")[-1]
+            clean_ds = clean_dataset_name(ds_name)
+            filename = f"{clean_ds}_seed_{run.config.get('rng_seed', 1)}_{model_name}_{run.id}_ood.npz"
             filepath = os.path.join(LOGITS_DIR, filename)
 
             if os.path.exists(filepath):
@@ -217,7 +231,7 @@ def main():
                     # Concatenate into (N_checkpoints, n_valid, n_classes)
                     de_logits = np.concatenate(de_logits_list, axis=0)
 
-                    de_filename = f"ood_custom_seed_{run.config.get('rng_seed', 1)}_DE({len(stored_valid_pts)},{config.model_params.SegDeg - 1})_{run.id}.npz"
+                    de_filename = f"{clean_ds}_seed_{run.config.get('rng_seed', 1)}_DE({len(stored_valid_pts)},{config.model_params.SegDeg - 1})_{run.id}_ood.npz"
                     de_filepath = os.path.join(LOGITS_DIR, de_filename)
                     # Convert labels to object array to preserve list structure in npz
                     labels_to_save = np.array(labels_ood, dtype=object)

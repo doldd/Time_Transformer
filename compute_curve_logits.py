@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import argparse
 import copy
+import gc
 import json
 import os
+import yaml
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import wandb
+from transformers import AutoTokenizer
 from qwen_fineTuning_PtoC_fixCps import (
     Config,
+    DataSplits,
     _setup_training_env,
     _prepare_datasets,
     setup_metrics,
@@ -22,6 +26,9 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 LOGITS_DIR = "funct_smooth/logits_backup"
 os.makedirs(LOGITS_DIR, exist_ok=True)
+
+OOD_DATA_PATH = "funct_smooth/my_ood_data.yaml"
+MODEL_NAME = "Qwen/Qwen2.5-7B"
 
 
 def clean_dataset_name(ds_name):
@@ -75,6 +82,21 @@ def load_config_and_data(run, local_path="artifacts"):
     config = Config.from_dict(run.config, data=data)
     config.net_kwargs["target_token_ids"] = unique_target_ids
     return config, data, rng_key
+
+
+def load_ood_data(tokenizer):
+    """Load and tokenize OOD prompts/labels from the YAML file."""
+    with open(OOD_DATA_PATH, "r") as f:
+        data = yaml.safe_load(f)
+
+    prompts = [ex["prompt"] for ex in data["examples"]]
+    labels = [ex["label"] for ex in data["examples"]]
+
+    encodings = tokenizer(prompts, padding=True, return_tensors="np")
+    x_ood = jnp.array(encodings["input_ids"])
+    attn_ood = jnp.array(encodings["attention_mask"])
+
+    return x_ood, attn_ood, labels
 
 
 def main():
@@ -140,15 +162,20 @@ def main():
         filename = f"{clean_ds}_seed_{TARGET_SEED}_{model_name}_{run.id}.npz"
         filepath = os.path.join(LOGITS_DIR, filename)
 
+        filepath_ood = filepath.replace(".npz", "_ood.npz")
         if "ALC(" in model_name:
-            filename2 = f"{clean_ds}_seed_{TARGET_SEED}_{model_name.replace('ALC', 'DE')}_{run.id}.npz"
-            filepath2 = os.path.join(LOGITS_DIR, filename2)
-            if os.path.exists(filepath) and os.path.exists(filepath2):
-                # print(f"Skipping {filename}, already exists.")
+            de_filepath = os.path.join(
+                LOGITS_DIR,
+                f"{clean_ds}_seed_{TARGET_SEED}_{model_name.replace('ALC', 'DE')}_{run.id}.npz",
+            )
+            de_filepath_ood = de_filepath.replace(".npz", "_ood.npz")
+            if all(
+                os.path.exists(f)
+                for f in [filepath, filepath_ood, de_filepath, de_filepath_ood]
+            ):
                 continue
         else:
-            if os.path.exists(filepath):
-                # print(f"Skipping {filename}, already exists.")
+            if os.path.exists(filepath) and os.path.exists(filepath_ood):
                 continue
 
         sweep_id = run.sweep.id if run.sweep else "None"
@@ -190,21 +217,39 @@ def main():
         )
         return
 
+    # Lazy-load OOD data once if any run needs it
+    needs_ood_globally = any(
+        not os.path.exists(fp.replace(".npz", "_ood.npz"))
+        for _, _, _, fp in runs_to_process
+    )
+    x_ood = attn_ood = labels_ood = dummy_labels_ood = None
+    if needs_ood_globally:
+        print(f"\nLoading OOD tokenizer ({MODEL_NAME})...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        print(f"Loading OOD data from {OOD_DATA_PATH}...")
+        x_ood, attn_ood, labels_ood = load_ood_data(tokenizer)
+        dummy_labels_ood = jnp.array([-1] * len(labels_ood))
+        print(f"OOD data loaded. Shape: {x_ood.shape}")
+
     print("\nSecond pass: Processing runs...")
     for run, ds_name, clean_ds, filepath in runs_to_process:
         print(f"Processing {run.id} for dataset {ds_name}...")
         try:
-            # Download artifacts if needed
+            # ------------------------------------------------------------------ #
+            # Artifact download
+            # ------------------------------------------------------------------ #
             local_path = os.path.abspath("artifacts")
             os.makedirs(local_path, exist_ok=True)
             dataset_artifact = ds_name if ":" in ds_name else f"{ds_name}:v0"
 
-            # Check for existing qwen model and dataset
             qwen_found = any("qwen2.5_7B_bfloat16" in d for d in os.listdir(local_path))
             ds_found = any(clean_ds in d for d in os.listdir(local_path))
 
             if not qwen_found:
-                print(f"Downloading artifact qwen2.5_7B_bfloat16:v0...")
+                print("Downloading artifact qwen2.5_7B_bfloat16:v0...")
                 art = api.artifact(f"ddold/{project}/qwen2.5_7B_bfloat16:v0")
                 art.download(local_path)
             else:
@@ -217,110 +262,226 @@ def main():
             else:
                 print(f"Dataset artifact for {clean_ds} found, skipping download.")
 
+            # ------------------------------------------------------------------ #
+            # Load config / ID data (needed for OOD too — provides target_token_ids)
+            # ------------------------------------------------------------------ #
             config, data, rng_key = load_config_and_data(run, local_path=local_path)
             print("Config and data loaded.")
-            
-            x_test, attn_test, labels = data.get("test")
-            num_test = len(labels)
 
-            # Identify ALC models (Pretraining=True) and compute Deep Ensemble (DE) logits
+            x_test, attn_test, labels = data.get("test")
             is_alc = run.config.get("model_params", {}).get("Pretraining", False)
 
-            env, params, rng_key = _setup_training_env(config, data, rng_key)
-            params, _, _, _, pretrained_params, _ = load_checkpoint_new(run, params, env.s_model)
-            if is_alc and pretrained_params is not None:
-                print("Computing DE logits for ALC model...")
-                # Filter out False entries
-                valid_pts = [p for p in pretrained_params if p is not False]
+            # Determine what still needs computing
+            filepath_ood = filepath.replace(".npz", "_ood.npz")
+            need_id = not os.path.exists(filepath)
+            need_ood = not os.path.exists(filepath_ood)
+            need_de_id = need_de_ood = False
+            de_filepath = de_filepath_ood = None
+            if is_alc:
+                de_filepath = filepath.replace("ALC", "DE")
+                de_filepath_ood = de_filepath.replace(".npz", "_ood.npz")
+                need_de_id = not os.path.exists(de_filepath)
+                need_de_ood = not os.path.exists(de_filepath_ood)
+
+            # Build OOD DataSplits if needed (reuses pre-loaded OOD arrays)
+            data_splits_ood = None
+            if need_ood or need_de_ood:
+                data_splits_ood = DataSplits(
+                    train_input_ids=x_ood,
+                    train_attention_mask=attn_ood,
+                    train_labels=dummy_labels_ood,
+                    test_input_ids=x_ood,
+                    test_attention_mask=attn_ood,
+                    test_labels=dummy_labels_ood,
+                )
+
+            # ------------------------------------------------------------------ #
+            # DE block (ALC only) — single checkpoint loop, collect ID + OOD
+            # ------------------------------------------------------------------ #
+            env = params = None
+            if is_alc and (need_de_id or need_de_ood):
+                print("Loading checkpoint for DE computation...")
+                env, params, rng_key = _setup_training_env(config, data, rng_key)
+                params, _, _, _, pretrained_params, _ = load_checkpoint_new(
+                    run, params, env.s_model
+                )
+                valid_pts = (
+                    [p for p in pretrained_params if p is not False]
+                    if pretrained_params is not None
+                    else []
+                )
+
                 if valid_pts:
-                    de_logits_list = []
+                    de_logits_id_list = [] if need_de_id else None
+                    de_logits_ood_list = [] if need_de_ood else None
+
                     with config.as_pretrain() as pt_config:
-                        # Re-initialize environment for pretrain mode
-                        env, params, rng_key = _setup_training_env(
+                        env_pt, params_pt, rng_key = _setup_training_env(
                             pt_config, data, rng_key
                         )
-                        params = env.s_model.set_lora_rho(
-                            rho_s=0.0, rho_w=0.0, params=params
+                        params_pt = env_pt.s_model.set_lora_rho(
+                            rho_s=0.0, rho_w=0.0, params=params_pt
                         )
-                        # n_samples=1 for discrete logits
-                        # Use a small batch size to avoid OOM
-                        de_pred_fn = setup_metrics(
-                            env.s_model,
-                            4,
-                            x_test,
-                            attn_test,
-                            labels,
-                            n_samples=1,
-                            use_linspace=True,
-                        )
+
+                        if need_de_id:
+                            de_pred_fn_id = setup_metrics(
+                                env_pt.s_model,
+                                4,
+                                x_test,
+                                attn_test,
+                                labels,
+                                n_samples=1,
+                                use_linspace=True,
+                            )
+                        if need_de_ood:
+                            de_pred_fn_ood = setup_metrics(
+                                env_pt.s_model,
+                                4,
+                                x_ood,
+                                attn_ood,
+                                dummy_labels_ood,
+                                n_samples=1,
+                                use_linspace=True,
+                            )
 
                         for pt_idx, pt_p in enumerate(valid_pts):
                             print(
-                                f"Inference for checkpoint {pt_idx + 1}/{len(valid_pts)}..."
+                                f"DE inference for checkpoint"
+                                f" {pt_idx + 1}/{len(valid_pts)}..."
                             )
-                            # Inject checkpoint into parameters using train_mask
-                            params['params'] = jax.tree.map(
+                            params_pt["params"] = jax.tree.map(
                                 lambda m, p, pl: pl if m else p,
-                                env.s_model.train_mask,
-                                params["params"],
+                                env_pt.s_model.train_mask,
+                                params_pt["params"],
                                 pt_p,
                             )
-                            # Run inference
-                            _, pt_logits = de_pred_fn(jax.random.PRNGKey(0), params)
-                            # pt_logits shape: (1, n_valid, n_classes)
-                            de_logits_list.append(np.array(pt_logits))
+                            if need_de_id:
+                                _, pt_logits = de_pred_fn_id(
+                                    jax.random.PRNGKey(0), params_pt
+                                )
+                                de_logits_id_list.append(np.array(pt_logits))
+                            if need_de_ood:
+                                _, pt_logits_ood = de_pred_fn_ood(
+                                    jax.random.PRNGKey(0), params_pt
+                                )
+                                de_logits_ood_list.append(np.array(pt_logits_ood))
 
-                    # Concatenate into (N_checkpoints, n_valid, n_classes)
-                    de_logits = np.concatenate(de_logits_list, axis=0)
-                    
-                    de_filepath = filepath.replace("ALC", "DE")
-                    np.savez(
-                        de_filepath,
-                        logits=de_logits,
-                        labels=np.array(labels),
-                        n_checkpoints=len(valid_pts),
-                        wandb_path=run.path,
-                    )
-                    print(f"Saved DE logits to {de_filepath}")
+                    if need_de_id:
+                        de_logits = np.concatenate(de_logits_id_list, axis=0)
+                        np.savez(
+                            de_filepath,
+                            logits=de_logits,
+                            labels=np.array(labels),
+                            n_checkpoints=len(valid_pts),
+                            wandb_path=run.path,
+                        )
+                        print(f"Saved DE logits to {de_filepath}")
 
-            # Revert manual chunking and use setup_metrics directly with a fixed small batch size
+                    if need_de_ood:
+                        de_logits_ood = np.concatenate(de_logits_ood_list, axis=0)
+                        labels_ood_save = np.empty(len(labels_ood), dtype=object)
+                        for i, lbl in enumerate(labels_ood):
+                            labels_ood_save[i] = lbl
+                        np.savez(
+                            de_filepath_ood,
+                            logits=de_logits_ood,
+                            labels=labels_ood_save,
+                            n_checkpoints=len(valid_pts),
+                            wandb_path=run.path,
+                        )
+                        print(f"Saved DE OOD logits to {de_filepath_ood}")
 
-            print("Training curve env setup.")
-            env, params, rng_key = _setup_training_env(config, data, rng_key)
-            params, _, _, _, _, _ = load_checkpoint_new(run, params, env.s_model)
-            params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+                # Clear DE state before curve passes
+                env = params = None
+                try:
+                    env_pt = params_pt = None
+                    de_pred_fn_id = de_pred_fn_ood = None
+                except NameError:
+                    pass
+                gc.collect()
 
-            print(f"Setting up metrics for {num_test} examples...")
-            pred_fn = setup_metrics(
-                env.s_model,
-                4,  # Fixed small batch size to avoid OOM
-                x_test,
-                attn_test,
-                labels,
-                n_samples=args.n_samples,
-                use_linspace=True,
-            )
+            # ------------------------------------------------------------------ #
+            # Curve ID block
+            # ------------------------------------------------------------------ #
+            if need_id:
+                print("Setting up curve ID environment...")
+                env, params, rng_key = _setup_training_env(config, data, rng_key)
+                params, _, _, _, _, _ = load_checkpoint_new(run, params, env.s_model)
+                params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
 
-            print("Running prediction...")
-            # To avoid timeout, we might need to process in smaller chunks or use a more efficient scan.
-            # But setup_metrics is already scanning. Let's try to see if it's just the first compilation that is slow.
-            _, logits = pred_fn(jax.random.PRNGKey(0), params)
+                print(f"Running curve ID prediction ({len(labels)} examples)...")
+                pred_fn = setup_metrics(
+                    env.s_model,
+                    4,
+                    x_test,
+                    attn_test,
+                    labels,
+                    n_samples=args.n_samples,
+                    use_linspace=True,
+                )
+                _, logits = pred_fn(jax.random.PRNGKey(0), params)
 
-            # Check for NaNs
-            if np.any(np.isnan(logits)):
-                print("Warning: NaNs detected in logits!")
+                if np.any(np.isnan(logits)):
+                    print("Warning: NaNs detected in ID logits!")
+                print(f"ID logits shape: {logits.shape}")
 
-            print(f"Logits shape: {logits.shape}, Labels shape: {labels.shape}")
+                np.savez(
+                    filepath,
+                    logits=np.array(logits),
+                    labels=np.array(labels),
+                    n_samples=args.n_samples,
+                    t_max=float(env.s_model.t_max),
+                    wandb_path=run.path,
+                )
+                print(f"Saved {filepath}")
 
-            np.savez(
-                filepath,
-                logits=np.array(logits),
-                labels=np.array(labels),
-                n_samples=args.n_samples,
-                t_max=float(env.s_model.t_max),
-                wandb_path=run.path,
-            )
-            print(f"Saved {filepath}")
+                if need_ood:
+                    env = params = pred_fn = None
+                    gc.collect()
+
+            # ------------------------------------------------------------------ #
+            # Curve OOD block
+            # ------------------------------------------------------------------ #
+            if need_ood:
+                print("Setting up curve OOD environment...")
+                env, params, rng_key = _setup_training_env(
+                    config, data_splits_ood, rng_key
+                )
+                params, _, _, _, _, _ = load_checkpoint_new(run, params, env.s_model)
+                params = env.s_model.set_lora_rho(rho_s=0.0, rho_w=0.0, params=params)
+
+                print(f"Running curve OOD prediction ({len(labels_ood)} examples)...")
+                pred_fn = setup_metrics(
+                    env.s_model,
+                    4,
+                    x_ood,
+                    attn_ood,
+                    dummy_labels_ood,
+                    n_samples=args.n_samples,
+                    use_linspace=True,
+                )
+                _, logits_ood = pred_fn(jax.random.PRNGKey(0), params)
+
+                if np.any(np.isnan(logits_ood)):
+                    print("Warning: NaNs detected in OOD logits!")
+                print(f"OOD logits shape: {logits_ood.shape}")
+
+                labels_ood_save = np.empty(len(labels_ood), dtype=object)
+                for i, lbl in enumerate(labels_ood):
+                    labels_ood_save[i] = lbl
+
+                np.savez(
+                    filepath_ood,
+                    logits=np.array(logits_ood),
+                    labels=labels_ood_save,
+                    n_samples=args.n_samples,
+                    t_max=float(env.s_model.t_max),
+                    wandb_path=run.path,
+                )
+                print(f"Saved {filepath_ood}")
+
+                env = params = pred_fn = None
+                gc.collect()
 
         except Exception as e:
             print(f"Error processing run {run.id}: {e}")

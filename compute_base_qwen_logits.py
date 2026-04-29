@@ -120,7 +120,7 @@ def main():
 
             clean_ds = clean_dataset_name(ds_name)
             save_path = os.path.join(LOGITS_DIR, f"{clean_ds}_QWEN.npz")
-            ood_save_path = os.path.join(LOGITS_DIR, "ood_custom_QWEN.npz")
+            ood_save_path = os.path.join(LOGITS_DIR, f"{clean_ds}_QWEN_ood.npz")
 
             # Check if both exist
             if os.path.exists(save_path) and (

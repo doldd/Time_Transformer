@@ -612,6 +612,7 @@ class SubspaceBaseModel:
             )
 
         # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
+        # use the same weight matrix initialization as Hugging Face PEFT library does for the LoRA A matrix
         def make_curve(m, p, key):
             if m:
                 if (type(p) is LoRAParams) or (type(p) is LoRAepsilonAParams):

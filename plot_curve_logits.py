@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--files", type=str, nargs="+", default=None)
     parser.add_argument("--indices", type=int, nargs="+", default=None)
+    parser.add_argument("--indices_ood", type=int, nargs="+", default=None)
     args = parser.parse_args()
 
     import wandb
@@ -55,14 +56,14 @@ def main():
         print(f"Directory {args.input_dir} does not exist.")
         return
 
+    # FIX 1: Ignore OOD files during the initial dataset compilation
     if args.files:
-        # Use only the explicitly passed files
-        files_to_scan = [f for f in args.files if f.endswith(".npz")]
+        files_to_scan = [f for f in args.files if f.endswith(".npz") and not f.endswith("_ood.npz")]
     else:
-        files_to_scan = [f for f in os.listdir(args.input_dir) if f.endswith(".npz")]
+        files_to_scan = [f for f in os.listdir(args.input_dir) if f.endswith(".npz") and not f.endswith("_ood.npz")]
 
     if not files_to_scan:
-        print("No .npz files found.")
+        print("No primary .npz files found (excluding OOD files).")
         return
 
     datasets = {}
@@ -107,7 +108,6 @@ def main():
             if "wandb_path" in d:
                 try:
                     wp = d["wandb_path"]
-                    # ... existing logic to resolve wp ...
                     if isinstance(wp, np.ndarray) and wp.size == 3:
                         run_path = "/".join(wp.tolist())
                     elif isinstance(wp, np.ndarray) and wp.size == 1:
@@ -149,16 +149,16 @@ def main():
         if not all_data:
             continue
 
-        # probs: (models, T, samples, classes)
-        # Compute BMA entropy per sample to select top K
-        # BMA entropy = entropy(mean(probs over T))
-
         if args.indices:
             top_k_indices = args.indices
         else:
+            # FIX: Find the minimum number of samples across all models
+            min_samples = min([d["logits"].shape[1] for d in all_data])
+
             sample_entropies = []
             for d in all_data:
-                logits = d["logits"]  # (T, samples, classes)
+                logits = d["logits"][:, :min_samples, :]  # (T, samples, classes)
+                print(f"Processing {d['filename']} with logits shape {logits.shape}...")
                 probs = softmax(logits, axis=-1)
                 avg_probs = np.mean(probs, axis=0)  # (samples, classes)
                 ent = -np.sum(avg_probs * np.log(avg_probs + 1e-10), axis=-1)
@@ -168,38 +168,36 @@ def main():
             max_ent_per_sample = np.max(np.stack(sample_entropies), axis=0)
             top_k_indices = np.argsort(max_ent_per_sample)[::-1][: args.k]
 
-        # Load OOD data if available
+        # FIX 2: Correct scoping and simplified OOD matching logic
         ood_rows = []
         all_files_in_dir = os.listdir(args.input_dir)
-        for rid in [d["run_id"] for d in all_data]:
-            if rid == "BASE":
-                # Explicitly look for ood_custom_QWEN.npz for the base model
-                qwen_ood_path = os.path.join(args.input_dir, "ood_custom_QWEN.npz")
-                if os.path.exists(qwen_ood_path):
-                    ood_data = dict(np.load(qwen_ood_path, allow_pickle=True))
-                    ood_rows.append(ood_data)
-                else:
-                    ood_rows.append(None)
-                continue
-            # Try to find ood file for this run_id
-            ood_file = [
-                f
-                for f in all_files_in_dir
-                if f.startswith("ood_custom_") and f.endswith(f"_{rid}.npz")
-            ]
-            if ood_file:
-                ood_path = os.path.join(args.input_dir, ood_file[0])
-                ood_data = dict(np.load(ood_path, allow_pickle=True))
+        
+        for d in all_data:
+            expected_ood = d["filename"].replace(".npz", "_ood.npz")
+            if expected_ood in all_files_in_dir:
+                ood_data = dict(
+                    np.load(
+                        os.path.join(args.input_dir, expected_ood), allow_pickle=True
+                    )
+                )
                 ood_rows.append(ood_data)
             else:
                 ood_rows.append(None)
 
         # Check if we have OOD examples (all OOD examples must be shown as rows)
         num_ood_samples = 0
-        valid_ood_indices = []
         for row in ood_rows:
             if row is not None:
                 num_ood_samples = max(num_ood_samples, row["logits"].shape[1])
+
+        # Determine which OOD sample indices to display
+        if args.indices_ood is not None:
+            # Use explicitly provided OOD indices
+            ood_sample_indices = args.indices_ood
+            num_ood_samples = len(ood_sample_indices)
+        else:
+            # Show all OOD samples (indices 0, 1, 2, ...)
+            ood_sample_indices = list(range(num_ood_samples))
 
         total_rows = len(top_k_indices) + num_ood_samples
         num_models = len(all_data)
@@ -231,7 +229,7 @@ def main():
         for i in range(total_rows):
             is_ood = i >= len(top_k_indices)
             if is_ood:
-                sample_idx = i - len(top_k_indices)
+                sample_idx = ood_sample_indices[i - len(top_k_indices)]
             else:
                 sample_idx = top_k_indices[i]
 
@@ -247,6 +245,7 @@ def main():
                         ax.axis("off")
                         continue
 
+                print(f"Plotting sample {sample_idx} for model {d['model_name']} (OOD: {is_ood}) shape {current_data['logits'].shape}...")
                 if "t_max" not in current_data:
                     current_data["t_max"] = 1.0  # Default for QWEN or DE
 

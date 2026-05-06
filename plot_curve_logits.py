@@ -41,7 +41,7 @@ def main():
     parser.add_argument(
         "--plot-type", choices=["heatmap", "lineplot"], default="heatmap"
     )
-    parser.add_argument("--input-dir", default="funct_smooth/logits_backup")
+    parser.add_argument("--input-dir", default="dataset/logits_backup")
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--files", type=str, nargs="+", default=None)
     parser.add_argument("--indices", type=int, nargs="+", default=None)
@@ -362,7 +362,7 @@ def main():
             y=1.02,
         )
         plt.tight_layout()
-        output_path = f"funct_smooth/smootheness_{ds_name}_{args.plot_type}.pdf"
+        output_path = f"dataset/smootheness_{ds_name}_{args.plot_type}.pdf"
         plt.savefig(output_path, bbox_inches="tight")
         print(f"Saved {output_path}")
         plt.close()

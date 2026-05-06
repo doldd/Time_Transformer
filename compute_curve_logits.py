@@ -24,10 +24,10 @@ from src.utils import load_checkpoint_new
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-LOGITS_DIR = "funct_smooth/logits_backup"
+LOGITS_DIR = "dataset/logits_backup"
 os.makedirs(LOGITS_DIR, exist_ok=True)
 
-OOD_DATA_PATH = "funct_smooth/my_ood_data.yaml"
+OOD_DATA_PATH = "dataset/my_ood_data.yaml"
 MODEL_NAME = "Qwen/Qwen2.5-7B"
 
 

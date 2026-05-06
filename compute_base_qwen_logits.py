@@ -17,7 +17,7 @@ from qwen_fineTuning_PtoC_fixCps import (
 # Configure environment
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-LOGITS_DIR = "funct_smooth/logits_backup"
+LOGITS_DIR = "dataset/logits_backup"
 os.makedirs(LOGITS_DIR, exist_ok=True)
 
 
@@ -26,7 +26,7 @@ def clean_dataset_name(ds_name):
 
 
 def load_ood_data(tokenizer_path):
-    ood_yaml_path = "funct_smooth/my_ood_data.yaml"
+    ood_yaml_path = "dataset/my_ood_data.yaml"
     with open(ood_yaml_path, "r") as f:
         ood_data = yaml.safe_load(f)
 

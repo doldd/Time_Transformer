@@ -1,0 +1,116 @@
+program: qwen_fineTuning_PtoC_fixCps.py
+name: OpenFlat_JSD_v2
+description: "Test curve connection with open control points with 12 bezier segments (non smooth traversion (Approach 2 (easy))."
+method: grid
+metric:
+  goal: maximize
+  name: test_ppd_uniform_ll
+parameters:
+  rng_seed:
+    values: [1, 2, 20, 400, 8000]
+  load_params_path:
+    value: False
+  data:
+    parameters:
+      dataset_path:
+        values: [
+                 "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0", 
+                 "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0", 
+                 "ddold/qwen_PtoC_newDS/ARC-Challenge_dataset:v0",
+                 "ddold/qwen_PtoC_newDS/obqa_dataset:v0", 
+                 "ddold/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
+                 ]
+      val_percentage:
+        value: 0.1
+  net_kwargs:
+    parameters:
+      model_path:
+        value: "ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0"
+  train_hyper:
+    parameters:
+      batch_size:
+        value: 4
+      eval_every_n_batch:
+        value: 100
+      num_epochs:
+        value: -1
+      num_steps:
+        value: 10000
+      save_params:
+        value: True
+      dataset_sampling:
+        parameters:
+          minibatch:
+            value: False
+      temperature:
+        value: [1.0,]
+  model_params:
+    parameters:
+      n_samples_eval:
+        value: "auto"
+      num_curve_segment:
+        values: [1, 2, 4, 8]
+      SegDeg:
+        values: [2, 3]
+      Pretraining:
+        value: False
+      curve_sampling_mode:
+        values: ["combined_all"]
+      subspace_model:
+        value: "jsd_v2_category"
+      filter_masks:
+        values:
+          - [{keys: ["self_attn", "q_proj", "kernel"], op: all}, {keys: ["self_attn", "v_proj", "kernel"], op: all}, {keys: ["lm_head", "kernel"], op: all}]
+      jitter_multiplier:
+        values: [0.0]
+      natural_parameterization:
+        value: False
+      weight_decay:
+        value: 0.0
+      curve_parameterization:
+        values: ["bezier",]
+      indepent_connected:
+        value: False
+      gravity:
+        value: 0.0
+      energy_weakening:
+        value: 1.0
+      regularizer:
+        value: False
+      entropy_weight:
+        value: 2.0
+      target_jsd:
+        value: 0.05
+      noise_rate:
+        value: 0.2
+      lora_params:
+        parameters:
+          use_lora:
+            value: True
+          rho_scheduler_frequency:
+            values: [50]
+          filter_masks:
+            values:
+              - [{keys: ["self_attn", "q_proj", "kernel"], op: all, dims: [1, 0]}, {keys: ["self_attn", "v_proj", "kernel"], op: all, dims: [1, 0]}, {keys: ["lm_head", "kernel"], op: all, dims: [1, 0]}]
+          r:
+            values: [8]
+          lora_dtype:
+            value: "float32"
+          lora_alpha:
+            value: 16.0
+          lora_mode:
+            # values: ["A(t)eB(t)", "Asd(t)eB", "A(t)eB"]
+            values: ["A(t)eB(t)",]
+          lora_rho:
+            values: [0.25,]
+          lora_rho_s:
+            values: [0.0]
+  optimizer_conf:
+    values:
+      - {name: adamw, kwargs: {learning_rate: {name: linear_onecycle_schedule, kwargs: {transition_steps: 10000, peak_value: 1e-4, pct_start: 0.12, pct_final: 1.0, div_factor: 300.0, final_div_factor: 300}}, weight_decay: 0.001}, freeze_other_params: true}
+
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- --use-sweep

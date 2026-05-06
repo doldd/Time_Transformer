@@ -67,9 +67,9 @@ def get_model_name(run):
 
 def load_config_and_data(run, local_path="artifacts"):
     run.config["net_kwargs"]["model_path"] = f"{local_path}/qwen2.5_7B_bfloat16:v0"
-    run.config["data"]["dataset_path"] = (
-        f"{local_path}/{run.config['data']['dataset_path'].split('/')[-1]}"
-    )
+    run.config["data"][
+        "dataset_path"
+    ] = f"{local_path}/{run.config['data']['dataset_path'].split('/')[-1]}"
     rng_key = jax.random.PRNGKey(0)
     data, unique_target_ids, rng_key = _prepare_datasets(
         rng_key,

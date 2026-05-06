@@ -10,7 +10,6 @@ import os
 
 
 class S2ClassDataset(DatasetBase):
-
     NAME = "bertds"  # used for loading the dataset
     task_info = {
         "sst2": {"num_labels": 2, "tokenize_keys": ("sentence", None)},
@@ -263,7 +262,6 @@ class S2ClassDataset(DatasetBase):
             )
 
     def deal_with_specical_datasets(self):
-
         # Initialize counters
         count_3_choices_train = 0
         count_5_choices_train = 0

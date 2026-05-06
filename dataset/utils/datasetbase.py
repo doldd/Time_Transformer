@@ -1,8 +1,6 @@
 # Abstrat class for datasets, including the following methods:
 # get_loaders()
 
-from argparse import Namespace
-
 
 class DatasetBase:
     NAME: str

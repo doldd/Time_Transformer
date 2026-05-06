@@ -15,7 +15,7 @@ import optax
 import wandb
 from einshape import jax_einshape as es
 import matplotlib.pyplot as plt
-from flax.core import freeze, unfreeze
+from flax.core import freeze
 
 from jax_tqdm import scan_tqdm
 from src.utils import (
@@ -26,7 +26,6 @@ from src.utils import (
     upper_bound,
     bezier_mass_center,
     bezier_gyration,
-    bezier_mean_curvature,
     bezier_rel_center,
 )
 
@@ -35,9 +34,7 @@ from src.qwen_jax import QwenTextClassificationWrapper
 from src.subspace_curve import (
     SubspaceBaseModel,
     masked_pytree_to_matrix,
-    bezier_curve,
     filter_mask,
-    bezier_coeff_fn,
     get_subspace_model,
     RepulsiveMixin,
     EntropyMixin,
@@ -169,9 +166,9 @@ class TrainHyperparams:
         # Compute num_epochs / num_steps from data size
         num_epochs_cfg = th.get("num_epochs", -1)
         num_steps_cfg = th.get("num_steps", -1)
-        assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), (
-            "Only one of num_epochs or num_steps should be > 0"
-        )
+        assert not (
+            (num_epochs_cfg > 0) and (num_steps_cfg > 0)
+        ), "Only one of num_epochs or num_steps should be > 0"
         has_train_data = num_epochs_cfg > 0 or num_steps_cfg > 0
         if has_train_data:
             assert data.train_input_ids is not None
@@ -1034,7 +1031,7 @@ def run_evaluation(
     k = config.model_params.k
     batch_size_eval = config.train_hyper.batch_size_eval
     # temperature = config.train_hyper.temperature
-    print(f"currently temperature is not used in evaluation ")
+    print("currently temperature is not used in evaluation ")
     temperature = jnp.array([1.0])
     smoke_test = config.train_hyper.smoke_test
     curve_sampling_mode = config.model_params.curve_sampling_mode
@@ -1408,9 +1405,9 @@ def _init_subspace_params(
     if fixed_cps_train_params != False:
         assert isinstance(fixed_cps_train_params, list)
         k = s_model.k
-        assert len(fixed_cps_train_params) == (k + 1), (
-            "fixed_cps_train_params length must match k or be False"
-        )
+        assert len(fixed_cps_train_params) == (
+            k + 1
+        ), "fixed_cps_train_params length must match k or be False"
         for i, p in enumerate(fixed_cps_train_params):
             if p != False:
 
@@ -2142,14 +2139,22 @@ def _prepare_datasets(
         ``(data, unique_target_ids, rng_key)``
     """
     # Load train and test data
-    input_ids, attention_mask, labels, _, unique_target_ids = (
-        load_text_classification_data(dataset_path, run=logger)
-    )
+    (
+        input_ids,
+        attention_mask,
+        labels,
+        _,
+        unique_target_ids,
+    ) = load_text_classification_data(dataset_path, run=logger)
     print(f"Dataset loaded: {len(input_ids)} samples, {len(unique_target_ids)} classes")
 
-    test_input_ids, test_attention_mask, test_labels, _, unique_target_ids = (
-        load_text_classification_data(dataset_path, run=logger, test=True)
-    )
+    (
+        test_input_ids,
+        test_attention_mask,
+        test_labels,
+        _,
+        unique_target_ids,
+    ) = load_text_classification_data(dataset_path, run=logger, test=True)
     print(f"Target token IDs: {unique_target_ids}")
 
     # Shuffle and split into train / val

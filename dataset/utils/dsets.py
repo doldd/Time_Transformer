@@ -14,6 +14,7 @@
 """
 Convenience wrappers around classification datasets
 """
+
 import string
 import re
 import torch as t
@@ -76,9 +77,7 @@ class ClassificationDataset:
             labels = [f"{spc}{chr(ord('A')+i)}" for i in range(self.n_labels)]
         self.target_ids = tokenizer(
             labels, return_tensors="pt", add_special_tokens=False
-        ).input_ids[
-            :, -1:
-        ]  # assume these encode to single tokens
+        ).input_ids[:, -1:]  # assume these encode to single tokens
         """A mapping from label _indices_ to target token ids. This is only useful for CausalLM models.
         Example: {(0, 345), (1, 673), (2, 736)}
         """
@@ -145,7 +144,10 @@ class ClassificationDataset:
             return self.clm_loader(dset, *args, **kwargs)
 
     def _tokenize_prompts(self, prompts):
-        if self.tokenizer.pad_token_id is None and 'Qwen' in self.tokenizer.init_kwargs['name_or_path']:
+        if (
+            self.tokenizer.pad_token_id is None
+            and "Qwen" in self.tokenizer.init_kwargs["name_or_path"]
+        ):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         prompts = self.tokenizer(
             prompts,
@@ -260,7 +262,7 @@ Answer:"""
             choices = "\n".join(
                 [
                     f"{l}) {c}"
-                    for l, c, in zip(e["choices"]["text"], e["choices"]["label"])
+                    for l, c in zip(e["choices"]["text"], e["choices"]["label"])
                 ]
             )
             prompts.append(
@@ -941,7 +943,6 @@ class MMLUDataset(ClassificationDataset):
         few_shot: bool = False,
         max_seq_len: int = 512,
     ):
-
         dset = load_dataset("cais/mmlu", "all")
         self.name = name
 
@@ -991,7 +992,7 @@ Answer:"""
         for e in batch:
             # choices = "\n".join(e["choices"])
             choices = "\n".join(
-                [f"{l}) {c}" for l, c, in zip(["A", "B", "C", "D"], e["choices"])]
+                [f"{l}) {c}" for l, c in zip(["A", "B", "C", "D"], e["choices"])]
             )
             prompts.append(
                 self.preamble.format(question=e["question"], choices=choices)
@@ -1145,7 +1146,6 @@ class TriviaQADataset(LMDataset):
         max_seq_len: int = 512,
         multianswer: bool = False,
     ):
-
         dset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext")
         self.n_shot = n_shot
 
@@ -1269,7 +1269,6 @@ class AmbigQADataset(LMDataset):
         super().__init__(dset, tokenizer, add_space, max_seq_len=max_seq_len)
 
         if multianswer:
-
             filtered_gt_1 = dset["validation"].filter(
                 lambda example: len(example["nq_answer"]) > 1
             )
@@ -1446,7 +1445,6 @@ OpenARC = OpenARCDataset
 
 
 import random
-from datasets import load_dataset
 from transformers import AutoTokenizer
 
 

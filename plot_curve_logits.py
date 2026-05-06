@@ -5,7 +5,6 @@ import argparse
 import numpy as np
 from scipy.special import softmax
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 
 def model_sort_key(model_name):
@@ -58,9 +57,15 @@ def main():
 
     # FIX 1: Ignore OOD files during the initial dataset compilation
     if args.files:
-        files_to_scan = [f for f in args.files if f.endswith(".npz") and not f.endswith("_ood.npz")]
+        files_to_scan = [
+            f for f in args.files if f.endswith(".npz") and not f.endswith("_ood.npz")
+        ]
     else:
-        files_to_scan = [f for f in os.listdir(args.input_dir) if f.endswith(".npz") and not f.endswith("_ood.npz")]
+        files_to_scan = [
+            f
+            for f in os.listdir(args.input_dir)
+            if f.endswith(".npz") and not f.endswith("_ood.npz")
+        ]
 
     if not files_to_scan:
         print("No primary .npz files found (excluding OOD files).")
@@ -171,7 +176,7 @@ def main():
         # FIX 2: Correct scoping and simplified OOD matching logic
         ood_rows = []
         all_files_in_dir = os.listdir(args.input_dir)
-        
+
         for d in all_data:
             expected_ood = d["filename"].replace(".npz", "_ood.npz")
             if expected_ood in all_files_in_dir:
@@ -245,7 +250,9 @@ def main():
                         ax.axis("off")
                         continue
 
-                print(f"Plotting sample {sample_idx} for model {d['model_name']} (OOD: {is_ood}) shape {current_data['logits'].shape}...")
+                print(
+                    f"Plotting sample {sample_idx} for model {d['model_name']} (OOD: {is_ood}) shape {current_data['logits'].shape}..."
+                )
                 if "t_max" not in current_data:
                     current_data["t_max"] = 1.0  # Default for QWEN or DE
 

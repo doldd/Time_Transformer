@@ -14,9 +14,9 @@ parameters:
     parameters:
       dataset_path:
         values: [
-                 "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0", 
-                 "ddold/qwen_PtoC_newDS/obqa_dataset:v0", 
-                 "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0", 
+                 "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0",
+                 "ddold/qwen_PtoC_newDS/obqa_dataset:v0",
+                 "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0",
                  "ddold/qwen_PtoC_newDS/ARC-Challenge_dataset:v0",
                  "ddold/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
                  ]

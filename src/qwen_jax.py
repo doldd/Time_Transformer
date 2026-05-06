@@ -7,7 +7,6 @@ import flax.linen as nn
 from flax.core import unfreeze, freeze
 import json
 import os
-import functools
 
 
 def rotate_half(x):

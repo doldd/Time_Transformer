@@ -51,8 +51,8 @@ def load_ood_data(tokenizer_path):
 
     # Ensure labels are object arrays if they contain lists (multiple correct answers)
     labels_out = np.empty(len(labels), dtype=object)
-    for i, l in enumerate(labels):
-        labels_out[i] = l
+    for i, j in enumerate(labels):
+        labels_out[i] = j
 
     return x_ood, attn_ood, labels_out
 
@@ -70,7 +70,7 @@ def load_config_and_data(run, local_path="artifacts"):
     api = wandb.Api()
     if not any("qwen2.5_7B_bfloat16" in d for d in os.listdir(local_path)):
         print("Downloading base model artifact...")
-        art = api.artifact(f"ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0")
+        art = api.artifact("ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0")
         art.download(local_path)
 
     if not any(ds_name.split(":")[0] in d for d in os.listdir(local_path)):
@@ -189,8 +189,8 @@ def main():
 
                 # Ensure labels are saved as object arrays if they contain lists
                 labels_out = np.empty(len(labels), dtype=object)
-                for i, l in enumerate(labels):
-                    labels_out[i] = l
+                for i, j in enumerate(labels):
+                    labels_out[i] = j
 
                 np.savez(
                     save_path,

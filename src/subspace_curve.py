@@ -11,7 +11,6 @@ from jaxopt import Bisection
 from jax.scipy.special import gammaln
 from src.weight_matching import PermutationSpec, apply_permutation, weight_matching
 from flax import traverse_util
-from copy import deepcopy
 from flax.core import freeze, unfreeze
 from jax.tree_util import register_pytree_node_class
 import math
@@ -19,19 +18,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "OrthoSpan",
-    "SubspaceModel",
-    "pytree_to_matrix",
-    "pytree_to_vec",
-    "vec_to_pytree",
-    "bezier_curve",
-    "segmented_bezier_coeff_fn",
-    "UniformTSubspace",
-    "UniformTCategory",
-    "SUBSPACE_REGISTRY",
-    "get_subspace_model",
-]
 
 # ---------------------------------------------------------------------------
 # Subspace model registry – maps string names to SubspaceBaseModel subclasses
@@ -89,8 +75,13 @@ def tree_broadcast(
         its corresponding subtree.
         """
         result = []
-        num_leaves = lambda t: jax.tree.structure(t).num_leaves
-        add_leaves = lambda x, subtree: result.extend([x] * num_leaves(subtree))
+
+        def num_leaves(t):
+            return jax.tree.structure(t).num_leaves
+
+        def add_leaves(x, subtree):
+            return result.extend([x] * num_leaves(subtree))
+
         jax.tree.map(add_leaves, prefix_tree, full_tree, is_leaf=is_leaf)
         return result
 
@@ -602,9 +593,9 @@ class SubspaceBaseModel:
             - Non-curve parameters are reverted to their original values from `point['params']`.
             - The mask used for curve parameters is stored in `self.curve_mask`.
         """
-        assert ("params" in params) and len(params.keys()) == 1, (
-            "Point must contain 'params' key and no other keys."
-        )
+        assert ("params" in params) and len(
+            params.keys()
+        ) == 1, "Point must contain 'params' key and no other keys."
 
         if self.perm_spec:
             raise ValueError(
@@ -772,7 +763,7 @@ class SubspaceBaseModel:
         - The output of the model.
 
         """
-        if type(t) is dict:
+        if isinstance(t, dict):
 
             def curve_to_point(t, p, m):
                 if m:
@@ -1073,9 +1064,9 @@ class DistRegressionSubspace(SubspaceBaseModel):
         # initialize log scale
         params["params"]["log_scale"] = self.init_log_scale
         logger.debug("curve_mask: %s", self.curve_mask)
-        self.curve_mask["log_scale"] = (
-            False  # mask log_scale parameter as non curve parameter
-        )
+        self.curve_mask[
+            "log_scale"
+        ] = False  # mask log_scale parameter as non curve parameter
         return params
 
     # @partial(jit, static_argnums=(0,), donate_argnums=(2,))
@@ -2083,7 +2074,7 @@ class LoRAMixin:
                     mask.w0 = False
                 if a_off:
                     mask.A = False
-                if type(s_on) is bool:
+                if isinstance(s_on, bool):
                     mask.s = s_on
                 if hasattr(mask, "lora_rho_s"):
                     mask.lora_rho_s = False
@@ -2111,9 +2102,9 @@ class LoRAMixin:
         Returns:
             _type_: _description_
         """
-        assert ("params" in params) and len(params.keys()) == 1, (
-            "Point must contain 'params' key and no other keys."
-        )
+        assert ("params" in params) and len(
+            params.keys()
+        ) == 1, "Point must contain 'params' key and no other keys."
 
         def initialize_lora_params(rng_key, params, lora_mask, rank):
             """
@@ -2146,13 +2137,13 @@ class LoRAMixin:
             for (key, m), p in zip(mask_, jax.tree.leaves(params)):
                 param_name = "/".join([k.key for k in key])
                 # change to a lora param
-                if type(m) != bool:
-                    assert p.ndim > 1, (
-                        f"Param {param_name} cannot be used for LoRA. Too few dimensions for parameter with shape {p.shape}"
-                    )
-                    assert p.ndim > np.max(m), (
-                        f"Mask {m} incompatible with param {param_name} and shape {p.shape}"
-                    )
+                if not isinstance(m, bool):
+                    assert (
+                        p.ndim > 1
+                    ), f"Param {param_name} cannot be used for LoRA. Too few dimensions for parameter with shape {p.shape}"
+                    assert (
+                        p.ndim > np.max(m)
+                    ), f"Mask {m} incompatible with param {param_name} and shape {p.shape}"
                     dtype = self.get_dtype(p)
                     B = jnp.zeros(shape_builder(p.shape, m[1]), dtype=dtype)
                     B = jnp.moveaxis(
@@ -2410,7 +2401,7 @@ class LoRAMixin:
         - The output of the model.
 
         """
-        if type(t) is dict:
+        if isinstance(t, dict):
 
             def curve_to_point(t, p, m):
                 if m:

@@ -17,12 +17,13 @@ Convenience wrappers around classification datasets
 
 import string
 import re
+import random
 import torch as t
 import pandas as pd
 
 from abc import abstractmethod
 from enum import Enum
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 import datasets
 from transformers import AutoTokenizer
 from collections import OrderedDict
@@ -74,7 +75,7 @@ class ClassificationDataset:
         elif numerical:
             labels = [f"{spc}{i}" for i in range(self.n_labels)]
         else:  # alphabetical
-            labels = [f"{spc}{chr(ord('A')+i)}" for i in range(self.n_labels)]
+            labels = [f"{spc}{chr(ord('A') + i)}" for i in range(self.n_labels)]
         self.target_ids = tokenizer(
             labels, return_tensors="pt", add_special_tokens=False
         ).input_ids[:, -1:]  # assume these encode to single tokens
@@ -133,9 +134,9 @@ class ClassificationDataset:
             dset = self.dset[split]
 
         kwargs = {"batch_size": 32, "drop_last": drop_last} | kwargs
-        assert (
-            kwargs["batch_size"] % grad_acc_steps == 0
-        ), "batch size must be divisible by gradient accumulation steps"
+        assert kwargs["batch_size"] % grad_acc_steps == 0, (
+            "batch size must be divisible by gradient accumulation steps"
+        )
         kwargs["batch_size"] = kwargs["batch_size"] // grad_acc_steps
 
         if is_s2s:
@@ -261,8 +262,8 @@ Answer:"""
         for e in batch:
             choices = "\n".join(
                 [
-                    f"{l}) {c}"
-                    for l, c in zip(e["choices"]["text"], e["choices"]["label"])
+                    f"{label}) {c}"
+                    for label, c in zip(e["choices"]["text"], e["choices"]["label"])
                 ]
             )
             prompts.append(
@@ -341,8 +342,8 @@ Answer:"""
         for e in batch:
             choices = "\n".join(
                 [
-                    f"{l}) {c}"
-                    for l, c in zip(e["choices"]["text"], e["choices"]["label"])
+                    f"{label}) {c}"
+                    for label, c in zip(e["choices"]["text"], e["choices"]["label"])
                 ]
             )
             prompts.append(
@@ -358,7 +359,7 @@ Answer:"""
         for e in batch:
             try:
                 classes_num.append(int(e["answerKey"]) - 1)
-            except:
+            except (ValueError, TypeError):
                 classes_num.append(-1)
         # classes_num = t.tensor([int(e["answerKey"]) - 1 for e in batch])
         classes = t.where(classes_alpha < 0, t.tensor(classes_num), classes_alpha)
@@ -515,8 +516,8 @@ Answer:"""
         for e in batch:
             choices = "\n".join(
                 [
-                    f"{l}) {c}"
-                    for l, c in zip(e["choices"]["label"], e["choices"]["text"])
+                    f"{label}) {c}"
+                    for label, c in zip(e["choices"]["label"], e["choices"]["text"])
                 ]
             )
             prompts.append(
@@ -530,7 +531,7 @@ Answer:"""
         # targets are token ids of the correct answer
         spc = " " if self.add_space else ""
         targets = self.tokenizer(
-            [f'{spc}{e["answerKey"]}' for e in batch],
+            [f"{spc}{e['answerKey']}" for e in batch],
             return_tensors="pt",
             add_special_tokens=False,
         ).input_ids[:, -1]
@@ -544,7 +545,7 @@ Answer:"""
         prompts = self._tokenize_prompts(prompts)
         spc = " " if self.add_space else ""
         targets = self.tokenizer(
-            [f'{spc}{e["answerKey"]}' for e in batch],
+            [f"{spc}{e['answerKey']}" for e in batch],
             return_tensors="pt",
             add_spcecial_tokens=False,
         ).input_ids[:, -1:]
@@ -992,7 +993,10 @@ Answer:"""
         for e in batch:
             # choices = "\n".join(e["choices"])
             choices = "\n".join(
-                [f"{l}) {c}" for l, c in zip(["A", "B", "C", "D"], e["choices"])]
+                [
+                    f"{label}) {c}"
+                    for label, c in zip(["A", "B", "C", "D"], e["choices"])
+                ]
             )
             prompts.append(
                 self.preamble.format(question=e["question"], choices=choices)
@@ -1025,9 +1029,9 @@ Answer:"""
     ):
         dset = self.dset
         kwargs = {"batch_size": 32, "drop_last": drop_last} | kwargs
-        assert (
-            kwargs["batch_size"] % grad_acc_steps == 0
-        ), "batch size must be divisible by gradient accumulation steps"
+        assert kwargs["batch_size"] % grad_acc_steps == 0, (
+            "batch size must be divisible by gradient accumulation steps"
+        )
         kwargs["batch_size"] = kwargs["batch_size"] // grad_acc_steps
 
         if is_s2s:
@@ -1251,9 +1255,6 @@ class TriviaQADataset(LMDataset):
 TriviaQA = TriviaQADataset
 
 
-from datasets import concatenate_datasets
-
-
 class AmbigQADataset(LMDataset):
     def __init__(
         self,
@@ -1442,10 +1443,6 @@ class OpenARCDataset(LMDataset):
 
 
 OpenARC = OpenARCDataset
-
-
-import random
-from transformers import AutoTokenizer
 
 
 class DollyDataset(LMDataset):

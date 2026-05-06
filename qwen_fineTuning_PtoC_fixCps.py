@@ -166,9 +166,9 @@ class TrainHyperparams:
         # Compute num_epochs / num_steps from data size
         num_epochs_cfg = th.get("num_epochs", -1)
         num_steps_cfg = th.get("num_steps", -1)
-        assert not (
-            (num_epochs_cfg > 0) and (num_steps_cfg > 0)
-        ), "Only one of num_epochs or num_steps should be > 0"
+        assert not ((num_epochs_cfg > 0) and (num_steps_cfg > 0)), (
+            "Only one of num_epochs or num_steps should be > 0"
+        )
         has_train_data = num_epochs_cfg > 0 or num_steps_cfg > 0
         if has_train_data:
             assert data.train_input_ids is not None
@@ -781,17 +781,21 @@ def setup_metrics(
     # Build the t-sampling closure (n_s passed explicitly so get_t is shape-generic).
     if t_sample_fn is None:
         if use_linspace:
-            get_t = lambda key, n_s: jnp.linspace(0, t_max, n_s)
+
+            def get_t(key, n_s):
+                return jnp.linspace(0, t_max, n_s)
+
         else:
-            get_t = lambda key, n_s: random.uniform(
-                key, (n_s,), minval=0.0, maxval=t_max
-            )
+
+            def get_t(key, n_s):
+                return random.uniform(key, (n_s,), minval=0.0, maxval=t_max)
+
     else:
         if use_linspace:
             raise ValueError("Cannot use linspace sampling with custom t_sample_fn")
-        get_t = lambda k, n_s: jax.vmap(lambda key: t_sample_fn(key))(
-            random.split(k, n_s)
-        )
+
+        def get_t(k, n_s):
+            return jax.vmap(lambda key: t_sample_fn(key))(random.split(k, n_s))
 
     # Fix 1 & 3: a single jitted evaluation core whose trace is stable as long
     # as the closed-over arrays (x_pad, attn_pad, target_pad) keep the same
@@ -1354,7 +1358,7 @@ def _element_wise_mask(element_freeze_mask):
 
     def update_fn(updates, state, params=None):
         new_updates = jax.tree.map(
-            lambda f, u: u * (1 - f) if type(f) != bool else u,
+            lambda f, u: u * (1 - f) if not isinstance(f, bool) else u,
             element_freeze_mask,
             updates,
         )
@@ -1402,14 +1406,14 @@ def _init_subspace_params(
     s_model.set_train_mask(updated_train_mask)
 
     # Map pretrained control points which are fixed into params vector
-    if fixed_cps_train_params != False:
+    if fixed_cps_train_params is not False:
         assert isinstance(fixed_cps_train_params, list)
         k = s_model.k
-        assert len(fixed_cps_train_params) == (
-            k + 1
-        ), "fixed_cps_train_params length must match k or be False"
+        assert len(fixed_cps_train_params) == (k + 1), (
+            "fixed_cps_train_params length must match k or be False"
+        )
         for i, p in enumerate(fixed_cps_train_params):
-            if p != False:
+            if p is not False:
 
                 def map_fn(m, p, cp_f):
                     if m:
@@ -1892,9 +1896,16 @@ def _setup_validation(s_model, data: "DataSplits", batch_size_eval, k):
 
         def get_best_params(params):
             return s_model.only_trainable_params(params["params"])
+
+        def valid_metrics_fn(rng, params):
+            return empty_metric
     else:
-        valid_metrics_fn = lambda rng, params: empty_metric
-        get_best_params = lambda params: None
+
+        def valid_metrics_fn(rng, params):
+            return empty_metric
+
+        def get_best_params(params):
+            return None
 
     return valid_metrics_fn, empty_metric, get_best_params
 

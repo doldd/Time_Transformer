@@ -119,7 +119,7 @@ def main():
 
     api = wandb.Api()
     project = "qwen_PtoC_newDS"
-    entity = "ddold"
+    entity = "[name]"
 
     TARGET_SEED = 1
     TARGET_LORA_RHO = 0.25
@@ -250,14 +250,14 @@ def main():
 
             if not qwen_found:
                 print("Downloading artifact qwen2.5_7B_bfloat16:v0...")
-                art = api.artifact(f"ddold/{project}/qwen2.5_7B_bfloat16:v0")
+                art = api.artifact(f"[name]/{project}/qwen2.5_7B_bfloat16:v0")
                 art.download(local_path)
             else:
                 print("Qwen artifact found, skipping download.")
 
             if not ds_found:
                 print(f"Downloading artifact {dataset_artifact}...")
-                art = api.artifact(f"ddold/{project}/{dataset_artifact}")
+                art = api.artifact(f"[name]/{project}/{dataset_artifact}")
                 art.download(local_path)
             else:
                 print(f"Dataset artifact for {clean_ds} found, skipping download.")

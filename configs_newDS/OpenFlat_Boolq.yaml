@@ -15,19 +15,19 @@ parameters:
     parameters:
       dataset_path:
         values: [
-                 "ddold/qwen_PtoC_newDS/boolq_dataset:v0",
-                #  "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0",
-                #  "ddold/qwen_PtoC_newDS/obqa_dataset:v0",
-                #  "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0",
-                #  "ddold/qwen_PtoC_newDS/ARC-Challenge_dataset:v0",
-                #  "ddold/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
+                 "[name]/qwen_PtoC_newDS/boolq_dataset:v0",
+                #  "[name]/qwen_PtoC_newDS/winogrande_m_dataset:v0",
+                #  "[name]/qwen_PtoC_newDS/obqa_dataset:v0",
+                #  "[name]/qwen_PtoC_newDS/winogrande_s_dataset:v0",
+                #  "[name]/qwen_PtoC_newDS/ARC-Challenge_dataset:v0",
+                #  "[name]/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
                  ]
       val_percentage:
         value: 0.025
   net_kwargs:
     parameters:
       model_path:
-        value: "ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0"
+        value: "[name]/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0"
   train_hyper:
     parameters:
       batch_size:

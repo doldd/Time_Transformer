@@ -2,7 +2,7 @@
 name = "jaxTorchTransfrom"
 version = "0.1.0"
 description = ""
-authors = ["Daniel <ddold@htwg-konstanz.de>"]
+authors = ["[fname] <[name]@[fname]-[fname].de>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]

@@ -57,7 +57,7 @@ from functools import partial
 # Set environment variables
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=10"
 # Central project prefix for artifacts/datasets
-WANDB_PATH = "ddold/qwen_PtoC"
+WANDB_PATH = "[name]/qwen_PtoC"
 # import sys
 # sys.setrecursionlimit(200)
 
@@ -2417,7 +2417,7 @@ def train(logger, config_dict):
 
     # Resolve model path from wandb if a local path is not given
     net_kwargs = dict(config_dict["net_kwargs"])
-    if net_kwargs["model_path"].startswith("ddold/"):
+    if net_kwargs["model_path"].startswith("[name]/"):
         model_artifact = logger.use_artifact(net_kwargs["model_path"], type="model")
         net_kwargs["model_path"] = model_artifact.download()
     config_dict["net_kwargs"] = net_kwargs

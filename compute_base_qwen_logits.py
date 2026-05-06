@@ -70,13 +70,13 @@ def load_config_and_data(run, local_path="artifacts"):
     api = wandb.Api()
     if not any("qwen2.5_7B_bfloat16" in d for d in os.listdir(local_path)):
         print("Downloading base model artifact...")
-        art = api.artifact("ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0")
+        art = api.artifact("[name]/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0")
         art.download(local_path)
 
     if not any(ds_name.split(":")[0] in d for d in os.listdir(local_path)):
         print(f"Downloading dataset artifact {ds_name}...")
         art = api.artifact(
-            f"ddold/qwen_PtoC_newDS/{ds_name if ':' in ds_name else ds_name + ':v0'}"
+            f"[name]/qwen_PtoC_newDS/{ds_name if ':' in ds_name else ds_name + ':v0'}"
         )
         art.download(local_path)
 
@@ -103,7 +103,7 @@ def main():
 
     api = wandb.Api()
     project = "qwen_PtoC_newDS"
-    entity = "ddold"
+    entity = "[name]"
 
     ood_computed = False
 

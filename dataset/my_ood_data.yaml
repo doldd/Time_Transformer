@@ -1,0 +1,122 @@
+possible_answers: "A, B, C, D"
+
+examples:
+  - id: 1
+    category: single_correct
+    description: basic arithmetic
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: What is the value of x in the equation 3x = 12?
+      Choices:
+      2) A
+      3) B
+      4) C
+      5) D
+      Answer:
+    label: 2
+
+  - id: 2
+    category: multiple_correct
+    description: renewable energy
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: Which of the following are renewable energy sources?
+      Choices:
+      solar power) A
+      wind power) B
+      coal) C
+      hydroelectric power) D
+      Answer:
+    label: [0, 1, 3]
+
+  - id: 3
+    category: multiple_correct
+    description: democratic systems
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: Which of the following statements correctly describe properties of democratic systems?
+      Choices:
+      citizens can vote in elections) A
+      laws apply equally to all citizens) B
+      power is inherited through family lineage) C
+      governments are accountable to the public) D
+      Answer:
+    label: [0, 1, 3]
+
+  - id: 4
+    category: underspecified
+    description: missing context
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: What caused the event described above?
+      Choices:
+      friction) A
+      gravity) B
+      magnetism) C
+      electricity) D
+      Answer:
+    label: []
+
+  - id: 5
+    category: multiple_correct
+    description: biological classification
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: Which of the following are mammals?
+      Choices:
+      whale) A
+      bat) B
+      lizard) C
+      human) D
+      Answer:
+    label: [0, 1, 3]
+
+  - id: 6
+    category: self_referential
+    description: task-breaking question
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: Which answer choice is correct for this question?
+      Choices:
+      this one) A
+      this one) B
+      this one) C
+      this one) D
+      Answer:
+    label: []
+
+  - id: 7
+    category: contradictory
+    description: inconsistent premises
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: A square has four equal sides and no equal sides. What shape is it?
+      Choices:
+      square) A
+      circle) B
+      triangle) C
+      none of the above) D
+      Answer:
+    label: 3
+
+  - id: 8
+    category: ontology_shift
+    description: ethics vs physical entities
+    prompt: |
+      Return the label of the correct answer for the question below.
+
+      Question: Which of the following has the highest moral responsibility?
+      Choices:
+      a rock) A
+      a tree) B
+      a river) C
+      a conscious human) D
+      Answer:
+    label: 3

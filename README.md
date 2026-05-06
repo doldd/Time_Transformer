@@ -51,7 +51,7 @@ Fit Bézier curve connecting the control points:
 Automatically runs after training. Supports multiple evaluation modes via `curve_sampling_mode`:
 
 - `combined_*`: Compute BMA weights on train/val, evaluate on test
-- `per_leave`: Leave-one-out evaluation  
+- `per_leave`: Leave-one-out evaluation
 - `noBMA`: Uniform averaging without Bayesian model averaging
 
 ## Configuration

@@ -89,13 +89,13 @@ def calibration_error(logits, labels, num_bins):
         # same as jnp.mean(accuracies[in_bin]) but jit friendly
         accuracy_in_bin = jnp.where(
             prop_in_bin > 0,
-            jnp.sum(jnp.where(in_bin == True, accuracies, 0.0)) / jnp.sum(in_bin),
+            jnp.sum(jnp.where(in_bin, accuracies, 0.0)) / jnp.sum(in_bin),
             0.0,
         )
         # same as jnp.mean(confidences[in_bin]) but jit friendly
         avg_confidence_in_bin = jnp.where(
             prop_in_bin > 0,
-            jnp.sum(jnp.where(in_bin == True, confidences, 0.0)) / jnp.sum(in_bin),
+            jnp.sum(jnp.where(in_bin, confidences, 0.0)) / jnp.sum(in_bin),
             0.0,
         )
         ece += jnp.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin

@@ -134,9 +134,9 @@ class ClassificationDataset:
             dset = self.dset[split]
 
         kwargs = {"batch_size": 32, "drop_last": drop_last} | kwargs
-        assert kwargs["batch_size"] % grad_acc_steps == 0, (
-            "batch size must be divisible by gradient accumulation steps"
-        )
+        assert (
+            kwargs["batch_size"] % grad_acc_steps == 0
+        ), "batch size must be divisible by gradient accumulation steps"
         kwargs["batch_size"] = kwargs["batch_size"] // grad_acc_steps
 
         if is_s2s:
@@ -1029,9 +1029,9 @@ Answer:"""
     ):
         dset = self.dset
         kwargs = {"batch_size": 32, "drop_last": drop_last} | kwargs
-        assert kwargs["batch_size"] % grad_acc_steps == 0, (
-            "batch size must be divisible by gradient accumulation steps"
-        )
+        assert (
+            kwargs["batch_size"] % grad_acc_steps == 0
+        ), "batch size must be divisible by gradient accumulation steps"
         kwargs["batch_size"] = kwargs["batch_size"] // grad_acc_steps
 
         if is_s2s:

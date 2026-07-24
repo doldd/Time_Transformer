@@ -146,6 +146,20 @@ def _run_snapshot_training_loop(
     only_train = s_model.only_trainable_params(params["params"])
     opt_state = optimizer.init(only_train)
 
+    # ``s_model.train_step`` is jitted with ``donate_argnums`` for params and
+    # opt_state. Calling it directly at top level from this Python loop makes
+    # the donation real, which crashes ("donate the same buffer twice") because
+    # the pytrees contain aliased leaves — e.g. ``set_lora_rho`` broadcasts one
+    # ``current_rho`` buffer onto every LoRA param, and the empty placeholders
+    # from ``only_trainable_params`` dedupe to a single buffer in opt_state.
+    # The production trainer never hits this because it only ever calls
+    # ``train_step`` inside an outer non-donating ``jax.jit`` (``_scan_jit``),
+    # where the inner donation is a no-op. Mirror that here: wrap the step in a
+    # plain (non-donating) jit so aliased inputs are harmless.
+    @jax.jit
+    def _train_step(rng_key, t, params, x, y, opt_state):
+        return s_model.train_step(rng_key, t, params, x, y, opt_state, optimizer)
+
     best_val_ll = -np.inf
     best_params = (
         s_model.only_trainable_params(params["params"]) if data.has_val else None
@@ -173,14 +187,13 @@ def _run_snapshot_training_loop(
             current_rho_s = rho_scheduler(step, lora_params.lora_rho_s)
             params = s_model.set_lora_rho(current_rho, current_rho_s, params)  # type: ignore[attr-defined]
 
-        loss, params, opt_state, (_, logs) = s_model.train_step(
+        loss, params, opt_state, (_, logs) = _train_step(
             step_key,
             t,
             params,
             (x_batch, atten_batch),
             y_batch,
             opt_state,
-            optimizer,
         )
 
         lr_value = lr_schedule(step)

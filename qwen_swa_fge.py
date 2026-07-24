@@ -35,7 +35,7 @@ from qwen_fineTuning_PtoC_fixCps import (
 from src.utils import load_checkpoint_new
 
 
-WANDB_PATH = "ddold/qwen_PtoC"
+WANDB_PATH = "ddold/qwen_PtoC_newDS"
 
 
 def _build_fge_lr_schedule(alpha1: float, alpha2: float, cycle_steps: int):

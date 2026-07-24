@@ -9,8 +9,6 @@ from typing import Callable, Tuple, Any
 from numpyro import distributions as dist
 from jaxopt import Bisection
 from jax.scipy.special import gammaln
-from src.weight_matching import PermutationSpec, apply_permutation, weight_matching
-from flax import traverse_util
 from flax.core import freeze, unfreeze
 from jax.tree_util import register_pytree_node_class
 import math
@@ -466,7 +464,6 @@ class SubspaceBaseModel:
         model,
         k,
         weight_decay: float = 0.0,
-        perm_spec: PermutationSpec = False,
         natural_parameterization=False,
         mutuable_param_name: str | bool = False,
         curve_parameterization="bezier",
@@ -499,7 +496,6 @@ class SubspaceBaseModel:
             self.bezier = bezier_coeff_fn(k + 1)
             self.t_max = 1.0
         self.weight_decay = weight_decay
-        self.perm_spec = perm_spec
         self.mutable_name = mutuable_param_name
         self.compute_loss = (
             self.compute_loss_natural_t
@@ -513,42 +509,6 @@ class SubspaceBaseModel:
         return jax.tree.map(
             lambda x, m: x if m else jnp.array([]), params, self.train_mask
         )
-
-    def remove_permutation(self, key, params_list):
-        """
-        Removes the permutation from the parameters.
-
-        Parameters:
-        - params: The parameters of the model.
-
-        Returns:
-        - The parameters without permutation.
-
-        """
-
-        def flatten_params(params):
-            return {
-                "/".join(k): v for k, v in traverse_util.flatten_dict(params).items()
-            }
-
-        def unflatten_params(flat_params):
-            return traverse_util.unflatten_dict(
-                {tuple(k.split("/")): v for k, v in flat_params.items()}
-            )
-
-        for i, p in enumerate(params_list[1:]):
-            logger.info("Remove permutation from k %d", i + 1)
-            key, perm_key = random.split(key)
-            final_permutation = weight_matching(
-                perm_key,
-                self.perm_spec,
-                flatten_params(params_list[0]),
-                flatten_params(p),
-            )
-            params_list[i] = unflatten_params(
-                apply_permutation(self.perm_spec, final_permutation, flatten_params(p))
-            )
-        return params_list
 
     def set_train_mask(self, train_mask):
         """
@@ -588,7 +548,6 @@ class SubspaceBaseModel:
         Returns:
             dict: A copy of the input `point` dictionary, with the 'params' key replaced by the initialized curve parameters.
         Notes:
-            - If `self.perm_spec` is set, permutation invariance is handled by removing permutations from the curve parameters.
             - The method adds Gaussian noise to each parameter in the curve, controlled by `jitter`.
             - Non-curve parameters are reverted to their original values from `point['params']`.
             - The mask used for curve parameters is stored in `self.curve_mask`.
@@ -596,11 +555,6 @@ class SubspaceBaseModel:
         assert ("params" in params) and len(
             params.keys()
         ) == 1, "Point must contain 'params' key and no other keys."
-
-        if self.perm_spec:
-            raise ValueError(
-                "Permutation specification is not supported in init_params_from_point method."
-            )
 
         # add a dimension if mask is true and initialize with noise function or repeate LoRA A matrix initialization
         # use the same weight matrix initialization as Hugging Face PEFT library does for the LoRA A matrix
@@ -706,9 +660,6 @@ class SubspaceBaseModel:
         all_params = self.model.init(keys[0], x)
         stacked_params = [all_params["params"]]
         stacked_params += [self.model.init(k, x)["params"] for k in keys[1:]]
-        # if permutation is specified then remove the permutation by using the first point as anchor
-        if self.perm_spec:
-            stacked_params = self.remove_permutation(key, stacked_params)
         # now pytree of stacked params (each leaf has leading dim of k+1)
         all_params["params"] = jax.tree.map(
             lambda m, *x: jnp.stack(x) if m else x[0], mask, *stacked_params
@@ -990,7 +941,6 @@ class RegressionSubspace(SubspaceBaseModel):
         - model: The model to be used.
         - k: The number of control points.
         - weight_decay: The weight decay factor for regularization.
-        - perm_spec: The permutation specification for the model.
         - natural_parameterization: Whether to use natural parameterization.
         """
         super().__init__(**kwargs)
@@ -1035,7 +985,6 @@ class DistRegressionSubspace(SubspaceBaseModel):
         - model: The model to be used.
         - k: The number of control points.
         - weight_decay: The weight decay factor for regularization.
-        - perm_spec: The permutation specification for the model.
         - natural_parameterization: Whether to use natural parameterization.
         """
         super().__init__(**kwargs)
@@ -1104,17 +1053,15 @@ class QuantileSubspace(SubspaceBaseModel):
         k,
         quantiles,
         weight_decay=0,
-        perm_spec=False,
         natural_parameterization=False,
         mutuable_param_name=False,
     ):
         super().__init__(
-            model,
-            k,
-            weight_decay,
-            perm_spec,
-            natural_parameterization,
-            mutuable_param_name,
+            model=model,
+            k=k,
+            weight_decay=weight_decay,
+            natural_parameterization=natural_parameterization,
+            mutuable_param_name=mutuable_param_name,
         )
         self.quantiles = jnp.array(quantiles, dtype=jnp.float32)
 

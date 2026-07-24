@@ -1,6 +1,6 @@
-program: qwen_swa_fge.py
-name: "SWA + FGE OpenFlat No Seg"
-description: "Single-point Qwen fine-tuning with warmup training followed by cyclic FGE snapshots and SWA averaging."
+program: qwen_fge.py
+name: "FGE OpenFlat No Seg"
+description: "Single-point Qwen fine-tuning with warmup training followed by cyclic FGE snapshots and prediction ensembling."
 method: grid
 metric:
   goal: maximize
@@ -129,8 +129,6 @@ parameters:
         freeze_other_params: true
   fge:
     parameters:
-      enabled:
-        value: true
       warmup_steps:
         value: 2000
       steps:

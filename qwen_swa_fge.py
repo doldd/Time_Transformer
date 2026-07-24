@@ -8,6 +8,7 @@ dedicated Fast Geometric Ensembling (FGE) learning-rate schedule.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import argparse
 import os
 
@@ -19,6 +20,7 @@ import wandb
 
 from qwen_fineTuning_PtoC_fixCps import (
     Config,
+    _init_optimizer,
     _prepare_datasets,
     _setup_rho_scheduler,
     _setup_training_env,
@@ -30,6 +32,7 @@ from qwen_fineTuning_PtoC_fixCps import (
     run_training,
     setup_metrics,
 )
+from src.utils import load_checkpoint_new
 
 
 WANDB_PATH = "ddold/qwen_PtoC"
@@ -58,6 +61,40 @@ def _tree_mean(trees):
     return jax.tree.map(lambda *xs: jnp.mean(jnp.stack(xs, axis=0), axis=0), *trees)
 
 
+def _load_pretrained_point(wb_run, load_params_path: str, config, env, params):
+    """Load a converged single-point checkpoint (wˆ) from a finished wandb run.
+
+    Replaces the local phase-1 warmup training: instead of training wˆ inside
+    this script, fetch it from a previously completed
+    ``qwen_fineTuning_PtoC_fixCps.py`` k=0 pretraining run.
+    """
+    source_run = wandb.Api().run(load_params_path)
+    src_model_params = source_run.config.get("model_params", {})
+    src_num_curve_segment = src_model_params.get("num_curve_segment", 1)
+    src_seg_deg = src_model_params.get("SegDeg", 1)
+    src_k = src_num_curve_segment * src_seg_deg
+    if src_k != 0 or not src_model_params.get("Pretraining", False):
+        raise ValueError(
+            f"load_params_path={load_params_path!r} does not look like a k=0 "
+            f"single-point pretraining run (source k={src_k}, "
+            f"Pretraining={src_model_params.get('Pretraining')}). "
+            "The SWA/FGE entrypoint can only load k=0 checkpoints."
+        )
+
+    src_dataset_path = source_run.config.get("data", {}).get("dataset_path")
+    cur_dataset_path = config.data.get("dataset_path")
+    if src_dataset_path is not None and src_dataset_path != cur_dataset_path:
+        raise ValueError(
+            f"load_params_path={load_params_path!r} was trained on dataset "
+            f"{src_dataset_path!r} but this run uses {cur_dataset_path!r}. "
+            "The source run's dataset must match the current dataset_path."
+        )
+
+    print(f"Loading pretrained point from {load_params_path}")
+    params, _, _, _, _, _ = load_checkpoint_new(source_run, params, env.s_model)
+    return params
+
+
 def _pad_batch_indices(num_items: int, batch_size: int, step: int, permutation):
     num_batches = max(1, int(np.ceil(num_items / batch_size)))
     batch_pos = step % num_batches
@@ -76,8 +113,16 @@ def _validation_metrics(valid_metrics_fn, valid_key, params, empty_metric, shoul
     return empty_metric[0]
 
 
-def _run_fge_phase(wb_run, rng_key, env, params, data, config, fge_cfg):
-    """Run the FGE cyclic-LR phase and collect snapshots at low-LR midpoints."""
+def _run_fge_phase(
+    wb_run, rng_key, env, params, data, config, fge_cfg, lr_schedule, cycle_steps
+):
+    """Run the FGE cyclic-LR phase and collect snapshots at low-LR midpoints.
+
+    ``lr_schedule``/``cycle_steps`` must be the same values used to build
+    ``env.optimizer`` (see ``train()``) — the schedule here is only used to
+    log the current LR and to time snapshot collection, not to drive the
+    actual parameter updates (those come from ``env.optimizer`` itself).
+    """
     s_model = env.s_model
     optimizer = env.optimizer
     t_sample_fn = env.t_sample_fn
@@ -95,13 +140,7 @@ def _run_fge_phase(wb_run, rng_key, env, params, data, config, fge_cfg):
     eval_every_n_batch = int(
         fge_cfg.get("eval_every_n_batch", config.train_hyper.eval_every_n_batch)
     )
-    cycle_steps = int(fge_cfg.get("cycle_steps", 200))
-    if cycle_steps % 2 != 0:
-        raise ValueError("FGE cycle_steps must be even")
 
-    lr_high = float(fge_cfg.get("lr_high", 1e-4))
-    lr_low = float(fge_cfg.get("lr_low", lr_high / 10.0))
-    lr_schedule = _build_fge_lr_schedule(lr_high, lr_low, cycle_steps)
     rho_scheduler = _setup_rho_scheduler(config.model_params.lora_params, num_steps)
 
     only_train = s_model.only_trainable_params(params["params"])
@@ -165,7 +204,11 @@ def _run_fge_phase(wb_run, rng_key, env, params, data, config, fge_cfg):
             "fge/loss": loss,
             "fge/lr": lr_value,
             "fge/step": step,
-            **{f"fge/{k}": v for k, v in metrics.items() if not k.startswith("val_mean")},
+            **{
+                f"fge/{k}": v
+                for k, v in metrics.items()
+                if not k.startswith("val_mean")
+            },
             **{f"fge/{k}": v for k, v in logs.items()},
         }
         wb_run.log(log_row)
@@ -199,6 +242,10 @@ def _log_fge_ensemble_metrics(wb_run, env, data, swa_params, snapshots, config):
 
     snapshot_logits = []
     for idx, snapshot in enumerate(snapshots):
+        # Zero LoRA rho noise before scoring — matches run_evaluation's/
+        # valid_metrics_fn's behavior, so FGE metrics are comparable to SWA's
+        # rather than including stray training-time noise.
+        eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": deepcopy(snapshot)})
         metrics_fn = setup_metrics(
             env.s_model,
             batch_size_eval,
@@ -210,7 +257,7 @@ def _log_fge_ensemble_metrics(wb_run, env, data, swa_params, snapshots, config):
             average=False,
             key_prefix=f"snap_{idx}_",
         )
-        _, logits = metrics_fn(random.PRNGKey(config.rng_seed), {"params": snapshot})
+        _, logits = metrics_fn(random.PRNGKey(config.rng_seed), eval_params)
         snapshot_logits.append(logits[0])
 
     stacked_logits = jnp.stack(snapshot_logits, axis=0)
@@ -221,10 +268,14 @@ def _log_fge_ensemble_metrics(wb_run, env, data, swa_params, snapshots, config):
             "fge_uniform_mutual_information": mutual_information(
                 stacked_logits.astype(jnp.float32)
             ),
-            "fge_uniform_mean_entropy": mean_entropy(stacked_logits.astype(jnp.float32)),
+            "fge_uniform_mean_entropy": mean_entropy(
+                stacked_logits.astype(jnp.float32)
+            ),
             "fge_uniform_std_entropy_along_curve": entropy(
                 stacked_logits.astype(jnp.float32)
-            ).mean(-1).std(),
+            )
+            .mean(-1)
+            .std(),
             "fge_uniform_mean_entropy_along_curve": entropy(
                 stacked_logits.astype(jnp.float32)
             ).mean(),
@@ -237,6 +288,7 @@ def _log_fge_ensemble_metrics(wb_run, env, data, swa_params, snapshots, config):
 def train(wb_run, config_dict):
     config_dict = dict(config_dict)
     fge_cfg = dict(config_dict.get("fge", {}))
+    load_params_path = config_dict.get("load_params_path", False)
 
     rng_key = random.PRNGKey(config_dict["rng_seed"])
 
@@ -246,10 +298,12 @@ def train(wb_run, config_dict):
         net_kwargs["model_path"] = model_artifact.download()
     config_dict["net_kwargs"] = net_kwargs
 
-    warmup_steps = int(
-        fge_cfg.get("warmup_steps", config_dict["train_hyper"]["num_steps"])
-    )
-    config_dict["train_hyper"]["num_steps"] = warmup_steps
+    # warmup_steps only matters when we actually train wˆ locally below
+    if not load_params_path:
+        warmup_steps = int(
+            fge_cfg.get("warmup_steps", config_dict["train_hyper"]["num_steps"])
+        )
+        config_dict["train_hyper"]["num_steps"] = warmup_steps
     config_dict["train_hyper"].setdefault("num_epochs", -1)
 
     data, unique_target_ids, rng_key = _prepare_datasets(
@@ -268,9 +322,18 @@ def train(wb_run, config_dict):
             "The SWA/FGE entrypoint currently expects k=0 single-point training"
         )
 
+    env, params, rng_key = _setup_training_env(
+        config=config, data=data, rng_key=rng_key
+    )
+
+    if load_params_path:
+        params = _load_pretrained_point(wb_run, load_params_path, config, env, params)
+    else:
+        rng_key, params, _ = run_training(
+            rng_key, env, params, data, config, wb_run, "warmup_"
+        )
+
     if not fge_cfg.get("enabled", True):
-        env, params, rng_key = _setup_training_env(config=config, data=data, rng_key=rng_key)
-        rng_key, params, _ = run_training(rng_key, env, params, data, config, wb_run, "")
         run_evaluation(
             rng_key=rng_key,
             env=env,
@@ -281,20 +344,33 @@ def train(wb_run, config_dict):
         )
         return
 
-    env, params, rng_key = _setup_training_env(config=config, data=data, rng_key=rng_key)
-    rng_key, params, _ = run_training(rng_key, env, params, data, config, wb_run, "warmup_")
-
     fge_steps = int(fge_cfg.get("steps", 0))
     if fge_steps <= 0:
         raise ValueError("fge.steps must be > 0 when FGE is enabled")
 
+    cycle_steps = int(fge_cfg.get("cycle_steps", 200))
+    if cycle_steps % 2 != 0:
+        raise ValueError("FGE cycle_steps must be even")
+    lr_high = float(fge_cfg.get("lr_high", 1e-4))
+    lr_low = float(fge_cfg.get("lr_low", lr_high / 10.0))
+    lr_schedule = _build_fge_lr_schedule(lr_high, lr_low, cycle_steps)
+
     phase2_config = deepcopy(config)
     phase2_config.train_hyper.num_steps = fge_steps
     phase2_config.train_hyper.num_epochs = 0
+    # Route the FGE cyclic schedule through the same optimizer construction
+    # path as every other phase, instead of leaving the original one-cycle
+    # schedule from optimizer_conf in charge of the actual weight updates.
+    phase2_config.optimizer_conf.kwargs["learning_rate"] = lr_schedule
+    phase2_config.optimizer_conf.lr_schedule = lr_schedule
 
-    phase2_env, _, rng_key = _setup_training_env(
-        config=phase2_config, data=data, rng_key=rng_key
+    fge_optimizer = _init_optimizer(
+        phase2_config, curve_mask=env.s_model.curve_mask, curve_params=params["params"]
     )
+    # Reuse the same s_model / t_sample_fn / validation helpers — only the
+    # optimizer differs for the FGE phase, so no second full environment
+    # (and no second base-model load) is needed.
+    phase2_env = replace(env, optimizer=fge_optimizer)
 
     params, swa_params, snapshots, snapshot_steps, _ = _run_fge_phase(
         wb_run=wb_run,
@@ -304,6 +380,8 @@ def train(wb_run, config_dict):
         data=data,
         config=phase2_config,
         fge_cfg=fge_cfg,
+        lr_schedule=lr_schedule,
+        cycle_steps=cycle_steps,
     )
 
     wb_run.summary.update(
@@ -313,7 +391,9 @@ def train(wb_run, config_dict):
         }
     )
 
-    _log_fge_ensemble_metrics(wb_run, phase2_env, data, swa_params, snapshots, phase2_config)
+    _log_fge_ensemble_metrics(
+        wb_run, phase2_env, data, swa_params, snapshots, phase2_config
+    )
 
 
 def main():
@@ -331,6 +411,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-sweep", action="store_true", help="Use wandb sweep config."
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="batch size for training. Default is 4.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help=(
+            "Run a quick smoke test with reduced warmup/FGE steps, a small "
+            "cycle length, and a truncated dataset."
+        ),
+    )
     args = parser.parse_args()
 
     print("SWA/FGE training")
@@ -338,8 +432,12 @@ if __name__ == "__main__":
         wb_run = wandb.init()
         train(wb_run, wandb.config)
     else:
+        smoke_test = args.smoke_test
         default_config = {
             "rng_seed": 2,
+            # Set to a finished k=0 pretraining run path (e.g.
+            # WANDB_PATH + "/47xexal3") to load wˆ from wandb instead of
+            # training it locally below; False trains wˆ locally (warmup phase).
             "load_params_path": False,
             "data": {
                 "dataset_path": WANDB_PATH + "/ARC-Easy_dataset:v0",
@@ -347,14 +445,14 @@ if __name__ == "__main__":
             },
             "net_kwargs": {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"},
             "train_hyper": {
-                "batch_size": 4,
+                "batch_size": args.batch_size,
                 "num_epochs": -1,
-                "num_steps": 2000,
-                "eval_every_n_batch": 200,
+                "num_steps": 10 if smoke_test else 2000,
+                "eval_every_n_batch": 5 if smoke_test else 200,
                 "temperature": [1.0],
                 "dataset_sampling": {"minibatch": {}},
                 "save_params": True,
-                "smoke_test": False,
+                "smoke_test": smoke_test,
             },
             "model_params": {
                 "n_samples_eval": 1,
@@ -386,8 +484,16 @@ if __name__ == "__main__":
                     "lora_rho": 0.25,
                     "lora_rho_s": 0.0,
                     "filter_masks": [
-                        {"keys": ["self_attn", "q_proj", "kernel"], "op": "all", "dims": [1, 0]},
-                        {"keys": ["self_attn", "v_proj", "kernel"], "op": "all", "dims": [1, 0]},
+                        {
+                            "keys": ["self_attn", "q_proj", "kernel"],
+                            "op": "all",
+                            "dims": [1, 0],
+                        },
+                        {
+                            "keys": ["self_attn", "v_proj", "kernel"],
+                            "op": "all",
+                            "dims": [1, 0],
+                        },
                         {"keys": ["lm_head", "kernel"], "op": "all", "dims": [1, 0]},
                     ],
                 },
@@ -412,9 +518,9 @@ if __name__ == "__main__":
             },
             "fge": {
                 "enabled": True,
-                "warmup_steps": 2000,
-                "steps": 2000,
-                "cycle_steps": 200,
+                "warmup_steps": 10 if smoke_test else 2000,
+                "steps": 10 if smoke_test else 2000,
+                "cycle_steps": 4 if smoke_test else 200,
                 "lr_high": 1e-4,
                 "lr_low": 1e-5,
             },

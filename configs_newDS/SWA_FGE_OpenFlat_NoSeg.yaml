@@ -8,6 +8,9 @@ metric:
 parameters:
   rng_seed:
     values: [1, 2, 20, 400, 8000]
+  # Set to a finished k=0 pretraining run path, e.g.
+  # "ddold/qwen_PtoC/47xexal3", to load wˆ from wandb instead of training it
+  # locally via the warmup phase below.
   load_params_path:
     value: false
   data:

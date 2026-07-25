@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import jax
 import numpy as np
@@ -103,7 +104,11 @@ def train(wb_run, config_dict):
 
     # No dedicated schedule override — env.optimizer already carries whatever
     # optimizer_conf specifies, used unmodified for this entire run.
-    final_params, snapshots, snapshot_steps, _ = _run_snapshot_training_loop(
+    # welford_start_step reuses the same start_step as the discrete snapshot
+    # window, but maintains a running mean over *every* step from there on
+    # (via _welford_update) instead of only the num_snapshots discrete points
+    # — lets us compare both averaging strategies from one training run.
+    final_params, snapshots, snapshot_steps, _, welford_mean = _run_snapshot_training_loop(
         wb_run=wb_run,
         rng_key=rng_key,
         env=env,
@@ -115,6 +120,7 @@ def train(wb_run, config_dict):
         lr_schedule=config.optimizer_conf.lr_schedule,
         should_snapshot=lambda step: step in collection_steps,
         log_prefix="swa",
+        welford_start_step=start_step,
     )
 
     wb_run.summary.update(
@@ -137,6 +143,38 @@ def train(wb_run, config_dict):
         logger=wb_run,
         logger_prefix="swa_",
     )
+
+    # Compare against an online (Welford) running mean over every step of the
+    # same tail window, instead of only num_snapshots discrete points.
+    welford_full = _merge_trainable(env.s_model, welford_mean, final_params["params"])
+    welford_eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": welford_full})
+
+    run_evaluation(
+        rng_key=rng_key,
+        env=env,
+        params=welford_eval_params,
+        data=data,
+        config=config,
+        logger=wb_run,
+        logger_prefix="swa_welford_",
+    )
+
+    if config.train_hyper.save_params:
+        # swa_trainable is already trainable-only (each snapshot came from
+        # s_model.only_trainable_params inside _run_snapshot_training_loop) —
+        # save that directly rather than the full (frozen + trainable) params.
+        os.makedirs("tmp_files", exist_ok=True)
+        trainable_path = f"tmp_files/{wb_run.id}_trainable_params.npy"
+        np.save(trainable_path, swa_trainable)
+        time.sleep(1)
+        print("Saved SWA trainable parameters to tmp_files")
+        artifact = wandb.Artifact(name="params", type="pytree")
+        artifact.add_file(trainable_path)
+        wb_run.log_artifact(artifact)
+        time.sleep(5)
+        print("Logged artifact with SWA trainable parameters.")
+
+    wb_run.finish()
 
 
 def main():
@@ -168,6 +206,21 @@ if __name__ == "__main__":
             "truncated dataset."
         ),
     )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=2000,
+        help=(
+            "Total training steps (also sets the LR schedule's "
+            "transition_steps and swa.steps to match). Default is 2000."
+        ),
+    )
+    parser.add_argument(
+        "--start-pct",
+        type=float,
+        default=0.8,
+        help="swa.start_pct: fraction of training after which snapshots are collected.",
+    )
     args = parser.parse_args()
 
     print("SWA training")
@@ -183,14 +236,15 @@ if __name__ == "__main__":
             # training it locally below; False trains it locally.
             "load_params_path": False,
             "data": {
-                "dataset_path": WANDB_PATH + "/ARC-Easy_dataset:v0",
+                "dataset_path": WANDB_PATH + "/winogrande_s_dataset:v0",
                 "val_percentage": 0.1,
             },
-            "net_kwargs": {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"},
+            "net_kwargs": {"model_path": "artifacts/qwen2.5_7B_bfloat16:v0"},
+
             "train_hyper": {
                 "batch_size": args.batch_size,
                 "num_epochs": -1,
-                "num_steps": 20 if smoke_test else 2000,
+                "num_steps": 20 if smoke_test else args.num_steps,
                 "eval_every_n_batch": 5 if smoke_test else 200,
                 "temperature": [1.0],
                 "dataset_sampling": {"minibatch": {}},
@@ -203,7 +257,7 @@ if __name__ == "__main__":
                 "SegDeg": 1,
                 "Pretraining": True,
                 "curve_sampling_mode": "combined_noBMA",
-                "subspace_model": "jsd_noise_sampling_dropout_category",
+                "subspace_model": "lora_category",
                 "jitter_multiplier": 0.0,
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
@@ -247,7 +301,7 @@ if __name__ == "__main__":
                     "learning_rate": {
                         "name": "linear_onecycle_schedule",
                         "kwargs": {
-                            "transition_steps": 2000,
+                            "transition_steps": 20 if smoke_test else args.num_steps,
                             "peak_value": 1e-4,
                             "pct_start": 0.12,
                             "pct_final": 1.0,
@@ -260,8 +314,8 @@ if __name__ == "__main__":
                 "freeze_other_params": True,
             },
             "swa": {
-                "steps": 20 if smoke_test else 2000,
-                "start_pct": 0.5 if smoke_test else 0.8,
+                "steps": 20 if smoke_test else args.num_steps,
+                "start_pct": 0.5 if smoke_test else args.start_pct,
                 "num_snapshots": 4 if smoke_test else 20,
             },
         }

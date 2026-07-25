@@ -90,10 +90,36 @@ def _pad_batch_indices(num_items: int, batch_size: int, step: int, permutation):
     return jnp.concatenate([batch_idx, permutation[:pad_count]], axis=0)
 
 
+def _dealias_small_leaves(tree):
+    """Force distinct buffers for tiny leaves so a donating jit doesn't see the
+    same physical buffer at multiple leaf positions ("donate the same buffer
+    twice") — e.g. the scalar rho broadcast onto every LoRA param by
+    ``set_lora_rho``, or the ``jnp.array([])`` placeholders ``only_trainable_params``
+    puts at every frozen leaf. Leaves above this size are real weight matrices;
+    those are left untouched, so this doesn't force an extra full-model copy.
+    """
+    return jax.tree.map(
+        lambda x: x + 0 if isinstance(x, jnp.ndarray) and x.size <= 8 else x,
+        tree,
+    )
+
+
 def _validation_metrics(valid_metrics_fn, valid_key, params, empty_metric, should_eval):
     if should_eval:
         return valid_metrics_fn(valid_key, params)[0]
     return empty_metric[0]
+
+
+def _welford_update(mean, count, new_value):
+    """One step of Welford's online mean update (the mean half of Welford's
+    algorithm — no variance/M2 tracking needed here): ``mean_n = mean_{n-1} +
+    (x_n - mean_{n-1}) / n``. Keeps a single running-mean pytree instead of
+    storing every per-step snapshot, so averaging over every step of a long
+    tail window doesn't cost O(num_steps) copies of the trainable params.
+    """
+    count = count + 1
+    mean = jax.tree.map(lambda m, x: m + (x - m) / count, mean, new_value)
+    return mean, count
 
 
 def _run_snapshot_training_loop(
@@ -109,6 +135,7 @@ def _run_snapshot_training_loop(
     lr_schedule: Callable[[int], Any],
     should_snapshot: Callable[[int], bool],
     log_prefix: str,
+    welford_start_step: int | None = None,
 ):
     """Manual per-step training loop with pluggable snapshot collection.
 
@@ -121,11 +148,18 @@ def _run_snapshot_training_loop(
     storing many of them doesn't scale with the (possibly multi-billion
     parameter) frozen base model.
 
-    Returns ``(final_params, snapshots, snapshot_steps, best_params)`` where
-    ``final_params`` is the full (frozen + trainable) params at the end of
-    the loop — callers use it as the template to merge trainable-only
-    snapshots back into full params before evaluating them
-    (``_merge_trainable``).
+    ``welford_start_step``, if given, additionally maintains a running
+    (Welford) mean of the trainable params over every step from that step
+    onward — independent of ``should_snapshot``'s discrete collection.
+    Defaults to ``None`` (disabled), which leaves FGE's call site (and its
+    discrete-snapshot ensembling) completely unaffected.
+
+    Returns ``(final_params, snapshots, snapshot_steps, best_params,
+    welford_mean)`` where ``final_params`` is the full (frozen + trainable)
+    params at the end of the loop — callers use it as the template to merge
+    trainable-only snapshots (or ``welford_mean``) back into full params
+    before evaluating them (``_merge_trainable``). ``welford_mean`` is
+    ``None`` if ``welford_start_step`` was not given.
     """
     s_model = env.s_model
     optimizer = env.optimizer
@@ -147,18 +181,21 @@ def _run_snapshot_training_loop(
     opt_state = optimizer.init(only_train)
 
     # ``s_model.train_step`` is jitted with ``donate_argnums`` for params and
-    # opt_state. Calling it directly at top level from this Python loop makes
-    # the donation real, which crashes ("donate the same buffer twice") because
-    # the pytrees contain aliased leaves — e.g. ``set_lora_rho`` broadcasts one
-    # ``current_rho`` buffer onto every LoRA param, and the empty placeholders
-    # from ``only_trainable_params`` dedupe to a single buffer in opt_state.
-    # The production trainer never hits this because it only ever calls
-    # ``train_step`` inside an outer non-donating ``jax.jit`` (``_scan_jit``),
-    # where the inner donation is a no-op. Mirror that here: wrap the step in a
-    # plain (non-donating) jit so aliased inputs are harmless.
-    @jax.jit
-    def _train_step(rng_key, t, params, x, y, opt_state):
-        return s_model.train_step(rng_key, t, params, x, y, opt_state, optimizer)
+    # opt_state so XLA can update the (possibly multi-billion parameter) frozen
+    # base model in place instead of allocating a second full copy every step.
+    # Calling it directly at top level from this Python loop makes that
+    # donation real, which used to crash ("donate the same buffer twice")
+    # because the pytrees contain aliased leaves — ``set_lora_rho`` broadcasts
+    # one ``current_rho`` buffer onto every LoRA param, and the empty
+    # placeholders from ``only_trainable_params`` dedupe to a single buffer in
+    # opt_state. Wrapping the step in an outer non-donating ``jax.jit`` avoided
+    # that crash but silently disabled donation entirely (the inner donation
+    # becomes a no-op), which is affordable at 0.5B scale but OOMs a 7B model
+    # on a single 40GB GPU (needs a second ~14GB copy of the frozen params
+    # every step). De-aliasing just the tiny leaves below and calling
+    # ``train_step`` directly keeps donation working for the actual weight
+    # matrices.
+    params = _dealias_small_leaves(params)
 
     best_val_ll = -np.inf
     best_params = (
@@ -166,6 +203,8 @@ def _run_snapshot_training_loop(
     )
     snapshots = []
     snapshot_steps = []
+    welford_mean = None
+    welford_count = 0
     permutation = jnp.arange(num_items)
 
     for step in range(num_steps):
@@ -186,14 +225,21 @@ def _run_snapshot_training_loop(
             current_rho = rho_scheduler(step, lora_params.lora_rho)
             current_rho_s = rho_scheduler(step, lora_params.lora_rho_s)
             params = s_model.set_lora_rho(current_rho, current_rho_s, params)  # type: ignore[attr-defined]
+            params = _dealias_small_leaves(params)
 
-        loss, params, opt_state, (_, logs) = _train_step(
+        # opt_state's frozen-leaf placeholders (empty arrays from
+        # only_trainable_params) get re-deduped by XLA on every train_step's
+        # output, not just the first call, so de-alias every iteration too.
+        opt_state = _dealias_small_leaves(opt_state)
+
+        loss, params, opt_state, (_, logs) = s_model.train_step(
             step_key,
             t,
             params,
             (x_batch, atten_batch),
             y_batch,
             opt_state,
+            optimizer,
         )
 
         lr_value = lr_schedule(step)
@@ -213,6 +259,16 @@ def _run_snapshot_training_loop(
             snapshots.append(deepcopy(s_model.only_trainable_params(params["params"])))
             snapshot_steps.append(step)
 
+        if welford_start_step is not None and step >= welford_start_step:
+            current_trainable = s_model.only_trainable_params(params["params"])
+            if welford_mean is None:
+                welford_mean = current_trainable
+                welford_count = 1
+            else:
+                welford_mean, welford_count = _welford_update(
+                    welford_mean, welford_count, current_trainable
+                )
+
         log_row = {
             f"{log_prefix}/loss": loss,
             f"{log_prefix}/lr": lr_value,
@@ -230,4 +286,4 @@ def _run_snapshot_training_loop(
         snapshots.append(deepcopy(s_model.only_trainable_params(params["params"])))
         snapshot_steps.append(num_steps - 1 if num_steps > 0 else 0)
 
-    return params, snapshots, snapshot_steps, best_params
+    return params, snapshots, snapshot_steps, best_params, welford_mean

@@ -13,9 +13,11 @@ from copy import deepcopy
 from dataclasses import replace
 import argparse
 import os
+import time
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 import wandb
 
@@ -192,7 +194,7 @@ def train(wb_run, config_dict):
         fge_cfg.get("eval_every_n_batch", phase2_config.train_hyper.eval_every_n_batch)
     )
 
-    final_params, snapshots, snapshot_steps, _ = _run_snapshot_training_loop(
+    final_params, snapshots, snapshot_steps, _, _ = _run_snapshot_training_loop(
         wb_run=wb_run,
         rng_key=rng_key,
         env=phase2_env,
@@ -216,6 +218,24 @@ def train(wb_run, config_dict):
     _log_fge_ensemble_metrics(
         wb_run, phase2_env, data, final_params, snapshots, phase2_config
     )
+
+    if config.train_hyper.save_params:
+        # snapshots is already a list of trainable-only pytrees (each came from
+        # s_model.only_trainable_params inside _run_snapshot_training_loop) —
+        # save that list directly rather than the full (frozen + trainable)
+        # params for each ensemble member.
+        os.makedirs("tmp_files", exist_ok=True)
+        trainable_path = f"tmp_files/{wb_run.id}_trainable_params.npy"
+        np.save(trainable_path, snapshots)
+        time.sleep(1)
+        print("Saved FGE snapshot trainable parameters to tmp_files")
+        artifact = wandb.Artifact(name="params", type="pytree")
+        artifact.add_file(trainable_path)
+        wb_run.log_artifact(artifact)
+        time.sleep(5)
+        print("Logged artifact with FGE snapshot trainable parameters.")
+
+    wb_run.finish()
 
 
 def main():
@@ -247,6 +267,12 @@ if __name__ == "__main__":
             "cycle length, and a truncated dataset."
         ),
     )
+    parser.add_argument(
+        "--dataset",
+        choices=["winogrande_s", "winogrande_m", "ARC-Challenge", "ARC-Easy"],
+        default="winogrande_s",
+        help="Which dataset artifact to train/eval on. Default is winogrande_s.",
+    )
     args = parser.parse_args()
 
     print("FGE training")
@@ -262,10 +288,10 @@ if __name__ == "__main__":
             # training it locally below; False trains wˆ locally (warmup phase).
             "load_params_path": False,
             "data": {
-                "dataset_path": WANDB_PATH + "/ARC-Easy_dataset:v0",
+                "dataset_path": WANDB_PATH + f"/{args.dataset}_dataset:v0",
                 "val_percentage": 0.1,
             },
-            "net_kwargs": {"model_path": "artifacts/qwen2.5_0.5B_bfloat16:v0"},
+            "net_kwargs": {"model_path": "artifacts/qwen2.5_7B_bfloat16:v0"},
             "train_hyper": {
                 "batch_size": args.batch_size,
                 "num_epochs": -1,
@@ -282,7 +308,7 @@ if __name__ == "__main__":
                 "SegDeg": 1,
                 "Pretraining": True,
                 "curve_sampling_mode": "combined_noBMA",
-                "subspace_model": "jsd_noise_sampling_dropout_category",
+                "subspace_model": "lora_category",
                 "jitter_multiplier": 0.0,
                 "natural_parameterization": False,
                 "weight_decay": 0.0,
@@ -348,7 +374,7 @@ if __name__ == "__main__":
         }
         wb_run = wandb.init(
             project=WANDB_PATH.split("/")[-1],
-            name="fge_test",
+            name=f"fge_test_{args.dataset}",
             entity=WANDB_PATH.split("/")[0],
             config=default_config,
         )

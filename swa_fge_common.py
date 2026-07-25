@@ -262,7 +262,11 @@ def _run_snapshot_training_loop(
         if welford_start_step is not None and step >= welford_start_step:
             current_trainable = s_model.only_trainable_params(params["params"])
             if welford_mean is None:
-                welford_mean = current_trainable
+                # only_trainable_params returns leaves aliased to params'
+                # underlying buffers (not copies); train_step donates params
+                # on the next iteration, which would delete those same
+                # buffers out from under welford_mean if we didn't copy here.
+                welford_mean = deepcopy(current_trainable)
                 welford_count = 1
             else:
                 welford_mean, welford_count = _welford_update(

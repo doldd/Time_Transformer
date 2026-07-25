@@ -2446,12 +2446,16 @@ def train(logger, config_dict):
 
     pretrained_params = [False] * len(config.model_params.cp_fix)
     if any(config.model_params.cp_fix):
+        pretrain_start = time.time()
         pretrained_params, rng_key = _pretrain_fixed_cps(
             rng_key, config, data, logger, artifact
         )
+        print(f"Pretraining took {time.time() - pretrain_start:.1f}s")
 
     if len(config.model_params.cp_fix) > 1:
+        curve_start = time.time()
         _train_full_curve(rng_key, config, data, pretrained_params, logger, artifact)
+        print(f"Curve training took {time.time() - curve_start:.1f}s")
 
     if config.train_hyper.save_params:
         logger.log_artifact(artifact)

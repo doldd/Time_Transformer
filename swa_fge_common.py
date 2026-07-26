@@ -199,7 +199,9 @@ def _run_snapshot_training_loop(
 
     best_val_ll = -np.inf
     best_params = (
-        s_model.only_trainable_params(params["params"]) if data.has_val else None
+        deepcopy(s_model.only_trainable_params(params["params"]))
+        if data.has_val
+        else None
     )
     snapshots = []
     snapshot_steps = []
@@ -252,7 +254,11 @@ def _run_snapshot_training_loop(
             (step % eval_every_n_batch) == 0,
         )
         if metrics["val_bma_ll"] > best_val_ll:
-            best_params = get_best_params(params)
+            # get_best_params aliases params' underlying buffers (not a copy);
+            # the next iteration's donating train_step call would delete those
+            # same buffers out from under best_params if we didn't copy here
+            # (same aliasing hazard fixed for welford_mean below).
+            best_params = deepcopy(get_best_params(params))
             best_val_ll = metrics["val_bma_ll"]
 
         if should_snapshot(step):

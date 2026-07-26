@@ -108,7 +108,7 @@ def train(wb_run, config_dict):
     # window, but maintains a running mean over *every* step from there on
     # (via _welford_update) instead of only the num_snapshots discrete points
     # — lets us compare both averaging strategies from one training run.
-    final_params, snapshots, snapshot_steps, _, welford_mean = _run_snapshot_training_loop(
+    final_params, snapshots, snapshot_steps, best_params, welford_mean = _run_snapshot_training_loop(
         wb_run=wb_run,
         rng_key=rng_key,
         env=env,
@@ -158,6 +158,24 @@ def train(wb_run, config_dict):
         logger=wb_run,
         logger_prefix="swa_welford_",
     )
+
+    # Compare against just picking the single best-validation checkpoint seen
+    # during training (early-stopping style) instead of averaging any tail
+    # window at all — env.get_best_params/best_params already tracks this
+    # internally, SWA just wasn't using it until now.
+    if best_params is not None:
+        best_full = _merge_trainable(env.s_model, best_params, final_params["params"])
+        best_eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": best_full})
+
+        run_evaluation(
+            rng_key=rng_key,
+            env=env,
+            params=best_eval_params,
+            data=data,
+            config=config,
+            logger=wb_run,
+            logger_prefix="swa_best_",
+        )
 
     if config.train_hyper.save_params:
         # swa_trainable is already trainable-only (each snapshot came from
@@ -221,6 +239,12 @@ if __name__ == "__main__":
         default=0.8,
         help="swa.start_pct: fraction of training after which snapshots are collected.",
     )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=2,
+        help="rng_seed for this run.",
+    )
     args = parser.parse_args()
 
     print("SWA training")
@@ -230,7 +254,7 @@ if __name__ == "__main__":
     else:
         smoke_test = args.smoke_test
         default_config = {
-            "rng_seed": 2,
+            "rng_seed": args.rng_seed,
             # Set to a finished k=0 pretraining run path (e.g.
             # WANDB_PATH + "/47xexal3") to load wˆ from wandb instead of
             # training it locally below; False trains it locally.

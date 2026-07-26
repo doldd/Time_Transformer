@@ -1,0 +1,147 @@
+program: qwen_fge.py
+name: "FGE OpenFlat No Seg round1"
+description: "Round 1: single-point Qwen fine-tuning (lora_category, no JSD/noise-sampling regularizer) with a 5000-step warmup (matching SWA's single-point budget for comparability), followed by a 2000-step cyclic FGE phase, gridded over cycle_steps (5/9/17 snapshots) across all 4 datasets at a single seed."
+method: grid
+metric:
+  goal: maximize
+  name: fge_ll
+parameters:
+  rng_seed:
+    value: 1
+  # Set to a finished k=0 pretraining run path, e.g.
+  # "ddold/qwen_PtoC/47xexal3", to load wˆ from wandb instead of training it
+  # locally via the warmup phase below.
+  load_params_path:
+    value: false
+  data:
+    parameters:
+      dataset_path:
+        values:
+          - "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/ARC-Challenge_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
+      val_percentage:
+        value: 0.1
+  net_kwargs:
+    parameters:
+      model_path:
+        value: "ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0"
+  train_hyper:
+    parameters:
+      batch_size:
+        value: 4
+      eval_every_n_batch:
+        value: 100
+      num_epochs:
+        value: -1
+      num_steps:
+        value: 5000
+      save_params:
+        value: true
+      dataset_sampling:
+        parameters:
+          minibatch:
+            value: false
+      temperature:
+        value: [1.0]
+  model_params:
+    parameters:
+      n_samples_eval:
+        value: 1
+      num_curve_segment:
+        value: 0
+      SegDeg:
+        value: 1
+      Pretraining:
+        value: true
+      curve_sampling_mode:
+        value: "combined_noBMA"
+      subspace_model:
+        value: "lora_category"
+      filter_masks:
+        values:
+          -
+            - {keys: ["self_attn", "q_proj", "kernel"], op: all}
+            - {keys: ["self_attn", "v_proj", "kernel"], op: all}
+            - {keys: ["lm_head", "kernel"], op: all}
+      jitter_multiplier:
+        value: 0.0
+      natural_parameterization:
+        value: false
+      weight_decay:
+        value: 0.0
+      curve_parameterization:
+        value: "bezier"
+      indepent_connected:
+        value: false
+      gravity:
+        value: 0.0
+      energy_weakening:
+        value: 1.0
+      regularizer:
+        value: false
+      entropy_weight:
+        value: 0.0
+      target_jsd:
+        value: 0.1
+      noise_rate:
+        value: 0.05
+      lora_params:
+        parameters:
+          use_lora:
+            value: true
+          rho_scheduler_frequency:
+            value: 50
+          filter_masks:
+            values:
+              -
+                - {keys: ["self_attn", "q_proj", "kernel"], op: all, dims: [1, 0]}
+                - {keys: ["self_attn", "v_proj", "kernel"], op: all, dims: [1, 0]}
+                - {keys: ["lm_head", "kernel"], op: all, dims: [1, 0]}
+          r:
+            value: 8
+          lora_dtype:
+            value: "float32"
+          lora_alpha:
+            value: 16.0
+          lora_mode:
+            value: "A(t)eB(t)"
+          lora_rho:
+            value: 0.25
+          lora_rho_s:
+            value: 0.0
+  optimizer_conf:
+    values:
+      -
+        name: adamw
+        kwargs:
+          learning_rate:
+            name: linear_onecycle_schedule
+            kwargs:
+              transition_steps: 5000
+              peak_value: 1e-4
+              pct_start: 0.12
+              pct_final: 1.0
+              div_factor: 300.0
+              final_div_factor: 300.0
+          weight_decay: 0.001
+        freeze_other_params: true
+  fge:
+    parameters:
+      warmup_steps:
+        value: 5000
+      steps:
+        value: 2000
+      cycle_steps:
+        values: [400, 222, 118]
+      lr_high:
+        value: 1e-4
+      lr_low:
+        value: 1e-5
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --use-sweep

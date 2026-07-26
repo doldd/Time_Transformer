@@ -1,0 +1,143 @@
+program: qwen_swa.py
+name: "SWA OpenFlat No Seg round1"
+description: "Round 1: single-point Qwen fine-tuning (lora_category, no JSD/noise-sampling regularizer), 2000 steps, snapshot window starting at start_pct=0.1 (tuned to land near the validation peak around step 200-600 rather than the overfit tail), gridded over num_snapshots (5/9/17, matching FGE's cycle_steps grid) across all 4 datasets at a single seed. Logs three comparable metrics per run: swa_test_ll (discrete snapshot average), swa_welford_test_ll (online/Welford running mean over every step of the same window), swa_best_test_ll (single best-validation checkpoint, no averaging)."
+method: grid
+metric:
+  goal: maximize
+  name: swa_best_test_ll
+parameters:
+  rng_seed:
+    value: 1
+  # Set to a finished k=0 pretraining run path, e.g.
+  # "ddold/qwen_PtoC/47xexal3", to load wˆ from wandb instead of training it
+  # locally below.
+  load_params_path:
+    value: false
+  data:
+    parameters:
+      dataset_path:
+        values:
+          - "ddold/qwen_PtoC_newDS/winogrande_m_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/winogrande_s_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/ARC-Challenge_dataset:v0"
+          - "ddold/qwen_PtoC_newDS/ARC-Easy_dataset:v0"
+      val_percentage:
+        value: 0.1
+  net_kwargs:
+    parameters:
+      model_path:
+        value: "ddold/qwen_PtoC_newDS/qwen2.5_7B_bfloat16:v0"
+  train_hyper:
+    parameters:
+      batch_size:
+        value: 4
+      eval_every_n_batch:
+        value: 100
+      num_epochs:
+        value: -1
+      num_steps:
+        value: 2000
+      save_params:
+        value: true
+      dataset_sampling:
+        parameters:
+          minibatch:
+            value: false
+      temperature:
+        value: [1.0]
+  model_params:
+    parameters:
+      n_samples_eval:
+        value: 1
+      num_curve_segment:
+        value: 0
+      SegDeg:
+        value: 1
+      Pretraining:
+        value: true
+      curve_sampling_mode:
+        value: "combined_noBMA"
+      subspace_model:
+        value: "lora_category"
+      filter_masks:
+        values:
+          -
+            - {keys: ["self_attn", "q_proj", "kernel"], op: all}
+            - {keys: ["self_attn", "v_proj", "kernel"], op: all}
+            - {keys: ["lm_head", "kernel"], op: all}
+      jitter_multiplier:
+        value: 0.0
+      natural_parameterization:
+        value: false
+      weight_decay:
+        value: 0.0
+      curve_parameterization:
+        value: "bezier"
+      indepent_connected:
+        value: false
+      gravity:
+        value: 0.0
+      energy_weakening:
+        value: 1.0
+      regularizer:
+        value: false
+      entropy_weight:
+        value: 0.0
+      target_jsd:
+        value: 0.1
+      noise_rate:
+        value: 0.05
+      lora_params:
+        parameters:
+          use_lora:
+            value: true
+          rho_scheduler_frequency:
+            value: 50
+          filter_masks:
+            values:
+              -
+                - {keys: ["self_attn", "q_proj", "kernel"], op: all, dims: [1, 0]}
+                - {keys: ["self_attn", "v_proj", "kernel"], op: all, dims: [1, 0]}
+                - {keys: ["lm_head", "kernel"], op: all, dims: [1, 0]}
+          r:
+            value: 8
+          lora_dtype:
+            value: "float32"
+          lora_alpha:
+            value: 16.0
+          lora_mode:
+            value: "A(t)eB(t)"
+          lora_rho:
+            value: 0.25
+          lora_rho_s:
+            value: 0.0
+  optimizer_conf:
+    values:
+      -
+        name: adamw
+        kwargs:
+          learning_rate:
+            name: linear_onecycle_schedule
+            kwargs:
+              transition_steps: 2000
+              peak_value: 1e-4
+              pct_start: 0.12
+              pct_final: 1.0
+              div_factor: 300.0
+              final_div_factor: 300.0
+          weight_decay: 0.001
+        freeze_other_params: true
+  swa:
+    parameters:
+      steps:
+        value: 2000
+      start_pct:
+        value: 0.1
+      num_snapshots:
+        values: [5, 9, 17]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --use-sweep

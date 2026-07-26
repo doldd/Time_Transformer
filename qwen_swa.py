@@ -30,7 +30,6 @@ from swa_fge_common import (
     _load_pretrained_point,
     _merge_trainable,
     _run_snapshot_training_loop,
-    _tree_mean,
 )
 
 
@@ -84,19 +83,10 @@ def train(wb_run, config_dict):
         params = _load_pretrained_point(wb_run, load_params_path, config, env, params)
 
     start_pct = float(swa_cfg.get("start_pct", 0.8))
-    num_snapshots = int(swa_cfg.get("num_snapshots", 20))
     if not (0.0 <= start_pct < 1.0):
         raise ValueError("swa.start_pct must be in [0, 1)")
-    if num_snapshots <= 0:
-        raise ValueError("swa.num_snapshots must be > 0")
 
     start_step = int(start_pct * swa_steps)
-    collection_steps = set(
-        np.linspace(start_step, swa_steps - 1, num_snapshots)
-        .round()
-        .astype(int)
-        .tolist()
-    )
 
     eval_every_n_batch = int(
         swa_cfg.get("eval_every_n_batch", config.train_hyper.eval_every_n_batch)
@@ -104,11 +94,13 @@ def train(wb_run, config_dict):
 
     # No dedicated schedule override — env.optimizer already carries whatever
     # optimizer_conf specifies, used unmodified for this entire run.
-    # welford_start_step reuses the same start_step as the discrete snapshot
-    # window, but maintains a running mean over *every* step from there on
-    # (via _welford_update) instead of only the num_snapshots discrete points
-    # — lets us compare both averaging strategies from one training run.
-    final_params, snapshots, snapshot_steps, best_params, welford_mean = _run_snapshot_training_loop(
+    # Only the Welford running mean is used for weight averaging (an online
+    # mean over every step from start_step onward via _welford_update) — no
+    # discrete snapshot collection, so should_snapshot is always False.
+    # best_params (tracked internally by _run_snapshot_training_loop) gives a
+    # second point of comparison: the single best-validation checkpoint, no
+    # averaging at all.
+    final_params, _, _, best_params, welford_mean = _run_snapshot_training_loop(
         wb_run=wb_run,
         rng_key=rng_key,
         env=env,
@@ -118,34 +110,11 @@ def train(wb_run, config_dict):
         num_steps=swa_steps,
         eval_every_n_batch=eval_every_n_batch,
         lr_schedule=config.optimizer_conf.lr_schedule,
-        should_snapshot=lambda step: step in collection_steps,
+        should_snapshot=lambda step: False,
         log_prefix="swa",
         welford_start_step=start_step,
     )
 
-    wb_run.summary.update(
-        {
-            "swa_num_snapshots": len(snapshots),
-            "swa_snapshot_steps": str(snapshot_steps),
-        }
-    )
-
-    swa_trainable = _tree_mean(snapshots)
-    swa_full = _merge_trainable(env.s_model, swa_trainable, final_params["params"])
-    swa_eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": swa_full})
-
-    run_evaluation(
-        rng_key=rng_key,
-        env=env,
-        params=swa_eval_params,
-        data=data,
-        config=config,
-        logger=wb_run,
-        logger_prefix="swa_",
-    )
-
-    # Compare against an online (Welford) running mean over every step of the
-    # same tail window, instead of only num_snapshots discrete points.
     welford_full = _merge_trainable(env.s_model, welford_mean, final_params["params"])
     welford_eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": welford_full})
 
@@ -156,13 +125,12 @@ def train(wb_run, config_dict):
         data=data,
         config=config,
         logger=wb_run,
-        logger_prefix="swa_welford_",
+        logger_prefix="swa_",
     )
 
     # Compare against just picking the single best-validation checkpoint seen
-    # during training (early-stopping style) instead of averaging any tail
-    # window at all — env.get_best_params/best_params already tracks this
-    # internally, SWA just wasn't using it until now.
+    # during training (early-stopping style) instead of averaging at all —
+    # env.get_best_params/best_params already tracks this internally.
     if best_params is not None:
         best_full = _merge_trainable(env.s_model, best_params, final_params["params"])
         best_eval_params = env.s_model.set_lora_rho(0.0, 0.0, {"params": best_full})
@@ -178,12 +146,12 @@ def train(wb_run, config_dict):
         )
 
     if config.train_hyper.save_params:
-        # swa_trainable is already trainable-only (each snapshot came from
-        # s_model.only_trainable_params inside _run_snapshot_training_loop) —
-        # save that directly rather than the full (frozen + trainable) params.
+        # welford_mean is already trainable-only (only_trainable_params
+        # applied each update inside _run_snapshot_training_loop) — save that
+        # directly rather than the full (frozen + trainable) params.
         os.makedirs("tmp_files", exist_ok=True)
         trainable_path = f"tmp_files/{wb_run.id}_trainable_params.npy"
-        np.save(trainable_path, swa_trainable)
+        np.save(trainable_path, welford_mean)
         time.sleep(1)
         print("Saved SWA trainable parameters to tmp_files")
         artifact = wandb.Artifact(name="params", type="pytree")
@@ -340,7 +308,6 @@ if __name__ == "__main__":
             "swa": {
                 "steps": 20 if smoke_test else args.num_steps,
                 "start_pct": 0.5 if smoke_test else args.start_pct,
-                "num_snapshots": 4 if smoke_test else 20,
             },
         }
         wb_run = wandb.init(

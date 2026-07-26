@@ -1,6 +1,6 @@
 program: qwen_swa.py
 name: "SWA OpenFlat No Seg round2"
-description: "Round 2: same as round1 (single-point Qwen fine-tuning, lora_category, no JSD/noise-sampling regularizer, 2000 steps, snapshot window starting at start_pct=0.1, gridded over num_snapshots (5/9/17, matching FGE's cycle_steps grid) across all 4 datasets) but expanded from 1 seed to the full 5-seed list used elsewhere in configs_newDS (matches FGE round1 -> round2). Logs three comparable metrics per run: swa_test_ll (discrete snapshot average), swa_welford_test_ll (online/Welford running mean over every step of the same window), swa_best_test_ll (single best-validation checkpoint, no averaging)."
+description: "Round 2: same as round1 (single-point Qwen fine-tuning, lora_category, no JSD/noise-sampling regularizer, 2000 steps, start_pct=0.1) but expanded from 1 seed to the full 5-seed list used elsewhere in configs_newDS. num_snapshots/discrete-average dropped entirely (round1 showed swa_best_test_ll is invariant to it, and discrete averaging isn't the strategy of interest) — only two metrics per run now: swa_test_ll (Welford online running mean over every step from start_pct onward) and swa_best_test_ll (single best-validation checkpoint, no averaging)."
 method: grid
 metric:
   goal: maximize
@@ -133,8 +133,6 @@ parameters:
         value: 2000
       start_pct:
         value: 0.1
-      num_snapshots:
-        values: [5, 9, 17]
 
 command:
   - ${env}

@@ -2073,7 +2073,9 @@ def run_training(rng_key, env, params, data, config: "Config", logger, logger_pr
 
     # Step fn is pre-built in _setup_training_env with the correct optimizer;
     # calling the cached JIT gives a trace-cache hit.
+    time_start = time.time()
     carry, metrics = env.train_step(carry, jnp.arange(scan_length))
+    print(f"Single Training completed in {time.time() - time_start:.2f} seconds")
 
     # Clean up inf values from lazy validation
     for key, value in metrics.items():
